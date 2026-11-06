@@ -1,14 +1,18 @@
-# Welcome to your Lovable project
+# Screen Safari Studio
+
+I want ui design for my tv app just like Netflix apple tv and Google tv i want design for channel player movies and series player and home ui with tab also a written file so I can drop in my ai and tell him to make exactly same
 
 This project was built with [Lovable](https://lovable.dev).
 
+**Live app**: https://screen-safari-studio.lovable.app
+
 ## Build with Lovable
 
-Open your project in the [Lovable editor](https://lovable.dev) and keep building.
+Continue developing this project in the [Lovable editor](https://lovable.dev/projects/c9af0b17-3006-4afa-ae4e-096bd41681bd).
 
 - **Ship faster**: describe what you want to build and Lovable handles the code.
-- **Stay in sync**: connect the project to GitHub and every change made in Lovable is committed straight to your repository.
-- **Full ownership**: this code is yours. Push to your repository and your changes sync back into Lovable, ready for your next prompt.
+- **Stay in sync**: every change made in Lovable is committed straight to this repository.
+- **Full ownership**: this code is yours. Push to `main` on GitHub and your changes sync back into Lovable, ready for your next prompt.
 
 ## Development
 
@@ -20,10 +24,3 @@ cd <repository-name>
 npm i
 npm run dev
 ```
-
-## Built with
-
-- TanStack Start
-- TypeScript
-- React
-- Tailwind CSS
