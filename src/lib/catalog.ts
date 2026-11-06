@@ -1,4 +1,4 @@
-export type Title = { id: string; name: string; year: number; tag: string; hue: number; kind: "movie" | "series"; progress?: number };
+export type Title = { id: string; name: string; year: number; tag: string; hue: number; kind: "movie" | "series"; progress?: number | undefined };
 
 const mk = (id: string, name: string, year: number, tag: string, hue: number, kind: Title["kind"], progress?: number): Title => ({ id, name, year, tag, hue, kind, progress });
 
