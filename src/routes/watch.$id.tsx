@@ -18,7 +18,7 @@ export const Route = createFileRoute("/watch/$id")({
 
 function Player() {
   const { id } = Route.useParams();
-  const t = titles.find((x) => x.id === id) ?? titles[0];
+  const t = titles.find((x) => x.id === id) ?? titles[0]!;
   const [playing, setPlaying] = useState(true);
   const [eps, setEps] = useState(false);
   const pct = t.progress ?? 35;

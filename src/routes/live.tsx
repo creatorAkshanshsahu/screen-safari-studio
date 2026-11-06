@@ -17,7 +17,7 @@ export const Route = createFileRoute("/live")({
 
 function LivePlayer() {
   const [i, setI] = useState(1);
-  const c = channels[i];
+  const c = channels[i]!;
   const go = (d: number) => setI((i + d + channels.length) % channels.length);
   return (
     <main className="relative h-screen w-full overflow-hidden" style={{ background: `radial-gradient(circle at 60% 40%, oklch(0.45 0.12 ${c.hue}), oklch(0.1 0.02 ${c.hue}))` }}>
