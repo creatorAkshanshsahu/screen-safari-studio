@@ -1,23 +1,31 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { TopNav } from "@/components/tv/TopNav";
+import { Hero, Rail } from "@/components/tv/Rails";
+import { titles } from "@/lib/catalog";
 
-// The home route ships no og:image, so serve-time hosting can inject the
-// project's social preview (explicit og:image or latest screenshot).
 export const Route = createFileRoute("/")({
-  component: Index,
+  head: () => ({
+    meta: [
+      { title: "Streamr — TV Home" },
+      { name: "description", content: "Streaming TV app home with movies, series and live channels." },
+      { property: "og:title", content: "Streamr — TV Home" },
+      { property: "og:description", content: "Streaming TV app home with movies, series and live channels." },
+    ],
+  }),
+  component: Home,
 });
 
-// IMPORTANT: Replace this placeholder. See ./README.md for routing conventions.
-function Index() {
+function Home() {
   return (
-    <div
-      className="flex min-h-screen items-center justify-center"
-      style={{ backgroundColor: "#fcfbf8" }}
-    >
-      <img
-        data-lovable-blank-page-placeholder="REMOVE_THIS"
-        src="https://cdn.gpteng.co/blank-app-v1.svg"
-        alt="Your app will live here!"
-      />
-    </div>
+    <main className="min-h-screen pb-16">
+      <TopNav />
+      <Hero />
+      <div className="-mt-10 relative space-y-6">
+        <Rail label="Continue Watching" items={titles.filter((t) => t.progress)} wide />
+        <Rail label="Trending Now" items={titles} />
+        <Rail label="New Series" items={titles.filter((t) => t.kind === "series")} />
+        <Rail label="Top Movies" items={titles.filter((t) => t.kind === "movie")} wide />
+      </div>
+    </main>
   );
 }
