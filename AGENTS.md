@@ -28,3 +28,5 @@ use the editor.
   own key and store it in Secrets.
 - **Secrets.** Lovable manages them. Do not put secret values in the repo.
 <!-- LOVABLE:END -->
+
+- Keep directional remote focus in a shared browser-only effect so all TV screens support arrow navigation without changing laptop tab navigation.

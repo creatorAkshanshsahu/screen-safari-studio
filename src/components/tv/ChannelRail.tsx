@@ -1,0 +1,24 @@
+import { Link } from "@tanstack/react-router";
+import { Radio, Play } from "lucide-react";
+import { channels } from "@/lib/catalog";
+
+export function ChannelRail() {
+  return (
+    <section className="space-y-3">
+      <div className="flex items-center justify-between px-4 md:px-12">
+        <h2 className="flex items-center gap-3 text-lg font-semibold md:text-2xl"><Radio className="size-5 text-live" /> On now</h2>
+        <Link to="/live" className="text-sm font-semibold text-muted-foreground">Channel guide →</Link>
+      </div>
+      <div className="no-scrollbar flex gap-3 overflow-x-auto px-4 py-4 md:gap-5 md:px-12">
+        {channels.map((channel) => (
+          <Link to="/live" key={channel.no} className="tv-focus w-64 shrink-0 rounded-lg border border-border bg-card p-5 md:w-72">
+            <div className="mb-5 flex items-center justify-between"><span className="font-display text-xl font-bold">{channel.name}</span><Play className="size-5 text-accent" /></div>
+            <p className="mb-2 text-xs font-bold text-live">LIVE · {channel.no}</p>
+            <p className="truncate font-semibold">{channel.now}</p>
+            <p className="mt-1 truncate text-sm text-muted-foreground">Next · {channel.next}</p>
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}
