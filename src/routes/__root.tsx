@@ -12,6 +12,7 @@ import { useEffect, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
+import { RemoteNavigation } from "@/components/tv/RemoteNavigation";
 
 function NotFoundComponent() {
   return (
@@ -85,7 +86,6 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { property: "og:description", content: "A TV-first streaming home with movies, series and a live channel guide." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:site", content: "@Lovable" },
     ],
     links: [
       {
@@ -122,6 +122,7 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
+      <RemoteNavigation />
       {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
       <Outlet />
     </QueryClientProvider>

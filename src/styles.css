@@ -81,6 +81,11 @@
 }
 
 @utility bg-hero-scrim { background: var(--gradient-hero); }
+@utility text-brand {
+  background: var(--gradient-brand);
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
 @utility bg-player-scrim { background: var(--gradient-player); }
 @utility tv-focus {
   transition: transform 0.25s cubic-bezier(.2,.8,.2,1), box-shadow 0.25s;
@@ -94,4 +99,21 @@
 @utility no-scrollbar {
   scrollbar-width: none;
   &::-webkit-scrollbar { display: none; }
+}
+
+/* Comfortable laptop controls and visible remote selection at TV viewing distance. */
+a:focus-visible, button:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 5px;
+}
+@media (min-width: 1600px) {
+  body { font-size: 20px; }
+  header nav a { font-size: 20px; padding: 14px 28px; }
+  main > section:first-of-type { height: 65vh; min-height: 560px; }
+  .tv-focus.w-64 { width: 360px; }
+  .tv-focus.w-32 { width: 240px; }
+  button { min-height: 48px; min-width: 48px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }

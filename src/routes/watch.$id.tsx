@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { ArrowLeft, Play, Pause, RotateCcw, RotateCw, SkipForward, Subtitles, Volume2, Maximize, ListVideo } from "lucide-react";
 import hero from "@/assets/hero.jpg";
 import { titles, poster } from "@/lib/catalog";
@@ -11,6 +12,8 @@ export const Route = createFileRoute("/watch/$id")({
       { name: "description", content: "Movie and series player with episodes and controls." },
       { property: "og:title", content: "Now Watching — Streamr" },
       { property: "og:description", content: "Movie and series player with episodes and controls." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
   component: Player,
@@ -18,9 +21,10 @@ export const Route = createFileRoute("/watch/$id")({
 
 function Player() {
   const { id } = Route.useParams();
-  const t = titles.find((x) => x.id === id) ?? titles[0]!;
+  const t = titles.find((x) => x.id === id) ?? titles[0];
   const [playing, setPlaying] = useState(true);
   const [eps, setEps] = useState(false);
+  if (!t) return null;
   const pct = t.progress ?? 35;
   return (
     <main className="relative h-screen w-full overflow-hidden bg-scrim">
@@ -34,16 +38,16 @@ function Player() {
         </div>
       </div>
       <div className="absolute inset-0 flex items-center justify-center gap-8 md:gap-16">
-        <button aria-label="Back 10s" className="glass rounded-full p-3 md:p-4"><RotateCcw className="size-6 md:size-8" /></button>
-        <button aria-label={playing ? "Pause" : "Play"} onClick={() => setPlaying(!playing)} className="tv-focus rounded-full bg-primary p-5 text-primary-foreground md:p-7">
+        <Button variant="secondary" aria-label="Back 10s" className="glass rounded-full p-3 md:p-4"><RotateCcw className="size-6 md:size-8" /></Button>
+        <Button variant="secondary" aria-label={playing ? "Pause" : "Play"} onClick={() => setPlaying(!playing)} className="tv-focus rounded-full bg-primary p-5 text-primary-foreground md:p-7">
           {playing ? <Pause className="size-8 fill-current md:size-10" /> : <Play className="size-8 fill-current md:size-10" />}
-        </button>
-        <button aria-label="Forward 10s" className="glass rounded-full p-3 md:p-4"><RotateCw className="size-6 md:size-8" /></button>
+        </Button>
+        <Button variant="secondary" aria-label="Forward 10s" className="glass rounded-full p-3 md:p-4"><RotateCw className="size-6 md:size-8" /></Button>
       </div>
       {eps && t.kind === "series" && (
         <div className="no-scrollbar absolute inset-x-0 bottom-36 flex gap-3 overflow-x-auto px-4 md:px-10">
           {[1, 2, 3, 4, 5, 6].map((e) => (
-            <div key={e} className="tv-focus glass w-56 shrink-0 overflow-hidden rounded-xl">
+            <div key={e} tabIndex={0} className="tv-focus glass w-56 shrink-0 overflow-hidden rounded-xl">
               <div className="aspect-video" style={{ background: poster(t.hue + e * 15) }} />
               <div className="p-3"><p className="text-sm font-bold">E{e} · Episode {e}</p><p className="text-xs text-muted-foreground">48m</p></div>
             </div>
@@ -60,16 +64,16 @@ function Player() {
           <span className="text-muted-foreground">2:14:00</span>
         </div>
         <div className="flex items-center gap-2 md:gap-4">
-          <button className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><Volume2 className="size-4" /></button>
-          <button className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><Subtitles className="size-4" /> <span className="hidden md:inline">Audio & Subtitles</span></button>
+          <Button variant="secondary" className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><Volume2 className="size-4" /></Button>
+          <Button variant="secondary" className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><Subtitles className="size-4" /> <span className="hidden md:inline">Audio & Subtitles</span></Button>
           <div className="flex-1" />
           {t.kind === "series" && (
             <>
-              <button onClick={() => setEps(!eps)} className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><ListVideo className="size-4" /> Episodes</button>
-              <button className="inline-flex items-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-bold text-primary-foreground"><SkipForward className="size-4" /> Next</button>
+              <Button variant="secondary" onClick={() => setEps(!eps)} className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><ListVideo className="size-4" /> Episodes</Button>
+              <Button variant="secondary" className="inline-flex items-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-bold text-primary-foreground"><SkipForward className="size-4" /> Next</Button>
             </>
           )}
-          <button aria-label="Fullscreen" className="glass rounded-lg p-2"><Maximize className="size-4" /></button>
+          <Button variant="secondary" aria-label="Fullscreen" className="glass rounded-lg p-2"><Maximize className="size-4" /></Button>
         </div>
       </div>
     </main>
