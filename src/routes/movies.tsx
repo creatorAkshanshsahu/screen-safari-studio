@@ -10,6 +10,8 @@ export const Route = createFileRoute("/movies")({
       { name: "description", content: "Browse films on Streamr." },
       { property: "og:title", content: "Movies — Streamr" },
       { property: "og:description", content: "Browse films on Streamr." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
   component: () => {
