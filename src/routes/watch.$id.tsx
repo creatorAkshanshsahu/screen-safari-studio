@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, Play, Pause, RotateCcw, RotateCw, SkipForward, Subtitles, Volume2, Maximize, ListVideo } from "lucide-react";
+import { ArrowLeft, Play, Pause, RotateCcw, RotateCw, SkipForward, Subtitles, Maximize, ListVideo, Server, RefreshCw, Info, Repeat } from "lucide-react";
 import hero from "@/assets/hero.jpg";
 import { titles, poster } from "@/lib/catalog";
 
@@ -24,6 +24,8 @@ function Player() {
   const t = titles.find((x) => x.id === id) ?? titles[0];
   const [playing, setPlaying] = useState(true);
   const [eps, setEps] = useState(false);
+  const [autoNext, setAutoNext] = useState(true);
+  const [details, setDetails] = useState(false);
   if (!t) return null;
   const pct = t.progress ?? 35;
   return (
@@ -36,6 +38,10 @@ function Player() {
           <p className="font-display text-lg font-bold md:text-2xl">{t.name}</p>
           {t.kind === "series" && <p className="text-xs text-muted-foreground md:text-sm">S1 · E3 “The Crossing”</p>}
         </div>
+      </div>
+      <span className="absolute right-4 top-6 font-display text-lg md:right-10 md:top-12 md:text-2xl">2:16</span>
+      <div className="absolute left-4 top-24 rounded-full border border-border bg-scrim/60 px-4 py-1.5 text-xs md:left-10 md:top-32 md:text-sm">
+        {details ? "Source: Server 1 · HLS · 1080p · 6.2 Mbps" : "Picture received · stream stable · HLS"}
       </div>
       <div className="absolute inset-0 flex items-center justify-center gap-8 md:gap-16">
         <Button variant="secondary" aria-label="Back 10s" className="glass rounded-full p-3 md:p-4"><RotateCcw className="size-6 md:size-8" /></Button>
@@ -63,17 +69,19 @@ function Player() {
           </div>
           <span className="text-muted-foreground">2:14:00</span>
         </div>
-        <div className="flex items-center gap-2 md:gap-4">
-          <Button variant="secondary" className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><Volume2 className="size-4" /></Button>
-          <Button variant="secondary" className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><Subtitles className="size-4" /> <span className="hidden md:inline">Audio & Subtitles</span></Button>
-          <div className="flex-1" />
+        <div className="no-scrollbar flex items-center gap-2 overflow-x-auto py-2 md:gap-3">
+          <Button variant="secondary" className="tv-focus glass inline-flex shrink-0 items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold md:px-6 md:py-3 md:text-base"><Server className="size-4" /> Change source</Button>
+          <Button variant="secondary" className="tv-focus glass inline-flex shrink-0 items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold md:px-6 md:py-3 md:text-base"><Subtitles className="size-4" /> Audio & Subtitles</Button>
           {t.kind === "series" && (
             <>
-              <Button variant="secondary" onClick={() => setEps(!eps)} className="glass inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold"><ListVideo className="size-4" /> Episodes</Button>
-              <Button variant="secondary" className="inline-flex items-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-bold text-primary-foreground"><SkipForward className="size-4" /> Next</Button>
+              <Button variant="secondary" className="tv-focus glass inline-flex shrink-0 items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold md:px-6 md:py-3 md:text-base" onClick={() => setEps(!eps)}><ListVideo className="size-4" /> Episodes</Button>
+              <Button variant="secondary" className="tv-focus inline-flex shrink-0 items-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-bold text-primary-foreground md:px-6 md:py-3 md:text-base"><SkipForward className="size-4" /> Next episode</Button>
+              <Button variant="secondary" className="tv-focus glass inline-flex shrink-0 items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold md:px-6 md:py-3 md:text-base" onClick={() => setAutoNext(!autoNext)}><Repeat className="size-4" /> Auto next: {autoNext ? "On" : "Off"}</Button>
             </>
           )}
-          <Button variant="secondary" aria-label="Fullscreen" className="glass rounded-lg p-2"><Maximize className="size-4" /></Button>
+          <Button variant="secondary" className="tv-focus glass inline-flex shrink-0 items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold md:px-6 md:py-3 md:text-base"><RefreshCw className="size-4" /> Retry</Button>
+          <Button variant="secondary" className="tv-focus glass inline-flex shrink-0 items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold md:px-6 md:py-3 md:text-base" onClick={() => setDetails(!details)}><Info className="size-4" /> Playback details</Button>
+          <Button variant="secondary" aria-label="Fullscreen" className="tv-focus glass shrink-0 rounded-xl p-3"><Maximize className="size-4" /></Button>
         </div>
       </div>
     </main>
