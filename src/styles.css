@@ -43,14 +43,14 @@
   --card-foreground: oklch(0.97 0 0);
   --popover: oklch(0.2 0.012 260);
   --popover-foreground: oklch(0.97 0 0);
-  --primary: oklch(0.97 0 0);
-  --primary-foreground: oklch(0.14 0.01 260);
+  --primary: oklch(0.55 0.22 22);
+  --primary-foreground: oklch(0.97 0 0);
   --secondary: oklch(1 0 0 / 14%);
   --secondary-foreground: oklch(0.97 0 0);
   --muted: oklch(0.24 0.012 260);
   --muted-foreground: oklch(0.7 0.01 260);
-  --accent: oklch(0.72 0.15 55);
-  --accent-foreground: oklch(0.14 0.01 260);
+  --accent: oklch(0.55 0.22 22);
+  --accent-foreground: oklch(0.97 0 0);
   --destructive: oklch(0.62 0.22 25);
   --destructive-foreground: oklch(0.97 0 0);
   --live: oklch(0.62 0.23 25);
@@ -59,8 +59,8 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.97 0 0);
-  --brand-from: oklch(0.7 0.17 50);
-  --brand-to: oklch(0.83 0.16 85);
+  --brand-from: oklch(0.5 0.21 20);
+  --brand-to: oklch(0.66 0.22 25);
   --gradient-brand: linear-gradient(90deg, var(--brand-from) 0%, var(--brand-to) 100%);
   --gradient-hero: linear-gradient(90deg, var(--scrim) 0%, oklch(0.1 0.01 260 / 70%) 40%, transparent 75%),
     linear-gradient(0deg, var(--background) 0%, transparent 35%);
