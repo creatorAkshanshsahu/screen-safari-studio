@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { Search, User } from "lucide-react";
-import logoMark from "@/assets/logo-mark.png";
+import logoMark from "@/assets/logo-mark-cyber.png";
 import { Button } from "@/components/ui/button";
 
 const tabs = [
