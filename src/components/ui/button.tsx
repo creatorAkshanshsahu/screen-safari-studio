@@ -9,6 +9,8 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
+        player: "player-control border border-player-border bg-player-surface text-player-text hover:border-accent hover:bg-player-surface-hover",
+        playerPrimary: "player-control border border-primary bg-primary text-primary-foreground hover:bg-primary/85",
         default: "bg-primary text-primary-foreground shadow hover:bg-primary/90",
         destructive: "bg-destructive text-destructive-foreground shadow-sm hover:bg-destructive/90",
         outline:
@@ -18,6 +20,8 @@ const buttonVariants = cva(
         link: "text-primary underline-offset-4 hover:underline",
       },
       size: {
+        player: "h-12 shrink-0 gap-2 rounded-md px-4 text-sm md:h-14 md:px-5 md:text-base",
+        playerIcon: "size-12 shrink-0 rounded-md [&_svg]:size-5 md:size-14 md:[&_svg]:size-6",
         default: "h-9 px-4 py-2",
         sm: "h-8 rounded-md px-3 text-xs",
         lg: "h-10 rounded-md px-8",
