@@ -1055,6 +1055,23 @@ async function jioKeysFor(entry: ParsedM3uEntry, siteHost: string): Promise<Clea
 
 let jioPlaylistShape = 0;
 
+/**
+ * The last attempt to read the JioTV playlist: which address and header shape answered, and
+ * what every attempt got back when none did.
+ *
+ * The playlist is a URL on someone else's server and the only way to know why it refused is
+ * to record the refusal. Without this, an unreachable playlist and an empty one look the
+ * same from the player, and both look like "no channels".
+ */
+let jioPlaylistReport: {
+  at: number;
+  ok: boolean;
+  attempts: Array<{ url: string; shape: number; status: number; bytes: number; sniff: string }>;
+  winner: string | null;
+  entries: number;
+  error: string | null;
+} | null = null;
+
 /** The numbered playlist file that last answered, asked before the shipped one. */
 let jioPlaylistWinner: string | null = null;
 
@@ -1144,6 +1161,9 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
   let status = 0;
   let networkError = "";
   let usedUrl = cfg.jioPlaylistUrl;
+  // Kept so the diagnostic can say which address and which header shape answered -- or,
+  // when nothing did, exactly what each attempt got back.
+  const attempts: Array<{ url: string; shape: number; status: number; bytes: number; sniff: string }> = [];
   const order = [jioPlaylistShape, ...shapes.map((_, i) => i)];
   search: for (const candidate of jioPlaylistCandidates(cfg)) {
     for (const idx of order) {
@@ -1151,12 +1171,30 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
         const res = await fetch(candidate, { headers: shapes[idx]! });
         if (!res.ok) {
           status = res.status;
+          const peek = await res.text().catch(() => "");
+          attempts.push({
+            url: candidate,
+            shape: idx!,
+            status: res.status,
+            bytes: peek.length,
+            sniff: peek.trim().slice(0, 120).replace(/\s+/g, " "),
+          });
           // A 404 is the numbered file having moved on; stop trying shapes for it.
           if (res.status === 404) break;
           continue;
         }
         const body = await res.text();
-        if (!body.trimStart().startsWith("#EXTM3U")) continue;
+        if (!body.trimStart().startsWith("#EXTM3U")) {
+          attempts.push({
+            url: candidate,
+            shape: idx!,
+            status: res.status,
+            bytes: body.length,
+            sniff: body.trim().slice(0, 120).replace(/\s+/g, " "),
+          });
+          continue;
+        }
+        attempts.push({ url: candidate, shape: idx!, status: res.status, bytes: body.length, sniff: "#EXTM3U" });
         text = body;
         usedUrl = candidate;
         jioPlaylistShape = idx!;
@@ -1169,11 +1207,20 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
   }
 
   if (!text) {
+    jioPlaylistReport = {
+      at: Date.now(),
+      ok: false,
+      attempts,
+      winner: null,
+      entries: 0,
+      error: status ? `HTTP ${status}` : networkError || "no response",
+    };
     if (status) throw new Error(`Backup playlist returned HTTP ${status}`);
     throw new Error(`Backup playlist unreachable (${networkError || "no response"})`);
   }
 
   const entries = parseM3u(text, usedUrl);
+  jioPlaylistReport = { at: Date.now(), ok: true, attempts, winner: usedUrl, entries: entries.length, error: null };
   if (entries.length === 0) throw new Error("Backup playlist listed no channels");
 
   const siteHost = (() => {
@@ -2596,7 +2643,19 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const id = url.searchParams.get("id") || "";
     const pool = await getChannelsBySource(cfg, "all", false);
     const ch = pool.find((c) => c.id === id || c.rawId === id);
-    if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
+    if (!ch) {
+      // "Channel not found" is the least useful answer possible: it is the same whether the
+      // playlist refused us, moved, or simply does not list this id. Say which.
+      return jsonResponse(404, {
+        ok: false,
+        error: "Channel not found in the catalogue",
+        channelId: id,
+        playlist: jioPlaylistReport,
+        hint: jioPlaylistReport
+          ? "The playlist report above says which address and header shape answered, or what each attempt got back."
+          : "The catalogue has not been read yet in this process. Request /api/live/channels?source=jio first.",
+      });
+    }
 
     let body = "";
     let status = 0;
@@ -2732,7 +2791,17 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
 
     const pool = await getChannelsBySource(cfg, "all", false);
     const ch = pool.find((c) => c.id === id || c.rawId === id);
-    if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
+    if (!ch) {
+      return jsonResponse(404, {
+        ok: false,
+        error: "Channel not found in the catalogue",
+        channelId: id,
+        playlist: jioPlaylistReport,
+        hint: jioPlaylistReport
+          ? "The playlist report says which address answered, or what each attempt got back."
+          : "The catalogue has not been read yet in this process. Request /api/live/channels?source=jio first.",
+      });
+    }
 
     const probe = async (raw: string, headers: Record<string, string>) => {
       try {
@@ -2797,6 +2866,8 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
           url: a.url,
         })),
       hasCookie: Boolean(ch.cookie),
+      // The playlist this channel came from, and how that playlist answered.
+      playlist: jioPlaylistReport,
       advertisedUrl: ch.cmd ?? null,
       firstResponse: opened,
       resolvedUrl: finalUrl,
