@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   RouterProvider,
@@ -45,5 +45,69 @@ describe("Live route", () => {
   it("shows the channel count in the guide header", async () => {
     renderLive();
     await waitFor(() => expect(screen.getAllByText(/2 Channels/).length).toBeGreaterThan(0));
+  });
+
+  it("offers JioTV as a source, not just a static maxTV label", async () => {
+    renderLive();
+    await waitFor(() => expect(screen.getAllByText("JioTV").length).toBeGreaterThan(0));
+    // "Both" merges the two catalogues; it is not a stand-in for a Jio button.
+    expect(screen.getAllByText("Both").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("maxTV").length).toBeGreaterThan(0);
+  });
+
+  it("requests the jio source when the JioTV tab is chosen", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderLive();
+    const tab = await waitFor(() => screen.getAllByText("JioTV")[0]!);
+    tab.click();
+    await waitFor(() => {
+      const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+      expect(urls.some((u) => u.includes("source=jio"))).toBe(true);
+    });
+  });
+
+  it("keeps a search box available below the lg breakpoint", async () => {
+    renderLive();
+    await waitFor(() => expect(screen.getAllByText("Colors HD").length).toBeGreaterThan(0));
+    // Two boxes: one in the desktop drawer, one in the compact rail. The rail is the
+    // only one that exists on a phone, and its absence is what hid search there.
+    expect(screen.getAllByPlaceholderText(/Search/i).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("filters the guide as the search query is typed", async () => {
+    renderLive();
+    await waitFor(() => expect(screen.getAllByText("Colors HD").length).toBeGreaterThan(0));
+    const box = screen.getAllByPlaceholderText(/Search/i)[0]!;
+    fireEvent.change(box, { target: { value: "Colors" } });
+    // Scope to the guide buttons: the player header deliberately keeps showing the
+    // active channel so the video is not interrupted by a search for something else.
+    await waitFor(() => {
+      expect(screen.queryAllByRole("button", { name: "Sports18 1 HD" }).length).toBe(0);
+      expect(screen.getAllByRole("button", { name: "Colors HD" }).length).toBeGreaterThan(0);
+      expect(screen.getAllByText(/1 Channels/).length).toBeGreaterThan(0);
+    });
+  });
+});
+
+describe("Live route with an empty catalogue", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ ok: true, channels: [], categories: [], servedBy: "jio", backupError: "Backup playlist unreachable" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+  });
+
+  it("says the list is empty instead of claiming it is still connecting", async () => {
+    renderLive();
+    // The old copy said "Connecting to maxTV portal…" forever, which read as a hung
+    // connection when the real problem was an empty catalogue.
+    await waitFor(() => expect(screen.queryByText(/Connecting to maxTV portal/)).toBeNull());
+    expect(screen.getAllByText(/No channels available from this source/).length).toBeGreaterThan(0);
   });
 });

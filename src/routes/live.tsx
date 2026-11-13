@@ -33,7 +33,9 @@ export const Route = createFileRoute("/live")({
 });
 
 export function LivePlayerContent() {
-  const [source, setSource] = useState<"maxtv" | "starshare" | "all">("maxtv");
+  // maxTV leads, but the JioTV playlist is a first-class source, not just something
+  // that happens when the portal is down. Picking "jio" asks for it by name.
+  const [source, setSource] = useState<"maxtv" | "jio" | "all">("maxtv");
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("hindi");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
   const [query, setQuery] = useState("");
@@ -162,13 +164,36 @@ export function LivePlayerContent() {
           <div>
             <p className="font-display text-lg font-bold md:text-2xl">{activeChannel?.name ?? "Loading Live TV…"}</p>
             <p className="text-xs text-muted-foreground">
-              {activeChannel ? `${activeChannel.source.toUpperCase()} · ${activeChannel.category} · ${containerKind}` : "Connecting to maxTV portal…"}
+              {activeChannel
+                ? `${activeChannel.source.toUpperCase()} · ${activeChannel.category} · ${containerKind}`
+                : loading
+                  ? "Loading channels…"
+                  : "No channels available from this source"}
             </p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div className="glass flex items-center rounded-full px-3 py-1 text-xs font-bold text-accent">maxTV</div>
+          {/* This used to be a static "maxTV" pill, so the backup playlist could not be
+              chosen at all — it only appeared when the portal happened to fail. */}
+          <div className="glass flex rounded-full p-1 text-xs font-semibold">
+            {(
+              [
+                ["maxtv", "maxTV"],
+                ["jio", "JioTV"],
+                ["all", "Both"],
+              ] as const
+            ).map(([val, label]) => (
+              <button
+                key={val}
+                type="button"
+                onClick={() => setSource(val)}
+                className={`rounded-full px-3 py-1 transition ${source === val ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
 
           <div className="glass flex rounded-full p-1 text-xs font-semibold">
             {(
@@ -200,7 +225,7 @@ export function LivePlayerContent() {
       </div>
 
       {/* Say plainly where the list came from; never let a dead seed look like a working catalogue. */}
-      {(portalError || servedBy === "jio") && (
+      {(portalError || servedBy === "jio" || (source === "jio" && !loading)) && (
         <div className="absolute left-4 right-4 top-20 z-30 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs md:left-8 md:right-auto md:max-w-xl">
           {servedBy === "jio" && (
             <p className="font-bold text-accent">maxTV unreachable — playing the JioTV backup playlist ({visibleChannels.length} channels).</p>
@@ -208,7 +233,13 @@ export function LivePlayerContent() {
           {portalError && (
             <p className="font-bold text-accent">No live source reachable — these {visibleChannels.length} sample channels will not play.</p>
           )}
-          <p className="mt-0.5 text-muted-foreground">{portalError ?? backupError ?? "Backup playlist is live."}</p>
+          <p className="mt-0.5 text-muted-foreground">
+            {portalError ??
+              backupError ??
+              (source === "jio" && visibleChannels.length === 0
+                ? "The JioTV playlist returned no channels. Press Refresh to try again."
+                : "Backup playlist is live.")}
+          </p>
         </div>
       )}
 
@@ -388,6 +419,18 @@ export function LivePlayerContent() {
             </button>
           </div>
 
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-2 size-3.5 text-muted-foreground" />
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search channels…"
+              aria-label="Search channels"
+              className="w-full rounded-full border border-border bg-background/70 py-1 pl-8 pr-3 text-[11px] outline-none focus:border-accent"
+            />
+          </div>
+
           <div className="no-scrollbar flex shrink-0 gap-1.5 overflow-x-auto pb-0.5">
             <button
               type="button"
@@ -409,6 +452,11 @@ export function LivePlayerContent() {
           </div>
 
           <div className="no-scrollbar flex gap-2 overflow-x-auto pb-1">
+            {visibleChannels.length === 0 && (
+              <p className="px-1 py-1.5 text-[11px] text-muted-foreground">
+                {loading ? "Loading channels…" : query.trim() ? `No channels match “${query.trim()}”.` : "No channels from this source."}
+              </p>
+            )}
             {visibleChannels.map((ch) => (
               <Button
                 variant="secondary"
