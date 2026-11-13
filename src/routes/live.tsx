@@ -29,10 +29,10 @@ export const Route = createFileRoute("/live")({
       { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
-  component: LivePlayer,
+  component: LivePlayerContent,
 });
 
-function LivePlayer() {
+export function LivePlayerContent() {
   const [source, setSource] = useState<"maxtv" | "starshare" | "all">("maxtv");
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("hindi");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
@@ -200,7 +200,7 @@ function LivePlayer() {
       </div>
 
       {/* Desktop Channel Guide Drawer */}
-      <aside className="glass absolute bottom-32 right-4 top-24 z-20 hidden w-88 flex-col gap-2.5 overflow-hidden rounded-2xl p-3 md:right-8 md:flex">
+      <aside className="glass absolute bottom-32 right-4 top-24 z-20 hidden w-88 flex-col gap-2.5 overflow-hidden rounded-2xl p-3 lg:right-8 lg:flex">
         <div className="flex items-center justify-between px-1">
           <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
             {loading ? "Loading…" : `${visibleChannels.length} Channels`}
@@ -363,18 +363,54 @@ function LivePlayer() {
           </div>
         </div>
 
-        {/* Mobile Channel Strip */}
-        <div className="no-scrollbar flex gap-2 overflow-x-auto md:hidden">
-          {visibleChannels.slice(0, 60).map((ch) => (
-            <Button
-              variant="secondary"
-              key={ch.id}
-              onClick={() => setActiveId(ch.id)}
-              className={`shrink-0 rounded-full px-3.5 py-1.5 text-xs font-bold ${activeChannel?.id === ch.id ? "bg-primary text-primary-foreground" : "glass"}`}
+        {/* Compact channel guide: every viewport below lg gets a horizontal rail so the
+            channel list is never hidden behind a desktop-only drawer. */}
+        <div className="space-y-2 lg:hidden">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">
+              {loading ? "Loading…" : `${visibleChannels.length} Channels`}
+            </p>
+            <button type="button" onClick={() => void loadCatalogue(true)} className="text-[11px] font-semibold text-accent hover:underline">
+              Refresh
+            </button>
+          </div>
+
+          <div className="no-scrollbar flex shrink-0 gap-1.5 overflow-x-auto pb-0.5">
+            <button
+              type="button"
+              onClick={() => setSelectedCategory("")}
+              className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${selectedCategory === "" ? "bg-primary text-primary-foreground" : "glass text-muted-foreground"}`}
             >
-              {ch.name}
-            </Button>
-          ))}
+              All
+            </button>
+            {categories.map((cat) => (
+              <button
+                key={cat}
+                type="button"
+                onClick={() => setSelectedCategory(cat)}
+                className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${selectedCategory === cat ? "bg-primary text-primary-foreground" : "glass text-muted-foreground"}`}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+
+          <div className="no-scrollbar flex gap-2 overflow-x-auto pb-1">
+            {visibleChannels.map((ch) => (
+              <Button
+                variant="secondary"
+                key={ch.id}
+                onClick={() => setActiveId(ch.id)}
+                className={`h-auto shrink-0 rounded-xl px-3 py-1.5 text-left text-xs font-bold ${activeChannel?.id === ch.id ? "bg-primary text-primary-foreground" : "glass"}`}
+              >
+                {ch.name}
+              </Button>
+            ))}
+          </div>
+
+          {!loading && visibleChannels.length === 0 && (
+            <p className="text-xs text-muted-foreground">No channels match this filter. Try “All”.</p>
+          )}
         </div>
       </div>
     </main>
