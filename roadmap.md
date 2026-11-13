@@ -5,4 +5,4 @@
 - [x] Animate the existing full logo with subtle motion and deliver a new MP4.
 - [ ] Restyle live, movie, and series players and verify their controls.
 - [ ] Deliver an updated cyberpunk TV design Markdown guide.
-- [ ] Add "by Akshansh Sahu" to the full logo and produce a new entrance video MP4.
+- [x] Add "by Akshansh Sahu" to the full logo and produce a new entrance video MP4.
