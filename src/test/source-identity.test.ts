@@ -31,20 +31,37 @@ afterEach(() => {
 });
 
 describe("maxTV talks to the identity the app migrated to", () => {
-  it("upgrades the stale MAC and portal the app upgrades away from", async () => {
+  it("migrates the shipped default, which the app also migrates", async () => {
+    // Nothing configured: the built-in identity applies, and a default we wrote ourselves
+    // may be migrated. This is the only case where rewriting is legitimate.
     const calls = stub(() => ({ body: JSON.stringify({ js: { token: "T1" } }) }));
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    await maybeHandleLiveRequest(new Request("http://localhost/api/live/channels?source=maxtv"), {});
+    const handshake = calls.find((c) => c.url.includes("action=handshake"));
+    expect(handshake).toBeDefined();
+    expect(handshake!.headers["Cookie"]).toContain(encodeURIComponent(LIVE_MAC));
+    expect(handshake!.headers["Cookie"]).not.toContain(encodeURIComponent(LEGACY_MAC));
+    expect(handshake!.url).toContain("new.maxtv.be/c/");
+  });
+
+  it("uses a configured legacy account as given, and offers the live one second", async () => {
+    // A viewer whose account IS the older identity must not have it swapped silently: the
+    // swap changes which account the portal sees, and the failure that causes is invisible.
+    const calls = stub((url) =>
+      url.includes("action=handshake") && url.includes("new.maxtv.be/c/")
+        ? { body: JSON.stringify({ js: {} }) }
+        : { body: JSON.stringify({ js: { token: "T1" } }) },
+    );
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     await maybeHandleLiveRequest(new Request("http://localhost/api/live/channels?source=maxtv"), {
       MAXTV_PORTAL: "http://new.maxtv.be/stalker_portal/c/",
       MAXTV_MAC: LEGACY_MAC,
     });
-    const handshake = calls.find((c) => c.url.includes("action=handshake"));
-    expect(handshake).toBeDefined();
-    // The live identity, not the deprecated one.
-    expect(handshake!.headers["Cookie"]).toContain(encodeURIComponent(LIVE_MAC));
-    expect(handshake!.headers["Cookie"]).not.toContain(encodeURIComponent(LEGACY_MAC));
-    // And the active web-client path, whose load.php sits one level up.
-    expect(handshake!.url).toContain("new.maxtv.be/c/");
+    const handshakes = calls.filter((c) => c.url.includes("action=handshake"));
+    expect(handshakes.length).toBeGreaterThan(0);
+    // First as configured.
+    expect(handshakes[0]!.headers["Cookie"]).toContain(encodeURIComponent(LEGACY_MAC));
+    expect(handshakes[0]!.url).toContain("stalker_portal");
   });
 
   it("keeps a viewer's own non-legacy account untouched", async () => {
