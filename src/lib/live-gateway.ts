@@ -84,13 +84,13 @@ function readEnv(env: unknown, key: string, fallback = ""): string {
 
 function getConfig(env: unknown): GatewayConfig {
   return {
-    maxtvPortal: readEnv(env, "MAXTV_PORTAL", "http://new.maxtv.be/c"),
+    maxtvPortal: readEnv(env, "MAXTV_PORTAL", "http://new.maxtv.be/stalker_portal/c/"),
     maxtvMac: readEnv(env, "MAXTV_MAC", "00:1A:79:EE:03:9F"),
-    maxtvSerial: readEnv(env, "MAXTV_SERIAL", "092014N028195"),
+    maxtvSerial: readEnv(env, "MAXTV_SERIAL", "92180365D21FE"),
     maxtvDeviceId: readEnv(
       env,
       "MAXTV_DEVICE_ID",
-      "EC32E82D78B465AA7B53263FB24AD856013BEFB9F0698B46AA9E0FE9D0675B51",
+      "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070",
     ),
     starshareServer: readEnv(env, "STARSHARE_SERVER", "http://livebox.pro:8080"),
     starshareFallback: readEnv(env, "STARSHARE_FALLBACK", "http://starshare.fans:8080"),
@@ -173,28 +173,93 @@ export function keepsByFilter(name = "", category = "", filter = "hindi"): boole
   return keepsIndianHindi(name, category);
 }
 
-// ---------- Stalker & Xtream Clients (Web Fetch) ----------
+// ---------- Stalker portal client (maxTV) ----------
+//
+// Ported from the working Android implementation in creatorAkshanshsahu/v.4.9
+// (app/src/main/java/com/aktv/app/StalkerPortal.kt + StalkerProtocol.kt).
+// The sequence a MAG set-top box performs is reproduced exactly:
+//   handshake -> get_profile -> get_genres/get_all_channels -> create_link
+// The address the portal's `server/load.php` actually lives at is discovered,
+// not guessed, because the configured web-client path is usually not the API.
 
-function stalkerCandidates(portalUrl: string): string[] {
-  const configured = (portalUrl || "http://new.maxtv.be/c").trim().replace(/\/+$/, "");
-  let origin = configured;
+/** One channel exactly as the portal advertises it. `cmd` is the handle traded for a stream URL. */
+interface StalkerChannel {
+  id: string;
+  name: string;
+  cmd: string;
+  genre: string;
+  logo: string;
+}
+
+/** The device identity a portal recognises. Defaults are the working set from the Android app. */
+interface StalkerAccount {
+  portal: string;
+  mac: string;
+  serial: string;
+  deviceId: string;
+}
+
+const STALKER_DEFAULT_PORTAL = "http://new.maxtv.be/stalker_portal/c/";
+const STALKER_DEFAULT_MAC = "00:1A:79:EE:03:9F";
+const STALKER_DEFAULT_SERIAL = "92180365D21FE";
+const STALKER_DEFAULT_DEVICE = "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070";
+
+/** `server/load.php` — the API every panel action is posted to. */
+const STALKER_API = "server/load.php";
+
+function stalkerOrigin(url: string): string {
   try {
-    const u = new URL(configured);
-    origin = `${u.protocol}//${u.host}`;
+    const u = new URL(url.trim());
+    return `${u.protocol}//${u.host}`;
   } catch {
-    // ignore malformed URL
+    return url.trim().replace(/\/+$/, "");
   }
-  const set = new Set<string>();
-  const add = (u: string) => {
-    if (u.startsWith("http")) set.add(u);
+}
+
+/**
+ * Every address a portal's API may live at, in the order the Android app tries them.
+ *
+ * The configured value is the *web client* path (`http://host/stalker_portal/c/`) and its
+ * `server/load.php` is normally one level up, at `http://host/stalker_portal/server/load.php`.
+ * Asking only for `<configured>/server/load.php` is what produces a 404 on most panels.
+ */
+function stalkerCandidates(portalUrl: string): string[] {
+  const configured = (portalUrl || STALKER_DEFAULT_PORTAL).trim().replace(/\/+$/, "");
+  const origin = stalkerOrigin(configured);
+  const out = new Set<string>();
+  const add = (url: string) => {
+    if (url.startsWith("http")) out.add(url);
   };
-  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/stalker_portal/server/load.php`);
-  add(`${origin}/stalker_portal/server/load.php`);
-  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/server/load.php`);
-  add(`${configured}/server/load.php`);
-  add(`${origin}/server/load.php`);
+
+  // Exactly as configured.
+  add(`${configured}/${STALKER_API}`);
+  // The web-client path is not the API: its load.php sits one level up.
+  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/${STALKER_API}`);
+  add(`${configured}/portal.php`);
+  // The same files on the bare host.
+  add(`${origin}/stalker_portal/${STALKER_API}`);
+  add(`${origin}/${STALKER_API}`);
   add(`${origin}/portal.php`);
-  return [...set];
+  add(`${origin}/stalker_portal/portal.php`);
+  // A panel that only answers over TLS.
+  if (configured.startsWith("http://")) {
+    const secure = `https://${configured.slice("http://".length)}`;
+    add(`${secure}/${STALKER_API}`);
+    if (secure.endsWith("/c")) add(`${secure.slice(0, -2)}/${STALKER_API}`);
+  }
+  return [...out];
+}
+
+/** A portal answered, but not with something usable. Carries the portal's own refusal when it gave one. */
+class StalkerError extends Error {
+  readonly status: number | null;
+  readonly detail: string;
+  constructor(status: number | null = null, detail = "") {
+    super(status !== null ? `The portal refused the request (HTTP ${status})` : detail || "The portal did not answer with a usable response");
+    this.name = "StalkerError";
+    this.status = status;
+    this.detail = detail;
+  }
 }
 
 function parseEnvelope(body: string): Record<string, unknown> | unknown[] | null {
@@ -212,31 +277,126 @@ function parseEnvelope(body: string): Record<string, unknown> | unknown[] | null
   }
 }
 
+/** The `js` envelope, or the root object when the portal did not wrap its answer. */
+function stalkerJs(body: string): Record<string, unknown> | null {
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return null;
+  const js = root["js"];
+  return js && typeof js === "object" && !Array.isArray(js) ? (js as Record<string, unknown>) : root;
+}
+
+/** The session token a handshake issues. */
+function stalkerToken(body: string): string | null {
+  const js = stalkerJs(body);
+  const tok = js?.["token"];
+  return typeof tok === "string" && tok.trim() ? tok.trim() : null;
+}
+
+/** The portal's own refusal text, when it sent one. */
+function stalkerError(body: string): string | null {
+  const js = stalkerJs(body);
+  const root = parseEnvelope(body);
+  const rootObj = root && !Array.isArray(root) ? root : null;
+  const text =
+    (typeof js?.["error"] === "string" && js["error"]) ||
+    (typeof js?.["msg"] === "string" && js["msg"]) ||
+    (typeof rootObj?.["error"] === "string" && rootObj["error"]) ||
+    "";
+  return String(text).trim() || null;
+}
+
+/** True when the portal says the token is gone, so the caller has to handshake again. */
+function isStalkerExpired(body: string): boolean {
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return false;
+  const js = (root["js"] && typeof root["js"] === "object" ? root["js"] : root) as Record<string, unknown>;
+  const flag = js["not_valid"];
+  if (flag === true) return true;
+  if (typeof flag === "number" && flag !== 0) return true;
+  const msg = `${String(js["error"] ?? "")} ${String(js["msg"] ?? "")} ${String(root["error"] ?? "")}`.toLowerCase();
+  return msg.includes("authorization failed") || msg.includes("not valid") || (msg.includes("token") && msg.includes("expire"));
+}
+
+/** `get_all_channels`: the `js.data` array of `{id, name, cmd, tv_genre_id, logo}`. */
+function stalkerChannels(body: string): StalkerChannel[] {
+  const js = stalkerJs(body);
+  const data = js?.["data"];
+  if (!Array.isArray(data)) return [];
+  const out: StalkerChannel[] = [];
+  for (const item of data) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const cmd = String(rec["cmd"] ?? "").trim();
+    const name = String(rec["name"] ?? rec["title"] ?? "").trim();
+    const id = String(rec["id"] ?? rec["ch_id"] ?? "").trim();
+    // A row without a name or without a handle cannot be shown or played.
+    if (!cmd || !name) continue;
+    out.push({
+      id: id || name,
+      name,
+      cmd,
+      genre: String(rec["tv_genre_id"] ?? "").trim(),
+      logo: String(rec["logo"] ?? "").trim(),
+    });
+  }
+  return out;
+}
+
+/** `get_genres`: `[{id, title}]`, or the same array under `js`. */
+function stalkerGenres(body: string): Map<string, string> {
+  const root = parseEnvelope(body);
+  let array: unknown[] | null = null;
+  if (Array.isArray(root)) array = root;
+  else if (root && typeof root === "object") {
+    const jsRaw = root["js"];
+    if (jsRaw && typeof jsRaw === "object" && !Array.isArray(jsRaw)) {
+      const nested = (jsRaw as Record<string, unknown>)["data"];
+      if (Array.isArray(nested)) array = nested;
+    } else if (Array.isArray(jsRaw)) array = jsRaw;
+    if (!array) {
+      const data = root["data"];
+      if (Array.isArray(data)) array = data;
+    }
+  }
+  const out = new Map<string, string>();
+  if (!array) return out;
+  for (const item of array) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const id = String(rec["id"] ?? "").trim();
+    const title = String(rec["title"] ?? "").trim();
+    if (id && title) out.set(id, title);
+  }
+  return out;
+}
+
+/** `create_link`: the raw `js.cmd` handle, still carrying the player's `ffmpeg ` prefix. */
+function stalkerLink(body: string): string | null {
+  const js = stalkerJs(body);
+  const cmd = js?.["cmd"];
+  return typeof cmd === "string" && cmd.trim() ? cmd.trim() : null;
+}
+
+/**
+ * The URL inside a portal command. Portals answer `ffmpeg http://host/…/index.m3u8`, and some append
+ * Kodi-style `|User-Agent=…` parameters that players cannot use, so both are cut away here.
+ */
 function extractStalkerStreamUrl(cmd: string): string | null {
   const clean = String(cmd || "")
     .trim()
-    .replace(/^ff(?:mpeg|rt\d*)\s+/i, "")
+    .replace(/^ffmpeg/i, "")
     .trim()
     .split("|")[0]
     ?.trim() ?? "";
   return /^(?:https?|rtsp):\/\//i.test(clean) ? clean : null;
 }
 
-function isStalkerExpired(body: string): boolean {
-  const root = parseEnvelope(body);
-  if (!root || Array.isArray(root)) return false;
-  const js = (root["js"] && typeof root["js"] === "object" ? root["js"] : root) as Record<string, unknown>;
-  if (js["not_valid"] === true || (typeof js["not_valid"] === "number" && js["not_valid"] !== 0)) return true;
-  const msg = `${String(js["error"] ?? "")} ${String(js["msg"] ?? "")} ${String(root["error"] ?? "")}`.toLowerCase();
-  return msg.includes("authorization failed") || msg.includes("not valid") || (msg.includes("token") && msg.includes("expire"));
-}
-
-async function fetchTextTimeout(url: string, headers: Record<string, string>, timeoutMs = 15000): Promise<string> {
+async function fetchTextTimeout(url: string, headers: Record<string, string>, timeoutMs = 20000): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { headers, redirect: "follow", signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const res = await fetch(url, { headers, signal: ctrl.signal });
+    if (res.status !== 200) throw new StalkerError(res.status);
     return await res.text();
   } finally {
     clearTimeout(timer);
@@ -249,12 +409,22 @@ const stalkerSession: {
   profiled: boolean;
 } = { endpoint: null, token: null, profiled: false };
 
-function stalkerHeaders(cfg: GatewayConfig, auth: boolean): Record<string, string> {
+function stalkerAccount(cfg: GatewayConfig): StalkerAccount {
+  return {
+    portal: cfg.maxtvPortal,
+    mac: cfg.maxtvMac,
+    serial: cfg.maxtvSerial,
+    deviceId: cfg.maxtvDeviceId,
+  };
+}
+
+function stalkerHeaders(cfg: GatewayConfig, account: StalkerAccount, auth: boolean): Record<string, string> {
   const h: Record<string, string> = {
-    Cookie: `mac=${encodeURIComponent(cfg.maxtvMac)}; stb_lang=en; timezone=Europe/London`,
+    Cookie: `mac=${encodeURIComponent(account.mac)}; stb_lang=en; timezone=Europe/London`,
     "User-Agent": MAG_USER_AGENT,
     "X-User-Agent": MAG_DEVICE_UA,
     Accept: "*/*",
+    // The web-client path the portal was issued with, independent of where its API turned out to be.
     Referer: `${cfg.maxtvPortal.replace(/\/+$/, "")}/`,
   };
   if (auth && stalkerSession.token) h["Authorization"] = `Bearer ${stalkerSession.token}`;
@@ -262,39 +432,78 @@ function stalkerHeaders(cfg: GatewayConfig, auth: boolean): Record<string, strin
 }
 
 function buildStalkerUrl(base: string, type: string, action: string, params: Record<string, string>): string {
-  const u = new URL(base);
-  u.searchParams.set("type", type);
-  u.searchParams.set("action", action);
-  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
-  u.searchParams.set("JsHttpRequest", "1-xml");
-  return u.toString();
+  const url = new URL(base);
+  url.searchParams.set("type", type);
+  url.searchParams.set("action", action);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("JsHttpRequest", "1-xml");
+  return url.toString();
 }
 
+async function stalkerRaw(
+  cfg: GatewayConfig,
+  account: StalkerAccount,
+  base: string,
+  type: string,
+  action: string,
+  params: Record<string, string>,
+  auth: boolean,
+): Promise<string> {
+  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 20000);
+  return body;
+}
+
+/**
+ * Asks every candidate address for a handshake once and keeps the one that answers with a token.
+ * A portal that refuses in its own words (expired MAC, too many connections) is reported in those
+ * words instead of as a list of HTTP codes.
+ */
 async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
-  const candidates = stalkerSession.endpoint ? [stalkerSession.endpoint] : stalkerCandidates(cfg.maxtvPortal);
+  const account = stalkerAccount(cfg);
+  if (stalkerSession.endpoint) {
+    const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, "stb", "handshake", { token: "", prehash: "0" }, false);
+    const issued = stalkerToken(body);
+    if (!issued) throw new StalkerError(null, stalkerError(body) ?? "the portal issued no token");
+    stalkerSession.token = issued;
+    stalkerSession.profiled = false;
+    return issued;
+  }
+
+  const failures: string[] = [];
+  let spoken: string | null = null;
   let lastErr: unknown = null;
-  for (const candidate of candidates) {
+
+  for (const candidate of stalkerCandidates(cfg.maxtvPortal)) {
     try {
-      const body = await fetchTextTimeout(
-        buildStalkerUrl(candidate, "stb", "handshake", { token: "", prehash: "0" }),
-        stalkerHeaders(cfg, false),
-        10000,
-      );
-      const root = parseEnvelope(body);
-      const js = root && !Array.isArray(root) ? ((root["js"] as Record<string, unknown>) ?? root) : null;
-      const tok = typeof js?.["token"] === "string" ? js["token"].trim() : "";
-      if (tok) {
-        stalkerSession.endpoint = candidate;
-        stalkerSession.token = tok;
-        stalkerSession.profiled = false;
-        return tok;
+      const body = await stalkerRaw(cfg, account, candidate, "stb", "handshake", { token: "", prehash: "0" }, false);
+      const issued = stalkerToken(body);
+      if (!issued) {
+        const detail = stalkerError(body);
+        if (detail && !spoken) spoken = detail;
+        failures.push(`${candidate} no token`);
+        continue;
       }
+      stalkerSession.endpoint = candidate;
+      stalkerSession.token = issued;
+      stalkerSession.profiled = false;
+      return issued;
     } catch (e) {
       lastErr = e;
+      if (e instanceof StalkerError) {
+        if (e.status === null && e.detail && !spoken) spoken = e.detail;
+        failures.push(`${candidate} ${e.status !== null ? `HTTP ${e.status}` : "no token"}`);
+      } else {
+        failures.push(`${candidate} ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   }
+
   stalkerSession.endpoint = null;
-  throw lastErr instanceof Error ? lastErr : new Error("maxTV handshake failed");
+  stalkerSession.token = null;
+  const tried = failures.slice(0, 4).join(", ") + (failures.length > 4 ? " …" : "");
+  const detail = spoken ?? (failures.length ? `no portal at this address (tried ${tried})` : "no portal at this address");
+  if (lastErr instanceof StalkerError) throw new StalkerError(lastErr.status, lastErr.detail || detail);
+  throw new StalkerError(null, detail);
 }
 
 async function stalkerRequest(
@@ -304,103 +513,92 @@ async function stalkerRequest(
   params: Record<string, string>,
   retried = false,
 ): Promise<string> {
+  const account = stalkerAccount(cfg);
   if (!stalkerSession.token || !stalkerSession.endpoint) await stalkerHandshake(cfg);
+
   if (!stalkerSession.profiled && stalkerSession.endpoint) {
     stalkerSession.profiled = true;
+    // Some portals answer get_profile only after a second step they do not advertise; the token is
+    // what the catalogue calls need, so a refusal here is not fatal.
     try {
-      await fetchTextTimeout(
-        buildStalkerUrl(stalkerSession.endpoint, "stb", "get_profile", {
+      await stalkerRaw(
+        cfg,
+        account,
+        stalkerSession.endpoint,
+        "stb",
+        "get_profile",
+        {
           hd: "1",
           auth_second_step: "1",
           prehash: "0",
           num_banks: "2",
           stb_type: "MAG254",
-          sn: cfg.maxtvSerial,
-          device_id: cfg.maxtvDeviceId,
-          device_id2: cfg.maxtvDeviceId,
+          sn: account.serial,
+          device_id: account.deviceId,
+          device_id2: account.deviceId,
+          signature: "",
           client_type: "STB",
           image_version: "218",
           video_out: "hdmi",
           hw_version: "1.7-BD-00",
           api_signature: "262",
-        }),
-        stalkerHeaders(cfg, true),
-        10000,
+        },
+        true,
       );
     } catch {
       // non-fatal on portals that do not enforce get_profile
     }
   }
-  const body = await fetchTextTimeout(
-    buildStalkerUrl(stalkerSession.endpoint!, type, action, params),
-    stalkerHeaders(cfg, true),
-    22000,
-  );
+
+  if (!stalkerSession.endpoint) throw new StalkerError(null, "no portal address was reached");
+  const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, type, action, params, true);
+
+  // An expired token is normal on a portal that sat idle; handshake once and repeat the call.
   if (!retried && isStalkerExpired(body)) {
     stalkerSession.token = null;
+    stalkerSession.endpoint = null;
     await stalkerHandshake(cfg);
     return stalkerRequest(cfg, type, action, params, true);
   }
   return body;
 }
 
-async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
-  let portalOrigin = "http://new.maxtv.be";
+/** The whole maxTV catalogue, in the order the portal lists it. */
+async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
+  const account = stalkerAccount(cfg);
+  const channelsBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
+  const listed = stalkerChannels(channelsBody);
+  if (listed.length === 0) {
+    throw new StalkerError(null, stalkerError(channelsBody) ?? "The portal lists no channels");
+  }
+
+  // Genres are best effort: a portal may refuse them without refusing the channels.
+  let genres = new Map<string, string>();
   try {
-    const u = new URL(cfg.maxtvPortal);
-    portalOrigin = `${u.protocol}//${u.host}`;
+    genres = stalkerGenres(await stalkerRequest(cfg, "itv", "get_genres", {}));
   } catch {
-    // keep default
+    genres = new Map();
   }
 
-  const genresBody = await stalkerRequest(cfg, "itv", "get_genres", {}).catch(() => "");
-  const genresMap = new Map<string, string>();
-  const gEnv = parseEnvelope(genresBody);
-  const gArr = Array.isArray(gEnv)
-    ? gEnv
-    : gEnv && typeof gEnv === "object"
-      ? (((gEnv["js"] as Record<string, unknown> | undefined)?.["data"] ?? gEnv["js"] ?? gEnv["data"]) as unknown[])
-      : [];
-  if (Array.isArray(gArr)) {
-    for (const item of gArr) {
-      const rec = item as Record<string, unknown>;
-      const id = String(rec?.["id"] ?? "").trim();
-      const title = String(rec?.["title"] ?? "").trim();
-      if (id && title && id !== "*" && title.toLowerCase() !== "all") genresMap.set(id, title);
-    }
-  }
+  const origin = stalkerOrigin(account.portal);
+  const channels: LiveChannelItem[] = listed.map((c) => {
+    const genre = genres.get(c.genre);
+    return {
+      id: `st:${c.id}`,
+      rawId: c.id,
+      source: "maxtv" as const,
+      name: c.name,
+      // The portal publishes logo paths relative to its own host.
+      category: genre && genre.trim() && genre !== "*" && genre.toLowerCase() !== "all" ? genre : "maxTV",
+      logo: c.logo.startsWith("/") ? `${origin}${c.logo}` : c.logo,
+      cmd: c.cmd,
+    };
+  });
 
-  const chBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
-  const chEnv = parseEnvelope(chBody);
-  const data =
-    chEnv && !Array.isArray(chEnv)
-      ? (((chEnv["js"] as Record<string, unknown> | undefined)?.["data"] ?? chEnv["data"]) as unknown[])
-      : [];
-  if (!Array.isArray(data) || data.length === 0) throw new Error("Empty maxTV catalogue");
-
-  const out: LiveChannelItem[] = [];
-  for (const raw of data) {
-    const item = raw as Record<string, unknown>;
-    const cmd = String(item?.["cmd"] ?? "").trim();
-    const name = String(item?.["name"] ?? item?.["title"] ?? "").trim();
-    const rawId = String(item?.["id"] ?? item?.["ch_id"] ?? "").trim();
-    if (!cmd || !name) continue;
-    const genreId = String(item?.["tv_genre_id"] ?? "").trim();
-    const logoRaw = String(item?.["logo"] ?? "").trim();
-    const logo = logoRaw.startsWith("/") ? `${portalOrigin}${logoRaw}` : logoRaw;
-    out.push({
-      id: `st:${rawId || name}`,
-      rawId: rawId || name,
-      source: "maxtv",
-      name,
-      category: genresMap.get(genreId) || "maxTV",
-      logo,
-      cmd,
-    });
-  }
-  return out;
+  return { channels, endpoint: stalkerSession.endpoint };
 }
 
+/** The playable URL for one channel handle. */
 async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string> {
   const body = await stalkerRequest(cfg, "itv", "create_link", {
     cmd,
@@ -410,13 +608,9 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
     download: "0",
     force_ch_link_check: "0",
   });
-  const env = parseEnvelope(body);
-  const rawCmd =
-    env && !Array.isArray(env)
-      ? String(((env["js"] as Record<string, unknown> | undefined)?.["cmd"] ?? env["cmd"]) || "")
-      : "";
-  const url = extractStalkerStreamUrl(rawCmd) || extractStalkerStreamUrl(cmd);
-  if (!url) throw new Error("maxTV returned no playable stream URL");
+  // A portal may hand back the channel's own address unchanged; that is a valid answer too.
+  const url = extractStalkerStreamUrl(stalkerLink(body) ?? "") || extractStalkerStreamUrl(cmd);
+  if (!url) throw new StalkerError(null, stalkerError(body) ?? "The portal returned no playable link for this channel");
   return url;
 }
 
@@ -486,10 +680,10 @@ async function fetchStarshareCatalogue(cfg: GatewayConfig): Promise<LiveChannelI
 // ---------- In-Memory Catalogue Cache ----------
 
 const memCache: {
-  maxtv: { items: LiveChannelItem[]; fetchedAt: number; usingSeed: boolean; error: string | null };
+  maxtv: { items: LiveChannelItem[]; fetchedAt: number; usingSeed: boolean; error: string | null; endpoint: string | null };
   starshare: { items: LiveChannelItem[]; fetchedAt: number; error: string | null };
 } = {
-  maxtv: { items: [], fetchedAt: 0, usingSeed: false, error: null },
+  maxtv: { items: [], fetchedAt: 0, usingSeed: false, error: null, endpoint: null },
   starshare: { items: [], fetchedAt: 0, error: null },
 };
 
@@ -498,8 +692,10 @@ async function loadMaxtvCached(cfg: GatewayConfig, force = false): Promise<LiveC
     return memCache.maxtv.items;
   }
   try {
-    const live = await fetchMaxtvCatalogue(cfg);
-    memCache.maxtv = { items: live, fetchedAt: Date.now(), usingSeed: false, error: null };
+    const { channels: live, endpoint } = await fetchMaxtvCatalogue(cfg);
+    // Remember the address that answered so later calls skip discovery.
+    if (endpoint) memCache.maxtv.endpoint = endpoint;
+    memCache.maxtv = { items: live, fetchedAt: Date.now(), usingSeed: false, error: null, endpoint: endpoint ?? memCache.maxtv.endpoint };
     return live;
   } catch (e) {
     const fallback = memCache.maxtv.items.length > 0 ? memCache.maxtv.items : PREVIEW_SEED_CHANNELS;
@@ -508,6 +704,7 @@ async function loadMaxtvCached(cfg: GatewayConfig, force = false): Promise<LiveC
       fetchedAt: Date.now(),
       usingSeed: fallback === PREVIEW_SEED_CHANNELS,
       error: e instanceof Error ? e.message : String(e),
+      endpoint: memCache.maxtv.endpoint,
     };
     return fallback;
   }
@@ -956,12 +1153,18 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const categories = [...new Set(filtered.map((c) => displayCategoryName(c.category)))];
     const channels = filtered.slice(0, limit).map((c) => toDto(c, publicOrigin));
 
+    // Never let a seed fallback masquerade as a working catalogue: report why maxTV failed.
+    const portalError = source !== "starshare" ? memCache.maxtv.error : null;
+    const usingSeed = source !== "starshare" && memCache.maxtv.usingSeed;
+
     return jsonResponse(200, {
       ok: true,
       source,
       filter,
       totalMatching: filtered.length,
-      usingPreviewSeed: source !== "starshare" && memCache.maxtv.usingSeed,
+      usingPreviewSeed: usingSeed,
+      portalError: usingSeed ? portalError : null,
+      portalEndpoint: source !== "starshare" ? memCache.maxtv.endpoint : null,
       categories,
       channels,
     });
