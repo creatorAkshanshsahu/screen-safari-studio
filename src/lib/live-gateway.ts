@@ -523,8 +523,33 @@ async function stalkerRaw(
 ): Promise<string> {
   // 8 candidates x 20s was up to ~160s of blank page when the host is a black hole.
   // A reachable portal answers a handshake well inside this.
-  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 7000);
-  return body;
+  const target = buildStalkerUrl(base, type, action, params);
+  try {
+    const body = await fetchTextTimeout(target, stalkerHeaders(cfg, account, auth), 7000);
+    recordPortal({ at: Date.now(), action, address: portalAddress(base), status: 200, said: portalSaid(body) });
+    return body;
+  } catch (e) {
+    // A refusal is the useful fact; record it before it becomes an exception.
+    const status = e instanceof StalkerError && e.status !== null ? e.status : 0;
+    recordPortal({
+      at: Date.now(),
+      action,
+      address: portalAddress(base),
+      status,
+      said: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
+    });
+    throw e;
+  }
+}
+
+/** The portal path only: no query, no credentials. */
+function portalAddress(base: string): string {
+  try {
+    const u = new URL(base);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return base.split("?")[0]!;
+  }
 }
 
 /**
@@ -649,11 +674,51 @@ async function stalkerRequest(
   return body;
 }
 
+/**
+ * The paginated catalogue, for panels that refuse the bulk `get_all_channels`.
+ *
+ * Twelve pages of fourteen, which is what the app asks for. A short page ends the walk: the
+ * portal is telling us it has nothing more, and guessing a page count would mean asking a
+ * portal for pages it does not have.
+ */
+async function stalkerPagedChannels(cfg: GatewayConfig): Promise<StalkerChannel[]> {
+  const out: StalkerChannel[] = [];
+  const seen = new Set<string>();
+  for (let page = 1; page <= 12; page++) {
+    const body = await stalkerRequest(cfg, "itv", "get_ordered_list", {
+      genre: "*",
+      force_ch_link_check: "0",
+      fav: "0",
+      sortby: "number",
+      hd: "0",
+      p: String(page),
+    });
+    const batch = stalkerChannels(body);
+    for (const c of batch) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      out.push(c);
+    }
+    if (batch.length < 14) break;
+  }
+  return out;
+}
+
 /** The whole maxTV catalogue, in the order the portal lists it. */
 async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
   const account = stalkerAccount(cfg);
   const channelsBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
-  const listed = stalkerChannels(channelsBody);
+  let listed = stalkerChannels(channelsBody);
+
+  if (listed.length === 0) {
+    const spoken = stalkerError(channelsBody);
+    // Some panels disable the bulk call and serve only paginated `get_ordered_list`. The
+    // app carries this fallback for exactly that case; without it a working portal looks
+    // like a portal with no channels.
+    const paged = await stalkerPagedChannels(cfg).catch(() => []);
+    if (paged.length > 0) listed = paged;
+    else if (spoken) throw new StalkerError(null, spoken);
+  }
   if (listed.length === 0) {
     throw new StalkerError(null, stalkerError(channelsBody) ?? "The portal lists no channels");
   }
@@ -1808,6 +1873,38 @@ interface SegmentAttempt {
 }
 
 const segmentLog = new Map<string, SegmentAttempt[]>();
+
+/**
+ * The last portal exchanges, newest first.
+ *
+ * "maxTV is failing" has several distinguishable causes -- portal unreachable, identity
+ * refused, no token, catalogue empty, create_link refused, media refused -- and the player
+ * shows the same blank rectangle for all of them. Each call is recorded with the status and
+ * the portal's own words, which is the only way to tell them apart from a browser.
+ */
+interface PortalAttempt {
+  at: number;
+  action: string;
+  address: string;
+  status: number;
+  said: string;
+}
+
+const portalTrace: PortalAttempt[] = [];
+const PORTAL_TRACE_LIMIT = 30;
+
+function recordPortal(attempt: PortalAttempt): void {
+  portalTrace.unshift(attempt);
+  if (portalTrace.length > PORTAL_TRACE_LIMIT) portalTrace.length = PORTAL_TRACE_LIMIT;
+}
+
+/** The portal's own refusal, or a short excerpt of what it sent instead. */
+function portalSaid(body: string): string {
+  const spoken = stalkerError(body);
+  if (spoken) return spoken.slice(0, 200);
+  const head = body.trim().replace(/\s+/g, " ").slice(0, 160);
+  return head || "(empty body)";
+}
 const __hdnea_re = /__hdnea__=[^&"'\s]*/g;
 const SEGMENT_LOG_LIMIT = 24;
 
@@ -2578,6 +2675,15 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       const report: Record<string, unknown> = {
         ok: true,
         kind: "maxtv",
+        // What the portal itself said, in order. Five different failures look identical in
+        // the player; this is where they differ.
+        trace: portalTrace.map((t) => ({
+          secondsAgo: Math.round((Date.now() - t.at) / 100) / 10,
+          action: t.action,
+          address: t.address,
+          status: t.status,
+          said: t.said,
+        })),
         configured: { portal: cfg.maxtvPortal, mac: cfg.maxtvMac },
         identities: candidates,
         migrated:
@@ -2597,7 +2703,13 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       }
 
       const pool = await getChannelsBySource(cfg, "maxtv", false).catch(() => []);
-      report['catalogue'] = { channels: pool.length };
+      report['catalogue'] = {
+        channels: pool.length,
+        note:
+          pool.length === 0
+            ? "The handshake succeeded but no channels came back: the bulk call and the paged fallback both returned nothing. The trace shows what each said."
+            : "Channels are listed.",
+      };
       const ch = pool.find((c) => c.id === id || c.rawId === id);
       if (ch?.cmd && !ch.cmd.startsWith("seed://")) {
         try {
