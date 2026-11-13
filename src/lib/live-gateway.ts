@@ -523,8 +523,33 @@ async function stalkerRaw(
 ): Promise<string> {
   // 8 candidates x 20s was up to ~160s of blank page when the host is a black hole.
   // A reachable portal answers a handshake well inside this.
-  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 7000);
-  return body;
+  const target = buildStalkerUrl(base, type, action, params);
+  try {
+    const body = await fetchTextTimeout(target, stalkerHeaders(cfg, account, auth), 7000);
+    recordPortal({ at: Date.now(), action, address: portalAddress(base), status: 200, said: portalSaid(body) });
+    return body;
+  } catch (e) {
+    // A refusal is the useful fact; record it before it becomes an exception.
+    const status = e instanceof StalkerError && e.status !== null ? e.status : 0;
+    recordPortal({
+      at: Date.now(),
+      action,
+      address: portalAddress(base),
+      status,
+      said: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
+    });
+    throw e;
+  }
+}
+
+/** The portal path only: no query, no credentials. */
+function portalAddress(base: string): string {
+  try {
+    const u = new URL(base);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return base.split("?")[0]!;
+  }
 }
 
 /**
@@ -649,11 +674,51 @@ async function stalkerRequest(
   return body;
 }
 
+/**
+ * The paginated catalogue, for panels that refuse the bulk `get_all_channels`.
+ *
+ * Twelve pages of fourteen, which is what the app asks for. A short page ends the walk: the
+ * portal is telling us it has nothing more, and guessing a page count would mean asking a
+ * portal for pages it does not have.
+ */
+async function stalkerPagedChannels(cfg: GatewayConfig): Promise<StalkerChannel[]> {
+  const out: StalkerChannel[] = [];
+  const seen = new Set<string>();
+  for (let page = 1; page <= 12; page++) {
+    const body = await stalkerRequest(cfg, "itv", "get_ordered_list", {
+      genre: "*",
+      force_ch_link_check: "0",
+      fav: "0",
+      sortby: "number",
+      hd: "0",
+      p: String(page),
+    });
+    const batch = stalkerChannels(body);
+    for (const c of batch) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      out.push(c);
+    }
+    if (batch.length < 14) break;
+  }
+  return out;
+}
+
 /** The whole maxTV catalogue, in the order the portal lists it. */
 async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
   const account = stalkerAccount(cfg);
   const channelsBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
-  const listed = stalkerChannels(channelsBody);
+  let listed = stalkerChannels(channelsBody);
+
+  if (listed.length === 0) {
+    const spoken = stalkerError(channelsBody);
+    // Some panels disable the bulk call and serve only paginated `get_ordered_list`. The
+    // app carries this fallback for exactly that case; without it a working portal looks
+    // like a portal with no channels.
+    const paged = await stalkerPagedChannels(cfg).catch(() => []);
+    if (paged.length > 0) listed = paged;
+    else if (spoken) throw new StalkerError(null, spoken);
+  }
   if (listed.length === 0) {
     throw new StalkerError(null, stalkerError(channelsBody) ?? "The portal lists no channels");
   }
@@ -1495,6 +1560,70 @@ function tokenHeadersFrom(
  * ($Number$, $RepresentationID$, $Time$, $Bandwidth$) are expanded by the player and
  * survive intact in the path appended after it.
  */
+/**
+ * Every `<BaseURL>` element in document order, with the directory it actually means.
+ *
+ * The value of a nested BaseURL is relative to its parent's, so the walk keeps a stack of
+ * the base in force at each open element. Self-closing tags pop immediately; anything
+ * unclosed is tolerated rather than throwing.
+ */
+function dashBaseElements(
+  doc: string,
+  manifestUrl: string,
+): Array<{ start: number; end: number; raw: string; resolved: URL | null }> {
+  const found: Array<{ start: number; end: number; raw: string; resolved: URL | null }> = [];
+  const stack: Array<{ tag: string; base: string }> = [];
+  let base = manifestUrl;
+  const tagRe = /<(\/?)([A-Za-z][\w:.-]*)([^>]*?)(\/?)>/g;
+  const lower = doc.toLowerCase();
+  let m: RegExpExecArray | null;
+
+  while ((m = tagRe.exec(doc))) {
+    const closing = Boolean(m[1]);
+    const name = m[2]!.toLowerCase();
+    const selfClosing = Boolean(m[4]);
+
+    if (closing) {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i]!.tag === name) {
+          base = stack[i]!.base;
+          stack.length = i;
+          break;
+        }
+      }
+      continue;
+    }
+
+    if (name === "baseurl") {
+      const contentStart = tagRe.lastIndex;
+      const closeAt = lower.indexOf("</baseurl>", contentStart);
+      const contentEnd = closeAt < 0 ? doc.length : closeAt;
+      const raw = doc.slice(contentStart, contentEnd).trim();
+      let resolved: URL | null = null;
+      try {
+        // The base in force is the manifest URL at the top of the document, and the
+        // enclosing BaseURL inside it.
+        resolved = new URL(raw, base);
+      } catch {
+        resolved = null;
+      }
+      if (resolved) base = resolved.toString();
+      found.push({
+        start: m.index,
+        end: closeAt < 0 ? doc.length : closeAt + "</baseurl>".length,
+        raw,
+        resolved,
+      });
+      tagRe.lastIndex = contentEnd;
+      continue;
+    }
+
+    if (!selfClosing) stack.push({ tag: name, base });
+  }
+
+  return found;
+}
+
 async function rewriteDashManifestWeb(
   mpdText: string,
   manifestUrl: string,
@@ -1556,29 +1685,32 @@ async function rewriteDashManifestWeb(
   // Every BaseURL, wherever it sits, must land on our proxy. Nested BaseURLs then
   // concatenate correctly because each one is rewritten to a fully-qualified URL.
   if (/<BaseURL>/i.test(out)) {
-    // One pass, every tag. Precompute each unique target first because the rewrite is
-    // async, then swap them all in a single synchronous replace-with-callback. Doing it
-    // one match at a time with a string pattern silently skipped every repeat.
-    const proxied = new Map<string, string>();
-    for (const m of out.matchAll(/<BaseURL>\s*([\s\S]*?)\s*<\/BaseURL>/gi)) {
-      const raw = m[1]!;
-      if (proxied.has(raw)) continue;
-      const resolved = resolve(raw);
+    // Resolve every BaseURL against its *parent*, not against the manifest.
+    //
+    // DASH nests them: an MPD-level `<BaseURL>143/</BaseURL>` and an AdaptationSet-level
+    // `<BaseURL>video/</BaseURL>` mean `143/video/`. Resolving each one against the
+    // manifest URL instead gives `video/` -- a directory that does not exist. A player
+    // given a manifest whose every segment 404s reports it as having no usable streams.
+    const elements = dashBaseElements(out, manifestUrl);
+    const rewrites: Array<{ start: number; end: number; text: string }> = [];
+    for (const el of elements) {
+      const resolved = el.resolved;
       if (!resolved) continue;
       // A BaseURL without a trailing slash is a file-name *prefix*, not a directory.
       const isDir = resolved.pathname.endsWith("/");
       const cut = resolved.pathname.lastIndexOf("/");
       // The query is part of the credential, not decoration. Jio signs the directory --
-      // `.../143/?__hdnea__=...` -- and dropping it here left every segment fetch unsigned,
-      // which the CDN answers with 450.
+      // `.../143/?__hdnea__=...` -- and dropping it left every segment fetch unsigned.
       const suffix = isDir ? "" : `${resolved.pathname.slice(cut + 1)}${resolved.search}`;
       const dir = `${resolved.origin}${resolved.pathname.slice(0, cut + 1)}${isDir ? resolved.search : ""}`;
-      proxied.set(raw, `${await proxyDir(dir)}${suffix}`);
+      rewrites.push({
+        start: el.start,
+        end: el.end,
+        text: `<BaseURL>${await proxyDir(dir)}${suffix}</BaseURL>`,
+      });
     }
-    out = out.replace(/(<BaseURL>)\s*([\s\S]*?)\s*(<\/BaseURL>)/gi, (whole, open, raw) => {
-      const target = proxied.get(raw);
-      return target ? `${open}${target}</BaseURL>` : whole;
-    });
+    // Apply back to front so earlier offsets stay valid.
+    for (const r of rewrites.reverse()) out = out.slice(0, r.start) + r.text + out.slice(r.end);
   } else {
     // With no BaseURL the player resolves against the manifest URL, i.e. our
     // /api/live/stream/... route, where no segments exist. Pin it to the real one.
@@ -1741,6 +1873,39 @@ interface SegmentAttempt {
 }
 
 const segmentLog = new Map<string, SegmentAttempt[]>();
+
+/**
+ * The last portal exchanges, newest first.
+ *
+ * "maxTV is failing" has several distinguishable causes -- portal unreachable, identity
+ * refused, no token, catalogue empty, create_link refused, media refused -- and the player
+ * shows the same blank rectangle for all of them. Each call is recorded with the status and
+ * the portal's own words, which is the only way to tell them apart from a browser.
+ */
+interface PortalAttempt {
+  at: number;
+  action: string;
+  address: string;
+  status: number;
+  said: string;
+}
+
+const portalTrace: PortalAttempt[] = [];
+const PORTAL_TRACE_LIMIT = 30;
+
+function recordPortal(attempt: PortalAttempt): void {
+  portalTrace.unshift(attempt);
+  if (portalTrace.length > PORTAL_TRACE_LIMIT) portalTrace.length = PORTAL_TRACE_LIMIT;
+}
+
+/** The portal's own refusal, or a short excerpt of what it sent instead. */
+function portalSaid(body: string): string {
+  const spoken = stalkerError(body);
+  if (spoken) return spoken.slice(0, 200);
+  const head = body.trim().replace(/\s+/g, " ").slice(0, 160);
+  return head || "(empty body)";
+}
+const __hdnea_re = /__hdnea__=[^&"'\s]*/g;
 const SEGMENT_LOG_LIMIT = 24;
 
 function recordSegment(key: string, attempt: SegmentAttempt): void {
@@ -1763,6 +1928,24 @@ function diagnosticUrl(raw: string): string {
   } catch {
     return raw.split("?")[0]!;
   }
+}
+
+/**
+ * Refuse a segment *and* record it.
+ *
+ * These requests never reach proxyMediaStream, so without this a segment the player did
+ * ask for was absent from the log and the diagnostic concluded "the player requested no
+ * segments at all" -- the opposite of what happened.
+ */
+function rejectedSegment(kind: string, why: string, status: number): Response {
+  recordSegment(`reject:${kind}`, {
+    at: Date.now(),
+    url: why,
+    status,
+    bytes: 0,
+    range: null,
+  });
+  return jsonResponse(status, { ok: false, error: "Invalid segment token" });
 }
 
 async function proxyMediaStream(
@@ -2381,7 +2564,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   if (path === "/api/live/segment") {
     const tok = url.searchParams.get("t") || "";
     const verified = await verifySegmentToken(tok, cfg.proxySecret);
-    if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
+    if (!verified) return rejectedSegment("hls", "invalid token", 403);
     return proxyMediaStream(
       verified.u,
       verified.m,
@@ -2401,6 +2584,82 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
    * onward, and report what each one actually returns. Without this a failure is only
    * ever "segments refused", with no way to see which URL was refused or why.
    */
+  /**
+   * What the player was actually handed, summarised and quoted.
+   *
+   * "The player requested no segments at all" is a conclusion, not an observation: the
+   * manifest arrived and the player drew nothing from it. The only way to tell an
+   * unparseable manifest from one describing segments somewhere unexpected is to look at
+   * the document the player got. Signatures are masked; their presence is reported.
+   */
+  if (path === "/api/live/manifest") {
+    const id = url.searchParams.get("id") || "";
+    const pool = await getChannelsBySource(cfg, "all", false);
+    const ch = pool.find((c) => c.id === id || c.rawId === id);
+    if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
+
+    let body = "";
+    let status = 0;
+    let finalUrl = "";
+    if (ch.source === "jio" && ch.cmd) {
+      const opened = await fetchJioMedia(ch.cmd, { userAgent: ch.userAgent, cookie: ch.cookie }).catch(
+        () => null,
+      );
+      if (opened) {
+        status = opened.res.status;
+        finalUrl = opened.finalUrl;
+        body = opened.res.ok ? await opened.res.text().catch(() => "") : "";
+      }
+    } else if (ch.cmd) {
+      try {
+        const resolved = await resolveMaxtvLink(cfg, ch.cmd);
+        finalUrl = resolved;
+        const res = await fetch(resolved, { headers: stalkerHeaders(cfg, stalkerAccount(cfg), false) });
+        status = res.status;
+        body = res.ok ? await res.text().catch(() => "") : "";
+      } catch (e) {
+        status = 0;
+        body = "";
+        finalUrl = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    const isDash = /<MPD/i.test(body.slice(0, 4096)) || /\.mpd/i.test(finalUrl);
+    const bases = [...body.matchAll(/<BaseURL[^>]*>([\s\S]*?)<\/BaseURL>/gi)].map((m) => m[1]!.trim());
+    const summary = {
+      bytes: body.length,
+      container: isDash ? "dash" : body.trimStart().startsWith("#EXTM3U") ? "hls" : "unknown",
+      representations: (body.match(/<Representation\b/gi) ?? []).length,
+      adaptationSets: (body.match(/<AdaptationSet\b/gi) ?? []).length,
+      segmentTemplate: (body.match(/<SegmentTemplate\b/gi) ?? []).length,
+      segmentList: (body.match(/<SegmentList\b/gi) ?? []).length,
+      segmentBase: (body.match(/<SegmentBase\b/gi) ?? []).length,
+      baseUrls: bases,
+      type: /<MPD[^>]*\btype="([^"]+)"/i.exec(body)?.[1] ?? null,
+      availabilityStartTime: /\bavailabilityStartTime="([^"]+)"/i.exec(body)?.[1] ?? null,
+      minimumUpdatePeriod: /\bminimumUpdatePeriod="([^"]+)"/i.exec(body)?.[1] ?? null,
+      contentProtection: (body.match(/<ContentProtection\b/gi) ?? []).length,
+      defaultKids: [...body.matchAll(/cenc:default_KID\s*=\s*"([^"]+)"/gi)].map((m) => m[1]!),
+    };
+
+    // Signatures are replaced, not printed: this endpoint is reachable by anyone.
+    const redacted = body.replace(/__hdnea__=[^&"'\s]*/g, "__hdnea__=<redacted>");
+    return jsonResponse(200, {
+      ok: true,
+      channel: { id: ch.id, name: ch.name, source: ch.source, mediaType: ch.mediaType ?? null },
+      upstreamStatus: status,
+      resolvedUrl: finalUrl.replace(__hdnea_re, "__hdnea__=<redacted>"),
+      summary,
+      manifest: redacted.slice(0, 20000),
+      note:
+        summary.representations === 0
+          ? "No Representations: the document is not a DASH manifest the player can use."
+          : bases.length === 0 && summary.segmentTemplate === 0 && summary.segmentBase === 0
+            ? "Representations exist but nothing says where their segments live."
+            : "This is the document shape the player received, before our rewrite. Compare the BaseURLs with what the player requested.",
+    });
+  }
+
   if (path === "/api/live/diagnose") {
     const id = url.searchParams.get("id") || "";
 
@@ -2416,6 +2675,15 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       const report: Record<string, unknown> = {
         ok: true,
         kind: "maxtv",
+        // What the portal itself said, in order. Five different failures look identical in
+        // the player; this is where they differ.
+        trace: portalTrace.map((t) => ({
+          secondsAgo: Math.round((Date.now() - t.at) / 100) / 10,
+          action: t.action,
+          address: t.address,
+          status: t.status,
+          said: t.said,
+        })),
         configured: { portal: cfg.maxtvPortal, mac: cfg.maxtvMac },
         identities: candidates,
         migrated:
@@ -2435,7 +2703,13 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       }
 
       const pool = await getChannelsBySource(cfg, "maxtv", false).catch(() => []);
-      report['catalogue'] = { channels: pool.length };
+      report['catalogue'] = {
+        channels: pool.length,
+        note:
+          pool.length === 0
+            ? "The handshake succeeded but no channels came back: the bulk call and the paged fallback both returned nothing. The trace shows what each said."
+            : "Channels are listed.",
+      };
       const ch = pool.find((c) => c.id === id || c.rawId === id);
       if (ch?.cmd && !ch.cmd.startsWith("seed://")) {
         try {
@@ -2543,7 +2817,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const tok = decodeURIComponent(rest.slice(0, slash));
     const file = rest.slice(slash + 1);
     const verified = await verifySegmentToken(tok, cfg.proxySecret);
-    if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
+    if (!verified) return rejectedSegment("dashseg", `invalid token for ${file}`, 403);
     const target = new URL(file, verified.u.endsWith("/") ? verified.u : `${verified.u}/`);
     if (url.search) target.search = url.search;
     else if (!target.search) {
