@@ -10,8 +10,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 //            We pinned one number, so when it moved the whole backup tab went empty and
 //            every stream fell through to a seed entry that answers 503.
 
-const LEGACY_MAC = "00:1A:79:EE:03:9F";
-const LIVE_MAC = "00:1A:79:BA:DF:D7";
+const PRIMARY_MAC = "00:1A:79:EE:03:9F";
+const SECONDARY_MAC = "00:1A:79:BA:DF:D7";
 
 type Call = { url: string; headers: Record<string, string> };
 
@@ -30,23 +30,19 @@ afterEach(() => {
   vi.resetModules();
 });
 
-describe("maxTV talks to the identity the app migrated to", () => {
-  it("migrates the shipped default, which the app also migrates", async () => {
-    // Nothing configured: the built-in identity applies, and a default we wrote ourselves
-    // may be migrated. This is the only case where rewriting is legitimate.
+describe("maxTV talks to the working Android STB subscription identity", () => {
+  it("uses the active 00:1A:79:EE:03:9F / stalker_portal identity by default", async () => {
     const calls = stub(() => ({ body: JSON.stringify({ js: { token: "T1" } }) }));
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     await maybeHandleLiveRequest(new Request("http://localhost/api/live/channels?source=maxtv"), {});
     const handshake = calls.find((c) => c.url.includes("action=handshake"));
     expect(handshake).toBeDefined();
-    expect(handshake!.headers["Cookie"]).toContain(encodeURIComponent(LIVE_MAC));
-    expect(handshake!.headers["Cookie"]).not.toContain(encodeURIComponent(LEGACY_MAC));
-    expect(handshake!.url).toContain("new.maxtv.be/c/");
+    expect(handshake!.headers["Cookie"]).toContain(encodeURIComponent(PRIMARY_MAC));
+    expect(handshake!.headers["Cookie"]).not.toContain(encodeURIComponent(SECONDARY_MAC));
+    expect(handshake!.url).toContain("stalker_portal");
   });
 
-  it("uses a configured legacy account as given, and offers the live one second", async () => {
-    // A viewer whose account IS the older identity must not have it swapped silently: the
-    // swap changes which account the portal sees, and the failure that causes is invisible.
+  it("uses an explicitly configured alternate account as given, and offers the primary one second", async () => {
     const calls = stub((url) =>
       url.includes("action=handshake") && url.includes("new.maxtv.be/c/")
         ? { body: JSON.stringify({ js: {} }) }
@@ -54,17 +50,17 @@ describe("maxTV talks to the identity the app migrated to", () => {
     );
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     await maybeHandleLiveRequest(new Request("http://localhost/api/live/channels?source=maxtv"), {
-      MAXTV_PORTAL: "http://new.maxtv.be/stalker_portal/c/",
-      MAXTV_MAC: LEGACY_MAC,
+      MAXTV_PORTAL: "http://new.maxtv.be/c/",
+      MAXTV_MAC: SECONDARY_MAC,
     });
     const handshakes = calls.filter((c) => c.url.includes("action=handshake"));
     expect(handshakes.length).toBeGreaterThan(0);
     // First as configured.
-    expect(handshakes[0]!.headers["Cookie"]).toContain(encodeURIComponent(LEGACY_MAC));
-    expect(handshakes[0]!.url).toContain("stalker_portal");
+    expect(handshakes[0]!.headers["Cookie"]).toContain(encodeURIComponent(SECONDARY_MAC));
+    expect(handshakes[0]!.url).toContain("new.maxtv.be/c/");
   });
 
-  it("keeps a viewer's own non-legacy account untouched", async () => {
+  it("keeps a viewer's own custom account untouched", async () => {
     const calls = stub(() => ({ body: JSON.stringify({ js: { token: "T1" } }) }));
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     await maybeHandleLiveRequest(new Request("http://localhost/api/live/channels?source=maxtv"), {

@@ -26,6 +26,8 @@ export interface ChannelDrm {
 interface LiveVideoSurfaceProps {
   channelId: string;
   channelName: string;
+  /** Optional direct HTTPS HLS stream URL for browser-side fallback when proxy ASN is geo-blocked. */
+  directUrl?: string | undefined;
   /** ClearKey material for DRM channels, handed over by the catalogue. */
   drm?: ChannelDrm | null | undefined;
   /** Stated by the catalogue: "dash" | "hls". */
@@ -37,6 +39,7 @@ interface LiveVideoSurfaceProps {
   selectedAudioTrack: number;
   onAudioTracksChange?: (tracks: AudioTrackOption[], activeIndex: number) => void;
   onContainerDetected?: (kind: string) => void;
+  onAutoMuted?: () => void;
 }
 
 declare global {
@@ -153,6 +156,7 @@ function ensurePlayerEnginesLoaded(): Promise<void> {
 export function LiveVideoSurface({
   channelId,
   channelName,
+  directUrl,
   drm,
   container,
   activeSource,
@@ -161,6 +165,7 @@ export function LiveVideoSurface({
   selectedAudioTrack,
   onAudioTracksChange,
   onContainerDetected,
+  onAutoMuted,
 }: LiveVideoSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<InstanceType<NonNullable<Window["Hls"]>> | null>(null);
@@ -171,9 +176,17 @@ export function LiveVideoSurface({
   /** Set when Shaka has named a concrete fault; the no-video timer must not overwrite it. */
   const specificErrorRef = useRef(false);
 
-  // A "playing" event only means the element started; it does not prove a frame was
-  // decoded. Shaka reports playing for a stream whose segments never arrive, and the
-  // overlay used to be hidden at that point, leaving a silent black rectangle.
+  const clearOverlayIfRendering = () => {
+    const el = videoRef.current;
+    if (!el) return false;
+    if ((el.videoWidth > 0 && el.videoHeight > 0 && !el.paused) || (!el.paused && el.currentTime > 0.6)) {
+      setStatusMsg(null);
+      setHasError(false);
+      return true;
+    }
+    return false;
+  };
+
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
@@ -183,6 +196,8 @@ export function LiveVideoSurface({
       if (settled) return;
       if (el.videoWidth > 0 && el.videoHeight > 0) {
         settled = true;
+        setStatusMsg(null);
+        setHasError(false);
         clearInterval(poll);
         clearTimeout(deadline);
       }
@@ -290,8 +305,22 @@ export function LiveVideoSurface({
       }
     };
 
-    const streamUrl = (ext: ".ts" | ".m3u8" | ".mpd") =>
-      `/api/live/stream/${encodeURIComponent(channelId)}${ext}?_t=${Date.now()}`;
+    const streamUrl = (ext: ".ts" | ".m3u8" | ".mpd", probe = false) =>
+      `/api/live/stream/${encodeURIComponent(channelId)}${ext}?_t=${Date.now()}${probe ? "&probe=1" : ""}`;
+
+    const safePlay = async () => {
+      const el = videoRef.current;
+      if (!el) return;
+      try {
+        await el.play();
+      } catch {
+        // Browsers block unmuted autoplay on initial page load with NotAllowedError.
+        // Fall back to muted playback and notify parent so the stream plays immediately.
+        el.muted = true;
+        onAutoMuted?.();
+        await el.play().catch(() => undefined);
+      }
+    };
 
     // DASH + ClearKey through Shaka. Shaka wants each key as 32 hex chars or as
     // *unpadded* 22-char base64url; a 32-char base64url string (which is what a
@@ -375,7 +404,7 @@ export function LiveVideoSurface({
             }
             const opts: AudioTrackOption[] = langs.map((name, idx) => ({ index: idx, label: name }));
             onAudioTracksChange?.(opts, Math.max(langs.indexOf(player.getAudioLanguage() ?? ""), 0));
-            await videoRef.current?.play().catch(() => undefined);
+            await safePlay();
           } catch {
             if (!cancelled) {
               setHasError(true);
@@ -389,7 +418,7 @@ export function LiveVideoSurface({
       }
     };
 
-    const startHls = (url: string) => {
+    const startHls = (url: string, triedDirectFallback = false) => {
       if (cancelled || !videoRef.current) return;
       cleanup();
       onContainerDetected?.("HLS");
@@ -417,25 +446,29 @@ export function LiveVideoSurface({
 
         hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
           syncTracks();
-          videoRef.current?.play().catch(() => undefined);
+          void safePlay();
         });
         hls.on(HlsCtor.Events.AUDIO_TRACKS_UPDATED, syncTracks);
         hls.on(HlsCtor.Events.ERROR, (_ev, data) => {
           const d = data as { fatal?: boolean } | undefined;
           if (d?.fatal && !cancelled) {
+            if (!triedDirectFallback && directUrl && url !== directUrl) {
+              startHls(directUrl, true);
+              return;
+            }
             setHasError(true);
-            // Name the source honestly: this message used to promise a "fresh maxTV
-            // token" even for a JioTV channel, where no maxTV token is involved.
             setStatusMsg(
               activeSource === "jio"
                 ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
-                : "Live HLS stream interrupted. Press Retry to request a fresh maxTV token.",
+                : activeSource === "tgtv"
+                  ? "This TG TV stream was interrupted. Press Retry to reconnect."
+                  : "Live HLS stream interrupted. Press Retry to request a fresh maxTV token.",
             );
           }
         });
       } else if (videoRef.current.canPlayType("application/vnd.apple.mpegurl")) {
         videoRef.current.src = url;
-        videoRef.current.play().catch(() => undefined);
+        void safePlay();
       } else {
         setHasError(true);
         setStatusMsg("HLS playback is not supported in this browser.");
@@ -457,7 +490,11 @@ export function LiveVideoSurface({
       );
       mpegtsInstance.attachMediaElement(videoRef.current);
       mpegtsInstance.load();
-      Promise.resolve(mpegtsInstance.play()).catch(() => undefined);
+      Promise.resolve(mpegtsInstance.play())
+        .then(() => safePlay())
+        .catch(() => {
+          void safePlay();
+        });
       mpegtsInstance.on(window.mpegts.Events.ERROR, () => {
         if (cancelled) return;
         if (fallbackToHls) startHls(streamUrl(".m3u8"));
@@ -469,6 +506,7 @@ export function LiveVideoSurface({
     };
 
     async function run() {
+      specificErrorRef.current = false;
       setHasError(false);
       setStatusMsg(`Connecting to ${channelName}…`);
       await ensurePlayerEnginesLoaded();
@@ -480,11 +518,15 @@ export function LiveVideoSurface({
       const wantDash = (container || "").toLowerCase() === "dash";
       const probeExt = wantDash ? ".mpd" : ".ts";
       try {
-        const res = await fetch(streamUrl(probeExt), { signal: probeCtrl.signal });
+        const res = await fetch(streamUrl(probeExt, true), { signal: probeCtrl.signal });
         clearTimeout(timer);
         if (!res.ok) {
           const j = (await res.json().catch(() => ({}))) as { error?: string };
           probeCtrl.abort();
+          if (!cancelled && directUrl) {
+            startHls(directUrl, true);
+            return;
+          }
           if (!cancelled) {
             setHasError(true);
             setStatusMsg(j.error || `Stream unavailable (HTTP ${res.status})`);
@@ -492,9 +534,6 @@ export function LiveVideoSurface({
           return;
         }
         const kind = (res.headers.get("x-stream-container") || "").toLowerCase();
-        // The server reconciles the key document with the manifest's own key ids, which
-        // is the difference between a picture and a silent black screen. Prefer its
-        // answer to the ids the catalogue handed us.
         const matched = parseKeyHeader(res.headers.get("x-clear-keys"));
         probeCtrl.abort();
         if (kind === "dash") startDash(streamUrl(".mpd"), matched);
@@ -502,7 +541,11 @@ export function LiveVideoSurface({
         else startMpegTs(streamUrl(".ts"), true);
       } catch {
         clearTimeout(timer);
-        if (!cancelled) startMpegTs(streamUrl(".ts"), true);
+        if (!cancelled) {
+          if (directUrl) startHls(directUrl, true);
+          else if (wantDash) startDash(streamUrl(".mpd"));
+          else startMpegTs(streamUrl(".ts"), true);
+        }
       }
     }
 
@@ -512,7 +555,7 @@ export function LiveVideoSurface({
       cancelled = true;
       cleanup();
     };
-  }, [channelId, channelName, drm, container, activeSource, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected]);
+  }, [channelId, channelName, directUrl, drm, container, activeSource, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected, onAutoMuted]);
 
   return (
     <div className="absolute inset-0 bg-black">
@@ -522,13 +565,16 @@ export function LiveVideoSurface({
         autoPlay
         muted={muted}
         onPlaying={() => {
-          // Clear the overlay only once the element actually has picture; otherwise
-          // leave the message up so a dead stream is never mistaken for a paused one.
-          const el = videoRef.current;
-          if (el && el.videoWidth > 0 && el.videoHeight > 0) {
-            setStatusMsg(null);
-            setHasError(false);
-          }
+          clearOverlayIfRendering();
+        }}
+        onLoadedData={() => {
+          clearOverlayIfRendering();
+        }}
+        onResize={() => {
+          clearOverlayIfRendering();
+        }}
+        onTimeUpdate={() => {
+          clearOverlayIfRendering();
         }}
         onWaiting={() => setStatusMsg("Buffering live broadcast…")}
         className="h-full w-full object-contain"
