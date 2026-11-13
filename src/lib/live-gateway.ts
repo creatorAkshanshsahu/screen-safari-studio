@@ -8,7 +8,7 @@
 export interface LiveChannelItem {
   id: string;
   rawId: string;
-  source: "maxtv" | "starshare";
+  source: "maxtv" | "starshare" | "jio";
   name: string;
   category: string;
   logo: string;
@@ -17,7 +17,7 @@ export interface LiveChannelItem {
 
 export interface LiveChannelDto {
   id: string;
-  source: "maxtv" | "starshare";
+  source: "maxtv" | "starshare" | "jio";
   name: string;
   category: string;
   rawCategory: string;
@@ -69,6 +69,7 @@ type GatewayConfig = {
   starshareFallback: string;
   starshareUser: string;
   starsharePass: string;
+  jioPlaylistUrl: string;
   proxySecret: string;
 };
 
@@ -96,6 +97,7 @@ function getConfig(env: unknown): GatewayConfig {
     starshareFallback: readEnv(env, "STARSHARE_FALLBACK", "http://starshare.fans:8080"),
     starshareUser: readEnv(env, "STARSHARE_USER", ""),
     starsharePass: readEnv(env, "STARSHARE_PASS", ""),
+    jioPlaylistUrl: readEnv(env, "JIO_PLAYLIST_URL", "https://allinonereborn2.online/jiotv-m3u/jtv39.m3u8"),
     proxySecret: readEnv(env, "LIVE_PROXY_SECRET", "streamr-maxtv-live-gateway-v1"),
   };
 }
@@ -614,6 +616,119 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
   return url;
 }
 
+// ---------- JioTV M3U backup source ----------
+//
+// A plain HLS playlist used as the fallback when the maxTV portal is unreachable.
+// Format is standard extended M3U:
+//   #EXTINF:-1 tvg-id="144" tvg-name="Colors HD" tvg-logo="…" group-title="Entertainment", Colors HD
+//   https://host/path/144/master.m3u8
+// Every stream is HLS, so it is proxied through the same manifest rewriter that
+// mpegts/HLS playback already uses.
+
+interface ParsedM3uEntry {
+  name: string;
+  url: string;
+  tvgId: string;
+  logo: string;
+  group: string;
+}
+
+function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
+  const lines = String(text || "").split(/\r?\n/);
+  const out: ParsedM3uEntry[] = [];
+  let pending: { name: string; tvgId: string; logo: string; group: string } | null = null;
+
+  const attr = (line: string, key: string): string => {
+    const m = line.match(new RegExp(`${key}="([^"]*)"`, "i"));
+    return m?.[1]?.trim() ?? "";
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    if (line.startsWith("#EXTINF")) {
+      const name = line.slice(line.lastIndexOf(",") + 1).trim() || attr(line, "tvg-name");
+      pending = {
+        name: name || attr(line, "tvg-id"),
+        tvgId: attr(line, "tvg-id"),
+        logo: attr(line, "tvg-logo"),
+        group: attr(line, "group-title"),
+      };
+      continue;
+    }
+    if (line.startsWith("#")) continue;
+
+    // A non-comment line is the stream URL for the pending entry.
+    let abs = "";
+    try {
+      abs = new URL(line, baseUrl).toString();
+    } catch {
+      abs = line;
+    }
+    if (!/^https?:\/\//i.test(abs) || !pending) {
+      pending = null;
+      continue;
+    }
+    if (!pending.name) {
+      pending = null;
+      continue;
+    }
+    out.push({ ...pending, url: abs });
+    pending = null;
+  }
+  return out;
+}
+
+const jioCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | null } = {
+  items: [],
+  fetchedAt: 0,
+  error: null,
+};
+
+async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
+  let res: Response;
+  try {
+    res = await fetch(cfg.jioPlaylistUrl, {
+      headers: { "User-Agent": MAG_USER_AGENT, Accept: "*/*" },
+    });
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    throw new Error(`Backup playlist unreachable (${reason})`);
+  }
+  if (!res.ok) throw new Error(`Backup playlist returned HTTP ${res.status}`);
+  const text = await res.text();
+  const entries = parseM3u(text, cfg.jioPlaylistUrl);
+  if (entries.length === 0) throw new Error("Backup playlist listed no channels");
+
+  return entries.map((e, i) => ({
+    // Stable id: the playlist's own channel number, else its position.
+    id: `jio:${e.tvgId || i}`,
+    rawId: e.tvgId || String(i),
+    source: "jio" as const,
+    name: e.name,
+    category: e.group || "JioTV",
+    logo: e.logo,
+    cmd: e.url,
+  }));
+}
+
+async function loadJioCached(cfg: GatewayConfig, force = false): Promise<LiveChannelItem[]> {
+  if (!force && jioCache.items.length > 0 && Date.now() - jioCache.fetchedAt < CATALOGUE_TTL_MS) {
+    return jioCache.items;
+  }
+  try {
+    const live = await fetchJioCatalogue(cfg);
+    jioCache.items = live;
+    jioCache.fetchedAt = Date.now();
+    jioCache.error = null;
+    return live;
+  } catch (e) {
+    jioCache.error = e instanceof Error ? e.message : String(e);
+    return jioCache.items;
+  }
+}
+
 const xtreamState: { workingOrigin: string; canonUser: string; canonPass: string } = {
   workingOrigin: "",
   canonUser: "",
@@ -731,11 +846,18 @@ async function loadStarshareCached(cfg: GatewayConfig, force = false): Promise<L
 async function getChannelsBySource(cfg: GatewayConfig, source: string, force = false): Promise<LiveChannelItem[]> {
   const s = source.toLowerCase();
   if (s === "starshare") return loadStarshareCached(cfg, force);
+  if (s === "jio") return loadJioCached(cfg, force);
   if (s === "all") {
-    const [m, x] = await Promise.all([loadMaxtvCached(cfg, force), loadStarshareCached(cfg, force)]);
-    return [...m, ...x];
+    const [m, j] = await Promise.all([loadMaxtvCached(cfg, force), loadJioCached(cfg, force)]);
+    return [...m, ...j];
   }
-  return loadMaxtvCached(cfg, force);
+  // The default path is "maxTV, with the backup playlist behind it".
+  // A portal that answered with a real catalogue wins; anything else falls through
+  // to JioTV so a viewer still gets channels that actually play.
+  const maxtv = await loadMaxtvCached(cfg, force);
+  if (!memCache.maxtv.usingSeed && maxtv.length > 0) return maxtv;
+  const jio = await loadJioCached(cfg, force);
+  return jio.length > 0 ? jio : maxtv;
 }
 
 // ---------- Web Crypto HMAC Signing for HLS Segments ----------
@@ -1153,18 +1275,37 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const categories = [...new Set(filtered.map((c) => displayCategoryName(c.category)))];
     const channels = filtered.slice(0, limit).map((c) => toDto(c, publicOrigin));
 
-    // Never let a seed fallback masquerade as a working catalogue: report why maxTV failed.
-    const portalError = source !== "starshare" ? memCache.maxtv.error : null;
-    const usingSeed = source !== "starshare" && memCache.maxtv.usingSeed;
+    // Report what is actually being served. A seed row can never masquerade as a working
+    // catalogue, and when the backup playlist is carrying the list that is stated plainly.
+    const usingSeed = filtered.length > 0 && filtered.every((c) => String(c.cmd || "").startsWith("seed://"));
+    const hasJio = filtered.some((c) => c.source === "jio");
+    const hasMaxtv = filtered.some((c) => c.source === "maxtv");
+
+    const served: "maxtv" | "jio" | "starshare" | "mixed" | "seed" =
+      source === "starshare"
+        ? "starshare"
+        : usingSeed
+          ? "seed"
+          : source === "jio"
+            ? "jio"
+            : hasJio && hasMaxtv
+              ? "mixed"
+              : hasJio
+                ? "jio"
+                : "maxtv";
+
+    const portalError = usingSeed ? memCache.maxtv.error : null;
 
     return jsonResponse(200, {
       ok: true,
       source,
+      servedBy: served,
       filter,
       totalMatching: filtered.length,
       usingPreviewSeed: usingSeed,
-      portalError: usingSeed ? portalError : null,
-      portalEndpoint: source !== "starshare" ? memCache.maxtv.endpoint : null,
+      portalError,
+      portalEndpoint: memCache.maxtv.endpoint,
+      backupError: source === "maxtv" || source === "all" ? jioCache.error : null,
       categories,
       channels,
     });
@@ -1215,10 +1356,20 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       return proxyMediaStream(`${origin}/live/${u}/${p}/${ch.rawId}.${preferHls ? "m3u8" : "ts"}`, "xtream", publicOrigin, cfg.proxySecret);
     }
 
+    // JioTV backup entries carry their own HLS URL, so they need no portal round-trip.
+    if (ch.source === "jio") {
+      if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This backup channel has no stream URL" });
+      try {
+        return await proxyMediaStream(ch.cmd, "xtream", publicOrigin, cfg.proxySecret);
+      } catch (e) {
+        return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Backup stream failed" });
+      }
+    }
+
     if (String(ch.cmd || "").startsWith("seed://")) {
       return jsonResponse(503, {
         ok: false,
-        error: "Live stream connects directly to maxTV once deployed on Lovable / internet-enabled runtime.",
+        error: "No live source is reachable. maxTV did not answer and the backup playlist is unavailable.",
       });
     }
 

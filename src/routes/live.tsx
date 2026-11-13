@@ -49,6 +49,8 @@ export function LivePlayerContent() {
   const [showEmbedModal, setShowEmbedModal] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [portalError, setPortalError] = useState<string | null>(null);
+  const [servedBy, setServedBy] = useState<string>("");
+  const [backupError, setBackupError] = useState<string | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -67,11 +69,15 @@ export function LivePlayerContent() {
           channels?: LiveChannelDto[];
           categories?: string[];
           portalError?: string | null;
+          servedBy?: string;
+          backupError?: string | null;
         };
         const list = data.channels ?? [];
         setChannels(list);
         setCategories(data.categories ?? []);
         setPortalError(data.portalError ?? null);
+        setServedBy(data.servedBy ?? "");
+        setBackupError(data.backupError ?? null);
         setSelectedCategory("");
         if (list.length > 0) {
           setActiveId((prev) => (prev && list.some((c) => c.id === prev) ? prev : list[0]!.id));
@@ -191,11 +197,16 @@ export function LivePlayerContent() {
         </div>
       </div>
 
-      {/* A seed fallback must never look like a working catalogue. */}
-      {portalError && (
+      {/* Say plainly where the list came from; never let a dead seed look like a working catalogue. */}
+      {(portalError || servedBy === "jio") && (
         <div className="absolute left-4 right-4 top-20 z-30 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs md:left-8 md:right-auto md:max-w-xl">
-          <p className="font-bold text-accent">maxTV portal unreachable — showing {visibleChannels.length} sample channels that will not play.</p>
-          <p className="mt-0.5 text-muted-foreground">{portalError}</p>
+          {servedBy === "jio" && (
+            <p className="font-bold text-accent">maxTV unreachable — playing the JioTV backup playlist ({visibleChannels.length} channels).</p>
+          )}
+          {portalError && (
+            <p className="font-bold text-accent">No live source reachable — these {visibleChannels.length} sample channels will not play.</p>
+          )}
+          <p className="mt-0.5 text-muted-foreground">{portalError ?? backupError ?? "Backup playlist is live."}</p>
         </div>
       )}
 
