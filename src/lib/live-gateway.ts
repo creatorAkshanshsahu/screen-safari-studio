@@ -1368,27 +1368,50 @@ async function rewriteDashManifestWeb(
 
   // Attributes that may hold an absolute media reference. `media` and
   // `initialization` are the SegmentTemplate pair; the rest are SegmentBase/List.
-  const attrRe = /\b(media|initialization|sourceURL|index)="(https?:\/\/[^"]*)"/gi;
-  for (const m of [...out.matchAll(attrRe)]) {
+  // Rewrite EVERY occurrence, and build replacements with a function.
+  //
+  // String.replace with a string pattern replaces only the first match, so when two
+  // Representations share one absolute media template -- which is normal in DASH -- every
+  // copy after the first kept pointing at the CDN and was fetched bare, where it is
+  // refused. A function replacement also stops `$` in a token or file name being read as
+  // a `$&` backreference.
+  const attrs: Array<{ from: string; to: string }> = [];
+  const seen = new Set<string>();
+  for (const m of out.matchAll(/\b(media|initialization|sourceURL|index)="(https?:\/\/[^"]*)"/gi)) {
     const resolved = resolve(m[2]!);
     if (!resolved) continue;
-    out = out.replace(m[0]!, `${m[1]!}="${await proxyFile(resolved)}"`);
+    const key = `${m[1]!}=${m[2]!}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    attrs.push({ from: m[0]!, to: `${m[1]!}="${await proxyFile(resolved)}"` });
+  }
+  for (const { from, to } of attrs) {
+    out = out.split(from).join(to);
   }
 
   // Every BaseURL, wherever it sits, must land on our proxy. Nested BaseURLs then
   // concatenate correctly because each one is rewritten to a fully-qualified URL.
   if (/<BaseURL>/i.test(out)) {
-    const tags = [...out.matchAll(/<BaseURL>\s*([\s\S]*?)\s*<\/BaseURL>/gi)];
-    for (const m of tags) {
-      const resolved = resolve(m[1]!);
+    // One pass, every tag. Precompute each unique target first because the rewrite is
+    // async, then swap them all in a single synchronous replace-with-callback. Doing it
+    // one match at a time with a string pattern silently skipped every repeat.
+    const proxied = new Map<string, string>();
+    for (const m of out.matchAll(/<BaseURL>\s*([\s\S]*?)\s*<\/BaseURL>/gi)) {
+      const raw = m[1]!;
+      if (proxied.has(raw)) continue;
+      const resolved = resolve(raw);
       if (!resolved) continue;
       // A BaseURL without a trailing slash is a file-name *prefix*, not a directory.
       const isDir = resolved.pathname.endsWith("/");
       const cut = resolved.pathname.lastIndexOf("/");
       const suffix = isDir ? "" : resolved.pathname.slice(cut + 1);
       const dir = `${resolved.origin}${resolved.pathname.slice(0, cut + 1)}`;
-      out = out.replace(m[0]!, `<BaseURL>${await proxyDir(dir)}${suffix}</BaseURL>`);
+      proxied.set(raw, `${await proxyDir(dir)}${suffix}`);
     }
+    out = out.replace(/(<BaseURL>)\s*([\s\S]*?)\s*(<\/BaseURL>)/gi, (whole, open, raw) => {
+      const target = proxied.get(raw);
+      return target ? `${open}${target}</BaseURL>` : whole;
+    });
   } else {
     // With no BaseURL the player resolves against the manifest URL, i.e. our
     // /api/live/stream/... route, where no segments exist. Pin it to the real one.
@@ -1480,12 +1503,18 @@ async function proxyMediaStream(
   secret: string,
   overrideHeaders?: Record<string, string>,
   clearKeys?: ClearKeyPair[],
+  range?: string | null,
 ): Promise<Response> {
   const headers: Record<string, string> = overrideHeaders
     ? { Accept: "*/*", ...overrideHeaders }
     : mode === "xtream"
       ? { "User-Agent": XTREAM_USER_AGENT, Accept: "*/*", "Icy-MetaData": "1" }
       : { "User-Agent": MAG_USER_AGENT, "X-User-Agent": MAG_DEVICE_UA, Accept: "*/*", "Icy-MetaData": "1" };
+
+  // Shaka asks for byte ranges on MP4 segments. Dropping the range silently returned the
+  // whole file, which some CDNs answer with 405 because the request is malformed for a
+  // ranged resource.
+  if (range) headers["Range"] = range;
 
   let currentUrl = upstreamUrl;
   let upRes: Response | null = null;
@@ -2021,12 +2050,94 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const tok = url.searchParams.get("t") || "";
     const verified = await verifySegmentToken(tok, cfg.proxySecret);
     if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
-    return proxyMediaStream(verified.u, verified.m, publicOrigin, cfg.proxySecret, overrideHeadersFromToken(verified));
+    return proxyMediaStream(
+      verified.u,
+      verified.m,
+      publicOrigin,
+      cfg.proxySecret,
+      overrideHeadersFromToken(verified),
+      undefined,
+      request.headers.get("range"),
+    );
   }
 
   // DASH segment/initialisation fetches. The tokenised part is the directory, so the
   // path after it is whatever SegmentTemplate the manifest used, already expanded by
   // the player ($Number$, $RepresentationID$, $Time$ and nested folders all survive).
+  /**
+   * Walk a channel's DASH manifest the way the player will, from the first reference
+   * onward, and report what each one actually returns. Without this a failure is only
+   * ever "segments refused", with no way to see which URL was refused or why.
+   */
+  if (path === "/api/live/diagnose") {
+    const id = url.searchParams.get("id") || "";
+    const pool = await getChannelsBySource(cfg, "all", false);
+    const ch = pool.find((c) => c.id === id || c.rawId === id);
+    if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
+
+    const probe = async (raw: string, headers: Record<string, string>) => {
+      try {
+        const res = await fetch(raw, { headers, redirect: "manual" });
+        const text = res.status === 200 ? await res.text().catch(() => "") : "";
+        return {
+          url: raw,
+          status: res.status,
+          location: res.headers.get("location") ?? null,
+          contentType: res.headers.get("content-type") ?? null,
+          isManifest: /#EXTM3U|<MPD/i.test(text.slice(0, 2048)),
+        };
+      } catch (e) {
+        return { url: raw, status: 0, error: e instanceof Error ? e.message : String(e) };
+      }
+    };
+
+    const ua = ch.userAgent || JIO_UA_OVERRIDE;
+    const headers: Record<string, string> = {
+      "User-Agent": ua,
+      ...(ch.cookie ? { Cookie: ch.cookie } : {}),
+      Accept: "*/*",
+    };
+    const opened = ch.cmd ? await probe(ch.cmd, headers) : null;
+    const finalUrl = opened?.location ?? ch.cmd ?? "";
+
+    let references: Array<{ kind: string; url: string; status: number | null }> = [];
+    if (ch.mediaType === "dash" && finalUrl) {
+      const body = await fetch(finalUrl, { headers, redirect: "follow" })
+        .then((r) => (r.ok ? r.text() : ""))
+        .catch(() => "");
+      const base = finalUrl.slice(0, finalUrl.lastIndexOf("/") + 1);
+      for (const m of body.matchAll(/<(?:BaseURL|SegmentTemplate|SegmentURL)[^>]*>/gi)) {
+        const tag = m[0];
+        const attr = /(media|initialization|sourceURL|index|href)="([^"]+)"/i.exec(tag);
+        if (!attr?.[2]) continue;
+        let abs: string;
+        try {
+          abs = new URL(attr[2].replace(/\$(Number|RepresentationID|Time|Bandwidth)\$[^/]*$/, "1"), base).toString();
+        } catch {
+          continue;
+        }
+        const r = await fetch(abs, { headers: { ...headers, Range: "bytes=0-1023" }, redirect: "manual" }).catch(() => null);
+        references.push({ kind: attr[1]!, url: abs, status: r ? r.status : 0 });
+      }
+    }
+
+    return jsonResponse(200, {
+      ok: true,
+      channel: { id: ch.id, name: ch.name, source: ch.source, mediaType: ch.mediaType ?? null },
+      hasCookie: Boolean(ch.cookie),
+      advertisedUrl: ch.cmd ?? null,
+      firstResponse: opened,
+      resolvedUrl: finalUrl,
+      references,
+      hint:
+        references.length === 0
+          ? "No DASH references were found. The manifest may be HLS, or the CDN refused the manifest fetch."
+          : references.every((r) => r.status === 200 || r.status === 206)
+            ? "Every reference answered. Playback should work."
+            : "At least one reference was refused; the statuses above say which and where.",
+    });
+  }
+
   if (path.startsWith("/api/live/dashseg/")) {
     const rest = path.slice("/api/live/dashseg/".length);
     const slash = rest.indexOf("/");
@@ -2037,7 +2148,15 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
     const target = new URL(file, verified.u.endsWith("/") ? verified.u : `${verified.u}/`);
     if (url.search) target.search = url.search;
-    return proxyMediaStream(target.toString(), verified.m, publicOrigin, cfg.proxySecret, overrideHeadersFromToken(verified));
+    return proxyMediaStream(
+      target.toString(),
+      verified.m,
+      publicOrigin,
+      cfg.proxySecret,
+      overrideHeadersFromToken(verified),
+      undefined,
+      request.headers.get("range"),
+    );
   }
 
   if (path.startsWith("/api/live/stream/")) {
