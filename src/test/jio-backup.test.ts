@@ -27,10 +27,10 @@ function stubPortalDown() {
   });
 }
 
-async function loadChannels(env: Record<string, string> = {}) {
+async function loadChannels(env: Record<string, string> = {}, source = "maxtv") {
   const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
   const res = await maybeHandleLiveRequest(
-    new Request("http://localhost/api/live/channels?source=maxtv&filter=all&max=500"),
+    new Request(`http://localhost/api/live/channels?source=${source}&filter=all&max=500`),
     { JIO_PLAYLIST_URL: BACKUP_URL, ...env },
   );
   return (await res!.json()) as {
@@ -45,6 +45,20 @@ async function loadChannels(env: Record<string, string> = {}) {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.resetModules();
+});
+
+describe("JioTV requested by name", () => {
+  it("reports why the playlist is empty instead of returning a silent blank list", async () => {
+    // Choosing "JioTV" and getting zero channels with no error is indistinguishable
+    // from a page that is still loading, so the failure reason has to come through.
+    vi.stubGlobal("fetch", async () => {
+      throw new TypeError("fetch failed");
+    });
+    const data = await loadChannels({}, "jio");
+
+    expect(data.channels).toHaveLength(0);
+    expect(data.backupError).toContain("unreachable");
+  });
 });
 
 describe("JioTV backup source", () => {

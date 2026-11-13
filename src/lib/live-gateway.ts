@@ -1113,7 +1113,12 @@ async function getChannelsBySource(cfg: GatewayConfig, source: string, force = f
   if (s === "jio") return loadJioCached(cfg, force);
   if (s === "all") {
     const [m, j] = await Promise.all([loadMaxtvCached(cfg, force), loadJioCached(cfg, force)]);
-    return [...m, ...j];
+    // The seed rows are placeholders that cannot play, so they must never pad out a
+    // combined list: "Both" would otherwise show 24 dead entries above the live ones,
+    // and the top of the guide would be the part that does not work.
+    const live = memCache.maxtv.usingSeed ? [] : m;
+    const combined = [...live, ...j];
+    return combined.length > 0 ? combined : m;
   }
   // The default path is "maxTV, with the backup playlist behind it".
   // A portal that answered with a real catalogue wins; anything else falls through
@@ -1804,7 +1809,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       usingPreviewSeed: usingSeed,
       portalError,
       portalEndpoint: memCache.maxtv.endpoint,
-      backupError: source === "maxtv" || source === "all" ? jioCache.error : null,
+      backupError: jioCache.error,
       categories,
       channels,
     });
