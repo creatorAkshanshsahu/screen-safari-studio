@@ -152,6 +152,44 @@ export function LiveVideoSurface({
   const [hasError, setHasError] = useState(false);
   const [localRetry, setLocalRetry] = useState(0);
 
+  // A "playing" event only means the element started; it does not prove a frame was
+  // decoded. Shaka reports playing for a stream whose segments never arrive, and the
+  // overlay used to be hidden at that point, leaving a silent black rectangle.
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    let settled = false;
+
+    const check = () => {
+      if (settled) return;
+      if (el.videoWidth > 0 && el.videoHeight > 0) {
+        settled = true;
+        clearInterval(poll);
+        clearTimeout(deadline);
+      }
+    };
+
+    const poll = setInterval(check, 500);
+    const deadline = setTimeout(() => {
+      if (settled) return;
+      if (el.videoWidth === 0 || el.videoHeight === 0) {
+        setHasError(true);
+        setStatusMsg(
+          "The stream started but no video arrived. The channel's segments were refused or the format is unsupported.",
+        );
+      }
+      settled = true;
+      clearInterval(poll);
+    }, 15000);
+
+    check();
+    return () => {
+      settled = true;
+      clearInterval(poll);
+      clearTimeout(deadline);
+    };
+  }, [channelId, reloadNonce, localRetry]);
+
   useEffect(() => {
     if (videoRef.current) videoRef.current.muted = muted;
   }, [muted]);
@@ -404,8 +442,13 @@ export function LiveVideoSurface({
         autoPlay
         muted={muted}
         onPlaying={() => {
-          setStatusMsg(null);
-          setHasError(false);
+          // Clear the overlay only once the element actually has picture; otherwise
+          // leave the message up so a dead stream is never mistaken for a paused one.
+          const el = videoRef.current;
+          if (el && el.videoWidth > 0 && el.videoHeight > 0) {
+            setStatusMsg(null);
+            setHasError(false);
+          }
         }}
         onWaiting={() => setStatusMsg("Buffering live broadcast…")}
         className="h-full w-full object-contain"

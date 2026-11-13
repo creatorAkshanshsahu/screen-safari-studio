@@ -414,6 +414,16 @@ async function fetchTextTimeout(url: string, headers: Record<string, string>, ti
   }
 }
 
+/**
+ * Remember a source that recently failed outright, so the catalogue does not spend
+ * eight 20-second timeouts on every page load while the host is unreachable.
+ */
+const sourceBackoff: { maxtvUntil: number; maxtvReason: string | null } = {
+  maxtvUntil: 0,
+  maxtvReason: null,
+};
+const SOURCE_BACKOFF_MS = 30_000;
+
 const stalkerSession: {
   endpoint: string | null;
   token: string | null;
@@ -460,7 +470,9 @@ async function stalkerRaw(
   params: Record<string, string>,
   auth: boolean,
 ): Promise<string> {
-  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 20000);
+  // 8 candidates x 20s was up to ~160s of blank page when the host is a black hole.
+  // A reachable portal answers a handshake well inside this.
+  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 7000);
   return body;
 }
 
@@ -480,6 +492,11 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
     return issued;
   }
 
+  if (Date.now() < sourceBackoff.maxtvUntil) {
+    // Recently proven dead: fail fast with the reason we already know.
+    throw new StalkerError(null, sourceBackoff.maxtvReason ?? "no portal at this address");
+  }
+
   const failures: string[] = [];
   let spoken: string | null = null;
   let lastErr: unknown = null;
@@ -497,6 +514,8 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
       stalkerSession.endpoint = candidate;
       stalkerSession.token = issued;
       stalkerSession.profiled = false;
+      sourceBackoff.maxtvUntil = 0;
+      sourceBackoff.maxtvReason = null;
       return issued;
     } catch (e) {
       lastErr = e;
@@ -513,6 +532,8 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
   stalkerSession.token = null;
   const tried = failures.slice(0, 4).join(", ") + (failures.length > 4 ? " …" : "");
   const detail = spoken ?? (failures.length ? `no portal at this address (tried ${tried})` : "no portal at this address");
+  sourceBackoff.maxtvUntil = Date.now() + SOURCE_BACKOFF_MS;
+  sourceBackoff.maxtvReason = detail;
   if (lastErr instanceof StalkerError) throw new StalkerError(lastErr.status, lastErr.detail || detail);
   throw new StalkerError(null, detail);
 }
@@ -870,16 +891,27 @@ async function jioKeysFor(entry: ParsedM3uEntry, siteHost: string): Promise<Clea
   if (cached && cached.until > Date.now()) return [...inline, ...cached.keys];
 
   try {
-    const res = await fetch(url, {
-      headers: {
-        Origin: JIO_SITE,
-        Referer: `${JIO_SITE}/`,
-        Accept: "application/json",
-        "User-Agent": JIO_UA_OVERRIDE,
-      },
-    });
-    if (!res.ok) return inline;
-    const keys = parseClearKeys(await res.text());
+    // Bounded: a key document that never answers used to stall the entire playlist
+    // build, leaving the guide on "Loading…" with no way out.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4000);
+    let body = "";
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Origin: JIO_SITE,
+          Referer: `${JIO_SITE}/`,
+          Accept: "application/json",
+          "User-Agent": JIO_UA_OVERRIDE,
+        },
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return inline;
+      body = await res.text();
+    } finally {
+      clearTimeout(timer);
+    }
+    const keys = parseClearKeys(body);
     if (keys.length) jioKeyCache.set(url, { keys, until: Date.now() + 10 * 60 * 1000 });
     return [...inline, ...keys];
   } catch {
@@ -949,14 +981,38 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
     }
   })();
 
+  // Key documents are fetched concurrently. Doing this one channel at a time meant the
+  // catalogue took as long as the sum of every key round-trip -- measured at 6s for 60
+  // channels, so a real playlist of a few hundred sat on "Loading…" for half a minute.
+  const wantsDrm = (e: ParsedM3uEntry) => Boolean(e.licenseType.toLowerCase() === "clearkey" || e.licenseKey);
+
+  const keyStore = new Map<number, ClearKeyPair[]>();
+  const drmIndexes = entries.map((e, i) => (wantsDrm(e) ? i : -1)).filter((i) => i >= 0);
+  const CONCURRENCY = 8;
+  for (let start = 0; start < drmIndexes.length; start += CONCURRENCY) {
+    const batch = drmIndexes.slice(start, start + CONCURRENCY);
+    const settled = await Promise.all(
+      batch.map(async (i) => {
+        try {
+          return [i, await jioKeysFor(entries[i]!, siteHost)] as const;
+        } catch {
+          // A single unreachable key document must not take the playlist down with it.
+          return [i, [] as ClearKeyPair[]] as const;
+        }
+      }),
+    );
+    for (const [i, keys] of settled) keyStore.set(i, keys);
+  }
+
   const items: LiveChannelItem[] = [];
   for (const [i, e] of entries.entries()) {
     const mediaType = jioMediaType(e.url);
     // Only DRM-protected entries need a key round-trip; plain HLS does not.
     let drm: LiveChannelItem["drm"];
-    if (e.licenseType.toLowerCase() === "clearkey" || e.licenseKey) {
-      const keys = await jioKeysFor(e, siteHost);
+    if (wantsDrm(e)) {
+      const keys = keyStore.get(i) ?? [];
       const licenseUrl = jioLicenseUrl(e, siteHost) ?? undefined;
+      // Kept even with zero keys: the player can pull the MPD's default_KID itself.
       drm = { type: "clearkey", keys, ...(licenseUrl ? { licenseUrl } : {}) };
     }
     items.push({
@@ -1646,6 +1702,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     }
     async function boot() {
       clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
+      armWatchdog();
       // Ask for the container the catalogue advertised. Probing ".ts" unconditionally
       // made every DASH channel look like MPEG-TS, so the embed could never play one.
       const wantDash = String(ch.container || "").toLowerCase() === "dash";
@@ -1660,7 +1717,21 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         else startTs(sUrl(".ts"), true);
       } catch { clearTimeout(tm); if (wantDash) startDash(sUrl(".mpd")); else startTs(sUrl(".ts"), true); }
     }
-    v.onplaying = () => { ov.classList.add("hide"); pl.textContent = "Pause"; };
+    // Only hide the overlay once a frame exists. An element can report "playing" with
+    // videoWidth 0 when every segment is refused, which shows a silent black box.
+    v.onplaying = () => {
+      pl.textContent = "Pause";
+      if (v.videoWidth > 0 && v.videoHeight > 0) ov.classList.add("hide");
+    };
+    let deadTimer = null;
+    function armWatchdog() {
+      clearTimeout(deadTimer);
+      deadTimer = setTimeout(() => {
+        if (v.videoWidth > 0 && v.videoHeight > 0) return;
+        st.textContent = "The stream started but no video arrived. Segments were refused or the format is unsupported.";
+        rt.style.display = "inline-block"; ov.classList.remove("hide");
+      }, 15000);
+    }
     v.onpause = () => { pl.textContent = "Play"; };
     pl.onclick = () => v.paused ? v.play() : v.pause();
     mu.onclick = () => { v.muted = !v.muted; mu.textContent = v.muted ? "Unmute" : "Mute"; };
