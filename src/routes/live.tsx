@@ -140,6 +140,8 @@ export function LivePlayerContent() {
         <LiveVideoSurface
           channelId={activeChannel.id}
           channelName={activeChannel.name}
+          drm={activeChannel.drm ?? null}
+          container={activeChannel.container}
           muted={muted}
           reloadNonce={reloadNonce}
           selectedAudioTrack={activeAudio}

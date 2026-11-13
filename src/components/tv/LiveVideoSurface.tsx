@@ -7,9 +7,18 @@ export interface AudioTrackOption {
   label: string;
 }
 
+export interface ChannelDrm {
+  type: "clearkey";
+  keys: Array<{ kid: string; k: string }>;
+}
+
 interface LiveVideoSurfaceProps {
   channelId: string;
   channelName: string;
+  /** ClearKey material for DRM channels, handed over by the catalogue. */
+  drm?: ChannelDrm | null | undefined;
+  /** Stated by the catalogue: "dash" | "hls". */
+  container?: string | undefined;
   muted: boolean;
   reloadNonce: number;
   selectedAudioTrack: number;
@@ -32,6 +41,18 @@ declare global {
       };
       Events: { ERROR: string };
     };
+    dashjs?: {
+      MediaPlayer: () => {
+        initialize: (view: HTMLVideoElement, autoplay: boolean, source?: string) => void;
+        attachSource: (url: string) => void;
+        setProtectionData: (data: Record<string, unknown>) => void;
+        on: (event: string, cb: (...args: unknown[]) => void) => void;
+        reset: () => void;
+        destroy: () => void;
+        isDynamic?: () => boolean;
+      };
+      Debug?: { LOG_LEVEL_NONE: number; setLogLevel: (level: number) => void };
+    };
     Hls?: {
       isSupported: () => boolean;
       Events: { MANIFEST_PARSED: string; AUDIO_TRACKS_UPDATED: string; ERROR: string };
@@ -51,7 +72,7 @@ let scriptsPromise: Promise<void> | null = null;
 
 function ensurePlayerEnginesLoaded(): Promise<void> {
   if (typeof window === "undefined") return Promise.resolve();
-  if (window.mpegts && window.Hls) return Promise.resolve();
+  if (window.mpegts && window.Hls && window.dashjs) return Promise.resolve();
   if (scriptsPromise) return scriptsPromise;
 
   const loadScript = (src: string) =>
@@ -68,13 +89,19 @@ function ensurePlayerEnginesLoaded(): Promise<void> {
       document.head.appendChild(el);
     });
 
-  scriptsPromise = Promise.all([loadScript("/vendor/mpegts.js"), loadScript("/vendor/hls.min.js")]).then(() => undefined);
+  scriptsPromise = Promise.all([
+    loadScript("/vendor/mpegts.js"),
+    loadScript("/vendor/hls.min.js"),
+    loadScript("/vendor/dash.all.min.js"),
+  ]).then(() => undefined);
   return scriptsPromise;
 }
 
 export function LiveVideoSurface({
   channelId,
   channelName,
+  drm,
+  container,
   muted,
   reloadNonce,
   selectedAudioTrack,
@@ -83,6 +110,7 @@ export function LiveVideoSurface({
 }: LiveVideoSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<InstanceType<NonNullable<Window["Hls"]>> | null>(null);
+  const dashRef = useRef<ReturnType<NonNullable<Window["dashjs"]>["MediaPlayer"]> | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>("Connecting to live stream…");
   const [hasError, setHasError] = useState(false);
   const [localRetry, setLocalRetry] = useState(0);
@@ -120,10 +148,59 @@ export function LiveVideoSurface({
         }
         hlsRef.current = null;
       }
+      if (dashRef.current) {
+        try {
+          dashRef.current.reset();
+          dashRef.current.destroy();
+        } catch {
+          // ignore teardown errors
+        }
+        dashRef.current = null;
+      }
     };
 
-    const streamUrl = (ext: ".ts" | ".m3u8") =>
+    const streamUrl = (ext: ".ts" | ".m3u8" | ".mpd") =>
       `/api/live/stream/${encodeURIComponent(channelId)}${ext}?_t=${Date.now()}`;
+
+    // DASH + ClearKey. dash.js takes the keys as protection data, so a DRM channel
+    // never reaches the EME handshake without them.
+    const startDash = (url: string) => {
+      if (cancelled || !videoRef.current) return;
+      cleanup();
+      const dash = window.dashjs;
+      if (!dash) {
+        setHasError(true);
+        setStatusMsg("DASH playback engine did not load.");
+        return;
+      }
+      onContainerDetected?.("DASH");
+      try {
+        dash.Debug?.setLogLevel(dash.Debug.LOG_LEVEL_NONE);
+        const player = dash.MediaPlayer();
+        if (drm?.keys?.length) {
+          player.setProtectionData({
+            "org.w3.clearkey": {
+              clearkeys: Object.fromEntries(drm.keys.map((k) => [k.kid, k.k])),
+            },
+          });
+        }
+        player.on("error", () => {
+          if (cancelled) return;
+          setHasError(true);
+          setStatusMsg(
+            drm?.keys?.length
+              ? "This DRM channel was refused. Its ClearKey document may have rotated."
+              : "This channel is DRM protected and no key was provided.",
+          );
+        });
+        player.initialize(videoRef.current, true);
+        player.attachSource(url);
+        dashRef.current = player;
+      } catch {
+        setHasError(true);
+        setStatusMsg("DASH playback failed to start.");
+      }
+    };
 
     const startHls = (url: string) => {
       if (cancelled || !videoRef.current) return;
@@ -206,8 +283,11 @@ export function LiveVideoSurface({
 
       const probeCtrl = new AbortController();
       const timer = setTimeout(() => probeCtrl.abort(), 8000);
+      // DASH manifests are not MPEG-TS: ask for the container the catalogue advertised.
+      const wantDash = (container || "").toLowerCase() === "dash";
+      const probeExt = wantDash ? ".mpd" : ".ts";
       try {
-        const res = await fetch(streamUrl(".ts"), { signal: probeCtrl.signal });
+        const res = await fetch(streamUrl(probeExt), { signal: probeCtrl.signal });
         clearTimeout(timer);
         if (!res.ok) {
           const j = (await res.json().catch(() => ({}))) as { error?: string };
@@ -220,7 +300,8 @@ export function LiveVideoSurface({
         }
         const kind = (res.headers.get("x-stream-container") || "").toLowerCase();
         probeCtrl.abort();
-        if (kind === "hls") startHls(streamUrl(".m3u8"));
+        if (kind === "dash") startDash(streamUrl(".mpd"));
+        else if (kind === "hls") startHls(streamUrl(".m3u8"));
         else startMpegTs(streamUrl(".ts"), true);
       } catch {
         clearTimeout(timer);
@@ -234,7 +315,7 @@ export function LiveVideoSurface({
       cancelled = true;
       cleanup();
     };
-  }, [channelId, channelName, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected]);
+  }, [channelId, channelName, drm, container, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected]);
 
   return (
     <div className="absolute inset-0 bg-black">

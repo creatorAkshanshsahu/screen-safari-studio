@@ -13,6 +13,12 @@ export interface LiveChannelItem {
   category: string;
   logo: string;
   cmd?: string;
+  /** ClearKey material for DRM-protected playlist channels. */
+  drm?: { type: "clearkey"; keys: ClearKeyPair[]; licenseUrl?: string };
+  /** Transport hints the playlist itself declares. */
+  userAgent?: string;
+  cookie?: string;
+  mediaType?: "hls" | "dash" | "mp4";
 }
 
 export interface LiveChannelDto {
@@ -25,6 +31,9 @@ export interface LiveChannelDto {
   embedUrl: string;
   iframeCode: string;
   streamUrl: string;
+  /** Present only for DRM channels; the page hands these straight to dash.js. */
+  drm?: { type: "clearkey"; keys: Array<{ kid: string; k: string }> };
+  container?: "hls" | "dash" | "mp4";
 }
 
 const MAG_USER_AGENT =
@@ -631,54 +640,254 @@ interface ParsedM3uEntry {
   tvgId: string;
   logo: string;
   group: string;
+  /** `#KODIPROP:...license_type=clearkey` — these channels are DRM protected. */
+  licenseType: string;
+  /** `#KODIPROP:...license_key=…`; either a key-document URL or an inline `kid:key`. */
+  licenseKey: string;
+  /** `#EXTVLCOPT:http-user-agent=…` — the playlist's own UA, required by the media host. */
+  userAgent: string;
+  /** `#EXTHTTP:{"cookie":"…"}` — a CDN token, only for the playlist host. */
+  cookie: string;
 }
 
-function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
-  const lines = String(text || "").split(/\r?\n/);
-  const out: ParsedM3uEntry[] = [];
-  let pending: { name: string; tvgId: string; logo: string; group: string } | null = null;
+const JIO_ATTR_RE = /([A-Za-z0-9_-]+)="([^"]*)"/g;
 
-  const attr = (line: string, key: string): string => {
+function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const out: ParsedM3uEntry[] = [];
+  let pending: Omit<ParsedM3uEntry, "url"> | null = null;
+  // Directives may appear before the #EXTINF or between it and the media URL.
+  let preLicenseType = "";
+  let preLicenseKey = "";
+  let preUserAgent = "";
+  let preCookie = "";
+
+  const attrValue = (line: string, key: string): string => {
     const m = line.match(new RegExp(`${key}="([^"]*)"`, "i"));
     return m?.[1]?.trim() ?? "";
   };
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
+  const resetPre = () => {
+    preLicenseType = "";
+    preLicenseKey = "";
+    preUserAgent = "";
+    preCookie = "";
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
 
     if (line.startsWith("#EXTINF")) {
-      const name = line.slice(line.lastIndexOf(",") + 1).trim() || attr(line, "tvg-name");
+      const comma = line.lastIndexOf(",");
+      const name = comma >= 0 ? line.slice(comma + 1).trim() : "";
+      if (!name) continue;
+      const head = line.slice(0, comma);
+      const attrs: Record<string, string> = {};
+      for (const m of head.matchAll(JIO_ATTR_RE)) attrs[m[1]!.toLowerCase()] = m[2]!.trim();
       pending = {
-        name: name || attr(line, "tvg-id"),
-        tvgId: attr(line, "tvg-id"),
-        logo: attr(line, "tvg-logo"),
-        group: attr(line, "group-title"),
+        ...{
+          name,
+          tvgId: attrs["tvg-id"] || attrs["tvg-chno"] || attrs["channel-id"] || "",
+          logo: attrs["tvg-logo"] || "",
+          group: attrs["group-title"] || "",
+        },
+        ...{ licenseType: preLicenseType, licenseKey: preLicenseKey, userAgent: preUserAgent, cookie: preCookie },
       };
+      resetPre();
+
+      // Directives between the #EXTINF and the media URL override the ones above it.
+      let j = i + 1;
+      for (; j < lines.length; j++) {
+        const l = lines[j]!;
+        if (l.startsWith("#EXTINF")) break;
+        if (!l.startsWith("#")) break;
+        const type = l.match(/^#KODIPROP:inputstream\.adaptive\.license_type=(\S+)/i);
+        const key = l.match(/^#KODIPROP:inputstream\.adaptive\.license_key=(\S+)/i);
+        const ua = l.match(/^#EXTVLCOPT:http-user-agent=(\S+)/i);
+        const cookie = l.match(/^#EXTHTTP:\{"cookie":"([^"]*)"\}/i);
+        if (type) pending!.licenseType = type[1]!;
+        if (key) pending!.licenseKey = key[1]!;
+        if (ua) pending!.userAgent = ua[1]!;
+        if (cookie) pending!.cookie = cookie[1]!;
+      }
+      i = j - 1;
       continue;
     }
-    if (line.startsWith("#")) continue;
 
-    // A non-comment line is the stream URL for the pending entry.
+    if (line.startsWith("#")) {
+      const type = line.match(/^#KODIPROP:inputstream\.adaptive\.license_type=(\S+)/i);
+      const key = line.match(/^#KODIPROP:inputstream\.adaptive\.license_key=(\S+)/i);
+      const ua = line.match(/^#EXTVLCOPT:http-user-agent=(\S+)/i);
+      const cookie = line.match(/^#EXTHTTP:\{"cookie":"([^"]*)"\}/i);
+      if (type) preLicenseType = type[1]!;
+      if (key) preLicenseKey = key[1]!;
+      if (ua) preUserAgent = ua[1]!;
+      if (cookie) preCookie = cookie[1]!;
+      continue;
+    }
+
+    // A media URL. It needs a pending entry; some lists carry the id only in `?id=`.
     let abs = "";
     try {
       abs = new URL(line, baseUrl).toString();
     } catch {
       abs = line;
     }
-    if (!/^https?:\/\//i.test(abs) || !pending) {
-      pending = null;
-      continue;
+    if (pending && /^https?:\/\//i.test(abs)) {
+      const idFromUrl = abs.match(/[?&]id=(\d{1,10})/)?.[1] ?? "";
+      const tvgId = pending.tvgId || idFromUrl;
+      if (tvgId || pending.name) {
+        out.push({ ...pending, tvgId, url: abs });
+      }
     }
-    if (!pending.name) {
-      pending = null;
-      continue;
-    }
-    out.push({ ...pending, url: abs });
     pending = null;
+    resetPre();
   }
   return out;
 }
+
+/** "dash", "hls" or "mp4" from the media URL, never from the page. */
+function jioMediaType(url: string): "hls" | "mp4" | "dash" {
+  const ext = url.split("?")[0]!.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "m3u8") return "hls";
+  if (ext === "mp4") return "mp4";
+  return "dash";
+}
+
+/** The headers an IPTV player sends: the playlist's own UA, no Origin/Referer (the CDN 451s on those). */
+function jioMediaHeaders(entry: ParsedM3uEntry, includeCookie: boolean): Record<string, string> {
+  const h: Record<string, string> = { "User-Agent": entry.userAgent || JIO_UA_OVERRIDE };
+  if (includeCookie && entry.cookie) h["Cookie"] = entry.cookie;
+  return h;
+}
+
+/** A real manifest, not an HTML error page or a login wall that happens to return 200. */
+function isManifest(type: "hls" | "mp4" | "dash", body: string): boolean {
+  const head = body.slice(0, 2048);
+  if (type === "hls") return head.trimStart().startsWith("#EXTM3U");
+  if (type === "mp4") return false;
+  return /<MPD/i.test(head) || /urn:mpeg:dash/i.test(head);
+}
+
+interface ClearKeyPair {
+  kid: string;
+  k: string;
+}
+
+/**
+ * The provider's ClearKey document: `{"keys":[{"kty":"oct","k":"…","kid":"…"}]}`.
+ * Plain `kid:key` pairs and `{"keys":{"kid":"key"}}` are accepted too.
+ */
+function parseClearKeys(body: string): ClearKeyPair[] {
+  if (!body.trim() || body.length > 64 * 1024) return [];
+  const out: ClearKeyPair[] = [];
+  const normalised = (v: string | undefined | null): string | null => {
+    const t = (v ?? "").trim();
+    if (/^[0-9a-fA-F]{32}$/.test(t)) return t;
+    if (/^[A-Za-z0-9_-]{16,88}$/.test(t)) return t;
+    return null;
+  };
+  const push = (kid: unknown, key: unknown) => {
+    const id = normalised(typeof kid === "string" ? kid : "");
+    const k = normalised(typeof key === "string" ? key : "");
+    if (id && k) out.push({ kid: id, k });
+  };
+
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const keys = parsed["keys"];
+    if (Array.isArray(keys)) {
+      for (const item of keys.slice(0, 8)) {
+        if (!item || typeof item !== "object") continue;
+        const rec = item as Record<string, unknown>;
+        push(rec["kid"] ?? rec["keyId"], rec["k"] ?? rec["key"]);
+      }
+    } else if (keys && typeof keys === "object") {
+      for (const [kid, k] of Object.entries(keys as Record<string, unknown>)) push(kid, k);
+    }
+    if (out.length === 0) push(parsed["kid"], parsed["k"]);
+    return out;
+  } catch {
+    // Not JSON: fall back to plain kid:key tokens.
+  }
+  for (const token of body.trim().split(/[,;\s]+/)) {
+    if (!token.includes(":")) continue;
+    push(token.slice(0, token.indexOf(":")), token.slice(token.indexOf(":") + 1));
+  }
+  return out;
+}
+
+/** `cenc:default_KID` values from an MPD, normalised to base64url (the form ClearKey uses). */
+function defaultKids(mpd: string): string[] {
+  const out = new Set<string>();
+  const re = /cenc:default_KID\s*=\s*["']([0-9a-fA-F-]{32,36})["']/g;
+  for (const m of mpd.matchAll(re)) {
+    const hex = m[1]!.replace(/-/g, "");
+    if (hex.length !== 32) continue;
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    out.add(toBase64Url(bytes));
+  }
+  return [...out];
+}
+
+/** The key endpoint the playlist advertises, when it is HTTPS on the playlist's own host. */
+function jioLicenseUrl(entry: ParsedM3uEntry, siteHost: string): string | null {
+  const raw = (entry.licenseKey || "").trim();
+  if (!/^https:\/\//i.test(raw)) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "https:" || u.username || !u.hostname) return null;
+    if (u.hostname.toLowerCase() !== siteHost.toLowerCase()) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+const JIO_UA_OVERRIDE = "@allinone_reborn";
+const JIO_SITE = "https://allinonereborn2.online";
+const jioKeyCache = new Map<string, { keys: ClearKeyPair[]; until: number }>();
+
+/** Reads the provider's key document. Keys stay in memory and are never written to disk. */
+async function jioKeysFor(entry: ParsedM3uEntry, siteHost: string): Promise<ClearKeyPair[]> {
+  // Inline `kid:key` needs no request.
+  const inline: ClearKeyPair[] = [];
+  if (entry.licenseKey && !/^https?:\/\//i.test(entry.licenseKey)) {
+    for (const pair of entry.licenseKey.split(",")) {
+      const i = pair.indexOf(":");
+      if (i > 0) inline.push({ kid: pair.slice(0, i).trim(), k: pair.slice(i + 1).trim() });
+    }
+  }
+  const url = jioLicenseUrl(entry, siteHost);
+  if (!url) return inline;
+
+  const cached = jioKeyCache.get(url);
+  if (cached && cached.until > Date.now()) return [...inline, ...cached.keys];
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Origin: JIO_SITE,
+        Referer: `${JIO_SITE}/`,
+        Accept: "application/json",
+        "User-Agent": JIO_UA_OVERRIDE,
+      },
+    });
+    if (!res.ok) return inline;
+    const keys = parseClearKeys(await res.text());
+    if (keys.length) jioKeyCache.set(url, { keys, until: Date.now() + 10 * 60 * 1000 });
+    return [...inline, ...keys];
+  } catch {
+    return inline;
+  }
+}
+
+let jioPlaylistShape = 0;
 
 const jioCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | null } = {
   items: [],
@@ -687,30 +896,85 @@ const jioCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | n
 };
 
 async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
-  let res: Response;
-  try {
-    res = await fetch(cfg.jioPlaylistUrl, {
-      headers: { "User-Agent": MAG_USER_AGENT, Accept: "*/*" },
-    });
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    throw new Error(`Backup playlist unreachable (${reason})`);
+  // The front door refuses a scriptless client (HTTP 415) when the request looks like a
+  // media player. Try the shapes the Android app tries, cheapest first, and keep the one
+  // that answers for the rest of this process.
+  const shapes: Array<Record<string, string>> = [
+    { Accept: "*/*" },
+    { Accept: "*/*", "User-Agent": JIO_UA_OVERRIDE },
+    { Accept: "application/vnd.apple.mpegurl, application/x-mpegurl" },
+    { Origin: JIO_SITE, Referer: `${JIO_SITE}/`, Accept: "*/*" },
+    {
+      Origin: JIO_SITE,
+      Referer: `${JIO_SITE}/`,
+      Accept: "application/vnd.apple.mpegurl, application/x-mpegurl",
+      "User-Agent": JIO_UA_OVERRIDE,
+    },
+  ];
+
+  let text = "";
+  let status = 0;
+  let networkError = "";
+  const order = [jioPlaylistShape, ...shapes.map((_, i) => i)];
+  for (const idx of order) {
+    try {
+      const res = await fetch(cfg.jioPlaylistUrl, { headers: shapes[idx]! });
+      if (!res.ok) {
+        status = res.status;
+        continue;
+      }
+      const body = await res.text();
+      if (!body.trimStart().startsWith("#EXTM3U")) continue;
+      text = body;
+      jioPlaylistShape = idx!;
+      break;
+    } catch (e) {
+      networkError = e instanceof Error ? e.message : String(e);
+    }
   }
-  if (!res.ok) throw new Error(`Backup playlist returned HTTP ${res.status}`);
-  const text = await res.text();
+
+  if (!text) {
+    if (status) throw new Error(`Backup playlist returned HTTP ${status}`);
+    throw new Error(`Backup playlist unreachable (${networkError || "no response"})`);
+  }
+
   const entries = parseM3u(text, cfg.jioPlaylistUrl);
   if (entries.length === 0) throw new Error("Backup playlist listed no channels");
 
-  return entries.map((e, i) => ({
-    // Stable id: the playlist's own channel number, else its position.
-    id: `jio:${e.tvgId || i}`,
-    rawId: e.tvgId || String(i),
-    source: "jio" as const,
-    name: e.name,
-    category: e.group || "JioTV",
-    logo: e.logo,
-    cmd: e.url,
-  }));
+  const siteHost = (() => {
+    try {
+      return new URL(cfg.jioPlaylistUrl).hostname;
+    } catch {
+      return "allinonereborn2.online";
+    }
+  })();
+
+  const items: LiveChannelItem[] = [];
+  for (const [i, e] of entries.entries()) {
+    const mediaType = jioMediaType(e.url);
+    // Only DRM-protected entries need a key round-trip; plain HLS does not.
+    let drm: LiveChannelItem["drm"];
+    if (e.licenseType.toLowerCase() === "clearkey" || e.licenseKey) {
+      const keys = await jioKeysFor(e, siteHost);
+      const licenseUrl = jioLicenseUrl(e, siteHost) ?? undefined;
+      drm = { type: "clearkey", keys, ...(licenseUrl ? { licenseUrl } : {}) };
+    }
+    items.push({
+      // Stable id: the playlist's own channel number, else its position.
+      id: `jio:${e.tvgId || i}`,
+      rawId: e.tvgId || String(i),
+      source: "jio" as const,
+      name: e.name,
+      category: e.group || "JioTV",
+      logo: e.logo,
+      cmd: e.url,
+      mediaType,
+      userAgent: e.userAgent || JIO_UA_OVERRIDE,
+      ...(e.cookie ? { cookie: e.cookie } : {}),
+      ...(drm ? { drm } : {}),
+    });
+  }
+  return items;
 }
 
 async function loadJioCached(cfg: GatewayConfig, force = false): Promise<LiveChannelItem[]> {
@@ -971,9 +1235,11 @@ async function proxyMediaStream(
   mode: "mag" | "xtream",
   publicOrigin: string,
   secret: string,
+  overrideHeaders?: Record<string, string>,
 ): Promise<Response> {
-  const headers: Record<string, string> =
-    mode === "xtream"
+  const headers: Record<string, string> = overrideHeaders
+    ? { Accept: "*/*", ...overrideHeaders }
+    : mode === "xtream"
       ? { "User-Agent": XTREAM_USER_AGENT, Accept: "*/*", "Icy-MetaData": "1" }
       : { "User-Agent": MAG_USER_AGENT, "X-User-Agent": MAG_DEVICE_UA, Accept: "*/*", "Icy-MetaData": "1" };
 
@@ -1006,8 +1272,36 @@ async function proxyMediaStream(
   }
 
   const ctype = (upRes.headers.get("content-type") || "").toLowerCase();
-  const headText = new TextDecoder().decode(first.value.subarray(0, 32)).trimStart();
-  const isHls = ctype.includes("mpegurl") || currentUrl.split("?")[0]!.toLowerCase().endsWith(".m3u8") || headText.startsWith("#EXTM3U");
+  const headText = new TextDecoder().decode(first.value.subarray(0, 64)).trimStart();
+  const pathLower = currentUrl.split("?")[0]!.toLowerCase();
+  const isHls = ctype.includes("mpegurl") || pathLower.endsWith(".m3u8") || headText.startsWith("#EXTM3U");
+  const isDash = ctype.includes("dash+xml") || pathLower.endsWith(".mpd") || /^<\?xml|^<MPD/i.test(headText);
+
+  if (isDash) {
+    // An MPD is small; buffer it and hand it back whole so the player can read it.
+    const chunks: Uint8Array[] = [first.value];
+    let total = first.value.byteLength;
+    while (total < 4 * 1024 * 1024) {
+      const next = await reader.read();
+      if (next.done || !next.value) break;
+      chunks.push(next.value);
+      total += next.value.byteLength;
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    return new Response(merged, {
+      status: 200,
+      headers: corsEmbedHeaders({
+        "Content-Type": "application/dash+xml; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Stream-Container": "dash",
+      }),
+    });
+  }
 
   if (isHls) {
     const chunks: Uint8Array[] = [first.value];
@@ -1213,7 +1507,10 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
     logo: ch.logo,
     embedUrl,
     iframeCode: `<iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>`,
-    streamUrl: `${publicOrigin}/api/live/stream/${enc}.ts`,
+    // The extension follows the container so the player probes the right engine.
+    streamUrl: `${publicOrigin}/api/live/stream/${enc}.${ch.mediaType === "dash" ? "mpd" : ch.mediaType === "hls" ? "m3u8" : "ts"}`,
+    ...(ch.drm && ch.drm.keys.length ? { drm: { type: "clearkey" as const, keys: ch.drm.keys } } : {}),
+    ...(ch.mediaType ? { container: ch.mediaType } : {}),
   };
 }
 
@@ -1333,6 +1630,42 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     });
   }
 
+  if (path === "/api/live/resolve") {
+    const id = url.searchParams.get("id") || "";
+    if (!id) return jsonResponse(400, { ok: false, error: "id is required" });
+    const pool = await getChannelsBySource(cfg, "all", false);
+    const ch = pool.find((c) => c.id === id || c.rawId === id);
+    if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
+
+    if (ch.source === "jio") {
+      return jsonResponse(200, {
+        ok: true,
+        channel: ch.name,
+        source: "jio",
+        container: ch.mediaType ?? "dash",
+        upstreamUrl: ch.cmd ?? "",
+        clearkeys: ch.drm?.keys ?? [],
+        userAgent: ch.userAgent ?? JIO_UA_OVERRIDE,
+        hasCookie: Boolean(ch.cookie),
+        proxyUrl: `${publicOrigin}/api/live/stream/${encodeURIComponent(ch.id)}.${ch.mediaType === "hls" ? "m3u8" : ch.mediaType === "mp4" ? "ts" : "mpd"}`,
+      });
+    }
+
+    try {
+      const resolved = await resolveMaxtvLink(cfg, ch.cmd || "");
+      return jsonResponse(200, {
+        ok: true,
+        channel: ch.name,
+        source: ch.source,
+        container: "mpegts",
+        upstreamUrl: resolved,
+        proxyUrl: `${publicOrigin}/api/live/stream/${encodeURIComponent(ch.id)}.ts`,
+      });
+    } catch (e) {
+      return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Failed to resolve link" });
+    }
+  }
+
   if (path === "/api/live/segment") {
     const tok = url.searchParams.get("t") || "";
     const verified = await verifySegmentToken(tok, cfg.proxySecret);
@@ -1341,7 +1674,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   }
 
   if (path.startsWith("/api/live/stream/")) {
-    const rawId = decodeURIComponent(path.slice("/api/live/stream/".length)).replace(/\.(?:ts|m3u8)$/i, "");
+    const rawId = decodeURIComponent(path.slice("/api/live/stream/".length)).replace(/\.(?:ts|m3u8|mpd)$/i, "");
     const preferHls = path.toLowerCase().endsWith(".m3u8");
     const pool = rawId.startsWith("xt:")
       ? await loadStarshareCached(cfg, false)
@@ -1356,11 +1689,14 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       return proxyMediaStream(`${origin}/live/${u}/${p}/${ch.rawId}.${preferHls ? "m3u8" : "ts"}`, "xtream", publicOrigin, cfg.proxySecret);
     }
 
-    // JioTV backup entries carry their own HLS URL, so they need no portal round-trip.
+    // JioTV backup entries carry their own media URL, so they need no portal round-trip.
     if (ch.source === "jio") {
       if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This backup channel has no stream URL" });
       try {
-        return await proxyMediaStream(ch.cmd, "xtream", publicOrigin, cfg.proxySecret);
+        // The playlist's own UA, and never Origin/Referer: the CDN answers 451 to those.
+        const headers: Record<string, string> = { "User-Agent": ch.userAgent || JIO_UA_OVERRIDE };
+        if (ch.cookie) headers["Cookie"] = ch.cookie;
+        return await proxyMediaStream(ch.cmd, "xtream", publicOrigin, cfg.proxySecret, headers);
       } catch (e) {
         return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Backup stream failed" });
       }
