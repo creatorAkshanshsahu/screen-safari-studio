@@ -7,6 +7,17 @@ export interface AudioTrackOption {
   label: string;
 }
 
+interface ShakaPlayerInstance {
+  configure: (config: Record<string, unknown>) => void;
+  attach: (el: HTMLMediaElement) => Promise<void>;
+  load: (url: string, startTime?: number) => Promise<void>;
+  destroy: () => Promise<void>;
+  addEventListener: (type: string, cb: (event: unknown) => void) => void;
+  getAudioLanguages: () => string[];
+  selectAudioLanguage: (language: string, role?: string) => void;
+  getAudioLanguage: () => string;
+}
+
 export interface ChannelDrm {
   type: "clearkey";
   keys: Array<{ kid: string; k: string }>;
@@ -41,17 +52,15 @@ declare global {
       };
       Events: { ERROR: string };
     };
-    dashjs?: {
-      MediaPlayer: () => {
-        initialize: (view: HTMLVideoElement, autoplay: boolean, source?: string) => void;
-        attachSource: (url: string) => void;
-        setProtectionData: (data: Record<string, unknown>) => void;
-        on: (event: string, cb: (...args: unknown[]) => void) => void;
-        reset: () => void;
-        destroy: () => void;
-        isDynamic?: () => boolean;
+    shaka?: {
+      /** Constructor, with Shaka's static capability probe hung off it. */
+      Player: {
+        new (): ShakaPlayerInstance;
+        isBrowserSupported: () => boolean;
       };
-      Debug?: { LOG_LEVEL_NONE: number; setLogLevel: (level: number) => void };
+      polyfill: { installAll: () => void };
+      log?: { setLevel: (level: number) => void };
+      LogLevel?: { NONE: number };
     };
     Hls?: {
       isSupported: () => boolean;
@@ -68,11 +77,39 @@ declare global {
   }
 }
 
+/**
+ * Normalise a ClearKey key id or key into 32 hex chars.
+ *
+ * Shaka accepts either 32 hex chars or 22-char unpadded base64url, and decides
+ * which by *length alone*: exactly 22 means "base64", anything else goes through
+ * a hex parser. A 16-byte key encoded as base64url is 22 chars, but a 16-byte
+ * key id we already emit is 22 only when unpadded — and a padded 24-char form, or
+ * a 32-char base64 string, fails the length test and gets parsed as hex, quietly
+ * producing a wrong key. Converting everything to hex removes the ambiguity.
+ */
+function toHexKeyId(value: string): string | null {
+  const v = (value ?? "").trim();
+  if (!v) return null;
+  if (/^[0-9a-fA-F]{32}$/.test(v)) return v.toLowerCase();
+  const normalised = v.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  if (!/^[A-Za-z0-9+/]+$/.test(normalised)) return null;
+  const padded = normalised + "===".slice((normalised.length + 3) % 4);
+  try {
+    const bin = atob(padded);
+    if (bin.length !== 16) return null;
+    let hex = "";
+    for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
+    return hex;
+  } catch {
+    return null;
+  }
+}
+
 let scriptsPromise: Promise<void> | null = null;
 
 function ensurePlayerEnginesLoaded(): Promise<void> {
   if (typeof window === "undefined") return Promise.resolve();
-  if (window.mpegts && window.Hls && window.dashjs) return Promise.resolve();
+  if (window.mpegts && window.Hls && window.shaka) return Promise.resolve();
   if (scriptsPromise) return scriptsPromise;
 
   const loadScript = (src: string) =>
@@ -92,7 +129,7 @@ function ensurePlayerEnginesLoaded(): Promise<void> {
   scriptsPromise = Promise.all([
     loadScript("/vendor/mpegts.js"),
     loadScript("/vendor/hls.min.js"),
-    loadScript("/vendor/dash.all.min.js"),
+    loadScript("/vendor/shaka-player.compiled.js"),
   ]).then(() => undefined);
   return scriptsPromise;
 }
@@ -110,7 +147,7 @@ export function LiveVideoSurface({
 }: LiveVideoSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<InstanceType<NonNullable<Window["Hls"]>> | null>(null);
-  const dashRef = useRef<ReturnType<NonNullable<Window["dashjs"]>["MediaPlayer"]> | null>(null);
+  const shakaRef = useRef<InstanceType<NonNullable<Window["shaka"]>["Player"]> | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>("Connecting to live stream…");
   const [hasError, setHasError] = useState(false);
   const [localRetry, setLocalRetry] = useState(0);
@@ -148,54 +185,96 @@ export function LiveVideoSurface({
         }
         hlsRef.current = null;
       }
-      if (dashRef.current) {
+      if (shakaRef.current) {
         try {
-          dashRef.current.reset();
-          dashRef.current.destroy();
+          void shakaRef.current.destroy();
         } catch {
           // ignore teardown errors
         }
-        dashRef.current = null;
+        shakaRef.current = null;
       }
     };
 
     const streamUrl = (ext: ".ts" | ".m3u8" | ".mpd") =>
       `/api/live/stream/${encodeURIComponent(channelId)}${ext}?_t=${Date.now()}`;
 
-    // DASH + ClearKey. dash.js takes the keys as protection data, so a DRM channel
-    // never reaches the EME handshake without them.
+    // DASH + ClearKey through Shaka. Shaka wants each key as 32 hex chars or as
+    // *unpadded* 22-char base64url; a 32-char base64url string (which is what a
+    // default_KID produces) is silently misread as hex, so normalise both forms
+    // to hex and let Shaka encode them itself.
     const startDash = (url: string) => {
       if (cancelled || !videoRef.current) return;
       cleanup();
-      const dash = window.dashjs;
-      if (!dash) {
+      const shaka = window.shaka;
+      if (!shaka) {
         setHasError(true);
         setStatusMsg("DASH playback engine did not load.");
         return;
       }
       onContainerDetected?.("DASH");
       try {
-        dash.Debug?.setLogLevel(dash.Debug.LOG_LEVEL_NONE);
-        const player = dash.MediaPlayer();
-        if (drm?.keys?.length) {
-          player.setProtectionData({
-            "org.w3.clearkey": {
-              clearkeys: Object.fromEntries(drm.keys.map((k) => [k.kid, k.k])),
-            },
-          });
+        shaka.polyfill.installAll();
+        if (!shaka.Player.isBrowserSupported()) {
+          setHasError(true);
+          setStatusMsg("This browser cannot play protected DASH streams.");
+          return;
         }
-        player.on("error", () => {
+        shaka.log?.setLevel(shaka.LogLevel?.NONE ?? 0);
+        const player = new shaka.Player();
+        shakaRef.current = player;
+
+        const clearKeys: Record<string, string> = {};
+        for (const pair of drm?.keys ?? []) {
+          const kid = toHexKeyId(pair.kid);
+          const key = toHexKeyId(pair.k);
+          if (kid && key) clearKeys[kid] = key;
+        }
+
+        player.configure({
+          drm: {
+            ...(Object.keys(clearKeys).length ? { clearKeys } : {}),
+            // Jio's CDN serves a clear-key licence; never block on a server cert.
+            advanced: {},
+          },
+          streaming: {
+            lowLatencyMode: true,
+            rebufferingGoal: 2,
+            bufferingGoal: 20,
+            retryParameters: { maxAttempts: 4, baseDelay: 500, backoffFactor: 2, timeout: 20000 },
+          },
+          manifest: { retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, timeout: 20000 } },
+        });
+
+        player.addEventListener("error", () => {
           if (cancelled) return;
           setHasError(true);
           setStatusMsg(
-            drm?.keys?.length
+            Object.keys(clearKeys).length
               ? "This DRM channel was refused. Its ClearKey document may have rotated."
               : "This channel is DRM protected and no key was provided.",
           );
         });
-        player.initialize(videoRef.current, true);
-        player.attachSource(url);
-        dashRef.current = player;
+
+        void (async () => {
+          try {
+            await player.attach(videoRef.current!);
+            await player.load(url);
+            if (cancelled) return;
+            const langs = player.getAudioLanguages() ?? [];
+            if (langs.length > 1) {
+              const hindi = langs.find((l) => /^hi/i.test(l));
+              if (hindi) player.selectAudioLanguage(hindi);
+            }
+            const opts: AudioTrackOption[] = langs.map((name, idx) => ({ index: idx, label: name }));
+            onAudioTracksChange?.(opts, Math.max(langs.indexOf(player.getAudioLanguage() ?? ""), 0));
+            await videoRef.current?.play().catch(() => undefined);
+          } catch {
+            if (!cancelled) {
+              setHasError(true);
+              setStatusMsg("DASH playback failed to start.");
+            }
+          }
+        })();
       } catch {
         setHasError(true);
         setStatusMsg("DASH playback failed to start.");

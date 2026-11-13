@@ -1140,16 +1140,32 @@ function fromBase64Url(str: string): Uint8Array {
   return out;
 }
 
-async function signSegmentToken(url: string, mode: "mag" | "xtream", secret: string): Promise<string> {
+async function signSegmentToken(
+  url: string,
+  mode: "mag" | "xtream",
+  secret: string,
+  headers?: { ua?: string; ck?: string },
+): Promise<string> {
   const enc = new TextEncoder();
-  const payload = toBase64Url(enc.encode(JSON.stringify({ u: url, m: mode })));
+  const signed: Record<string, unknown> = { u: url, m: mode };
+  // Child requests (segments, sub-manifests) must keep the playlist's own UA and
+  // cookie. Without them the Jio CDN answers 451 to the bare browser request.
+  if (headers?.ua) signed["h"] = { ua: headers.ua, ...(headers.ck ? { ck: headers.ck } : {}) };
+  const payload = toBase64Url(enc.encode(JSON.stringify(signed)));
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sigBuf = await crypto.subtle.sign("HMAC", key, enc.encode(payload));
   const sig = toBase64Url(new Uint8Array(sigBuf)).slice(0, 22);
   return `${payload}.${sig}`;
 }
 
-async function verifySegmentToken(token: string, secret: string): Promise<{ u: string; m: "mag" | "xtream" } | null> {
+interface VerifiedSegmentToken {
+  u: string;
+  m: "mag" | "xtream";
+  ua?: string;
+  ck?: string;
+}
+
+async function verifySegmentToken(token: string, secret: string): Promise<VerifiedSegmentToken | null> {
   const [payload, sig] = String(token || "").split(".");
   if (!payload || !sig) return null;
   const enc = new TextEncoder();
@@ -1158,9 +1174,18 @@ async function verifySegmentToken(token: string, secret: string): Promise<{ u: s
   const expected = toBase64Url(new Uint8Array(sigBuf)).slice(0, 22);
   if (sig !== expected) return null;
   try {
-    const parsed = JSON.parse(new TextDecoder().decode(fromBase64Url(payload))) as { u?: string; m?: "mag" | "xtream" };
+    const parsed = JSON.parse(new TextDecoder().decode(fromBase64Url(payload))) as {
+      u?: string;
+      m?: "mag" | "xtream";
+      h?: { ua?: string; ck?: string };
+    };
     if (!parsed?.u || !/^https?:\/\//i.test(parsed.u)) return null;
-    return { u: parsed.u, m: parsed.m === "xtream" ? "xtream" : "mag" };
+    return {
+      u: parsed.u,
+      m: parsed.m === "xtream" ? "xtream" : "mag",
+      ...(parsed.h?.ua ? { ua: parsed.h.ua } : {}),
+      ...(parsed.h?.ck ? { ck: parsed.h.ck } : {}),
+    };
   } catch {
     return null;
   }
@@ -1172,6 +1197,7 @@ async function rewriteHlsManifestWeb(
   mode: "mag" | "xtream",
   publicOrigin: string,
   secret: string,
+  headers?: { ua?: string; ck?: string },
 ): Promise<string> {
   const lines = manifestText.split(/\r?\n/);
   const out: string[] = [];
@@ -1184,7 +1210,7 @@ async function rewriteHlsManifestWeb(
     } catch {
       return ref;
     }
-    const tok = await signSegmentToken(abs, mode, secret);
+    const tok = await signSegmentToken(abs, mode, secret, headers);
     return `${publicOrigin}/api/live/segment?t=${encodeURIComponent(tok)}`;
   };
 
@@ -1207,6 +1233,99 @@ async function rewriteHlsManifestWeb(
     out.push(await signRef(trimmed));
   }
   return out.join("\n");
+}
+
+function overrideHeadersFromToken(v: VerifiedSegmentToken): Record<string, string> | undefined {
+  if (!v.ua) return undefined;
+  return { "User-Agent": v.ua, ...(v.ck ? { Cookie: v.ck } : {}) };
+}
+
+/** The UA/cookie pair to seal into child tokens, derived from the upstream request. */
+function tokenHeadersFrom(overrideHeaders?: Record<string, string>): { ua?: string; ck?: string } | undefined {
+  const ua = overrideHeaders?.["User-Agent"];
+  if (!ua) return undefined;
+  const ck = overrideHeaders?.["Cookie"];
+  return ck ? { ua, ck } : { ua };
+}
+
+/**
+ * DASH manifests need the same treatment as HLS playlists: an absolute BaseURL or
+ * SegmentTemplate points the browser straight at the CDN, where it arrives with no
+ * User-Agent and no CORS grant, so every segment is refused. Rewrite those references
+ * onto our signed segment proxy.
+ *
+ * The signature covers a *directory*, never a file name, so DASH template tokens
+ * ($Number$, $RepresentationID$, $Time$, $Bandwidth$) are expanded by the player and
+ * survive intact in the path appended after it.
+ */
+async function rewriteDashManifestWeb(
+  mpdText: string,
+  manifestUrl: string,
+  mode: "mag" | "xtream",
+  publicOrigin: string,
+  secret: string,
+  headers?: { ua?: string; ck?: string },
+): Promise<string> {
+  const resolve = (raw: string): URL | null => {
+    try {
+      return new URL(raw, manifestUrl);
+    } catch {
+      return null;
+    }
+  };
+
+  /** An absolute directory -> a proxied directory whose token carries its UA/cookie. */
+  const proxyDir = async (dirUrl: string): Promise<string> => {
+    const tok = await signSegmentToken(dirUrl, mode, secret, headers);
+    return `${publicOrigin}/api/live/dashseg/${tok}/`;
+  };
+
+  /** An absolute file reference -> proxied path, keeping template tokens and query. */
+  const proxyFile = async (url: URL): Promise<string> => {
+    const cut = url.pathname.lastIndexOf("/");
+    const dir = `${url.origin}${url.pathname.slice(0, cut + 1)}`;
+    const file = url.pathname.slice(cut + 1);
+    return `${await proxyDir(dir)}${file}${url.search}`;
+  };
+
+  let out = mpdText;
+
+  // Attributes that may hold an absolute media reference. `media` and
+  // `initialization` are the SegmentTemplate pair; the rest are SegmentBase/List.
+  const attrRe = /\b(media|initialization|sourceURL|index)="(https?:\/\/[^"]*)"/gi;
+  for (const m of [...out.matchAll(attrRe)]) {
+    const resolved = resolve(m[2]!);
+    if (!resolved) continue;
+    out = out.replace(m[0]!, `${m[1]!}="${await proxyFile(resolved)}"`);
+  }
+
+  // Every BaseURL, wherever it sits, must land on our proxy. Nested BaseURLs then
+  // concatenate correctly because each one is rewritten to a fully-qualified URL.
+  if (/<BaseURL>/i.test(out)) {
+    const tags = [...out.matchAll(/<BaseURL>\s*([\s\S]*?)\s*<\/BaseURL>/gi)];
+    for (const m of tags) {
+      const resolved = resolve(m[1]!);
+      if (!resolved) continue;
+      // A BaseURL without a trailing slash is a file-name *prefix*, not a directory.
+      const isDir = resolved.pathname.endsWith("/");
+      const cut = resolved.pathname.lastIndexOf("/");
+      const suffix = isDir ? "" : resolved.pathname.slice(cut + 1);
+      const dir = `${resolved.origin}${resolved.pathname.slice(0, cut + 1)}`;
+      out = out.replace(m[0]!, `<BaseURL>${await proxyDir(dir)}${suffix}</BaseURL>`);
+    }
+  } else {
+    // With no BaseURL the player resolves against the manifest URL, i.e. our
+    // /api/live/stream/... route, where no segments exist. Pin it to the real one.
+    const self = resolve(manifestUrl);
+    if (self) {
+      const cut = self.pathname.lastIndexOf("/");
+      const dir = `${self.origin}${self.pathname.slice(0, cut + 1)}`;
+      const proxied = await proxyDir(dir);
+      out = out.replace(/<MPD\b[^>]*>/i, (tag) => `${tag}<BaseURL>${proxied}</BaseURL>`);
+    }
+  }
+
+  return out;
 }
 
 function corsEmbedHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -1293,7 +1412,18 @@ async function proxyMediaStream(
       merged.set(c, offset);
       offset += c.byteLength;
     }
-    return new Response(merged, {
+    const mpdText = new TextDecoder().decode(merged);
+    // Hand over a manifest whose every reference points back at us. Untouched, the
+    // player would walk straight out to the CDN and lose the UA that keeps it alive.
+    const rewritten = await rewriteDashManifestWeb(
+      mpdText,
+      currentUrl,
+      mode,
+      publicOrigin,
+      secret,
+      tokenHeadersFrom(overrideHeaders),
+    );
+    return new Response(rewritten, {
       status: 200,
       headers: corsEmbedHeaders({
         "Content-Type": "application/dash+xml; charset=utf-8",
@@ -1319,7 +1449,14 @@ async function proxyMediaStream(
       offset += c.byteLength;
     }
     const manifestText = new TextDecoder().decode(merged);
-    const rewritten = await rewriteHlsManifestWeb(manifestText, currentUrl, mode, publicOrigin, secret);
+    const rewritten = await rewriteHlsManifestWeb(
+      manifestText,
+      currentUrl,
+      mode,
+      publicOrigin,
+      secret,
+      tokenHeadersFrom(overrideHeaders),
+    );
     return new Response(rewritten, {
       status: 200,
       headers: corsEmbedHeaders({
@@ -1400,15 +1537,17 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
   </div>
   <script src="/vendor/mpegts.js"></script>
   <script src="/vendor/hls.min.js"></script>
+  <script src="/vendor/shaka-player.compiled.js"></script>
   <script>
     const ch = ${boot};
     const v = document.getElementById("v"), ov = document.getElementById("ov"), st = document.getElementById("st"), rt = document.getElementById("rt"), au = document.getElementById("au"), mu = document.getElementById("mu"), pl = document.getElementById("pl");
     document.getElementById("nm").textContent = ch.name;
     if (new URLSearchParams(location.search).get("muted") === "1") { v.muted = true; mu.textContent = "Unmute"; }
-    let mp = null, hp = null;
+    let mp = null, hp = null, sp = null;
     function clean() {
       if (mp) { try { mp.unload(); mp.detachMediaElement(); mp.destroy(); } catch {} mp = null; }
       if (hp) { try { hp.destroy(); } catch {} hp = null; }
+      if (sp) { try { sp.destroy(); } catch {} sp = null; }
       au.style.display = "none"; au.innerHTML = "";
     }
     function sUrl(ext) { return "/api/live/stream/" + encodeURIComponent(ch.id) + ext + "?_t=" + Date.now(); }
@@ -1435,6 +1574,63 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         });
       } else { v.src = url; v.play().catch(() => {}); }
     }
+    function hexKey(v) {
+      v = String(v == null ? "" : v).trim();
+      if (!v) return null;
+      if (/^[0-9a-fA-F]{32}$/.test(v)) return v.toLowerCase();
+      var n = v.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+      if (!/^[A-Za-z0-9+/]+$/.test(n)) return null;
+      var p = n + "===".slice((n.length + 3) % 4);
+      try {
+        var b = atob(p);
+        if (b.length !== 16) return null;
+        var h = "";
+        for (var i = 0; i < b.length; i++) h += b.charCodeAt(i).toString(16).padStart(2, "0");
+        return h;
+      } catch (e) { return null; }
+    }
+    function startDash(url) {
+      clean();
+      if (!window.shaka) { st.textContent = "DASH playback engine did not load."; rt.style.display = "inline-block"; ov.classList.remove("hide"); return; }
+      shaka.polyfill.installAll();
+      if (!shaka.Player.isBrowserSupported()) { st.textContent = "This browser cannot play protected DASH streams."; rt.style.display = "inline-block"; ov.classList.remove("hide"); return; }
+      if (shaka.log && shaka.LogLevel) shaka.log.setLevel(shaka.LogLevel.NONE);
+      sp = new shaka.Player();
+      var ck = {};
+      ((ch.drm && ch.drm.keys) || []).forEach(function (pair) {
+        var kid = hexKey(pair.kid), k = hexKey(pair.k);
+        if (kid && k) ck[kid] = k;
+      });
+      sp.configure({
+        drm: Object.keys(ck).length ? { clearKeys: ck } : {},
+        streaming: { lowLatencyMode: true, rebufferingGoal: 2, bufferingGoal: 20, retryParameters: { maxAttempts: 4, baseDelay: 500, backoffFactor: 2, timeout: 20000 } },
+        manifest: { retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, timeout: 20000 } }
+      });
+      sp.addEventListener("error", function () {
+        st.textContent = Object.keys(ck).length ? "This DRM channel was refused. Its ClearKey document may have rotated." : "This channel is DRM protected and no key was provided.";
+        rt.style.display = "inline-block"; ov.classList.remove("hide");
+      });
+      Promise.resolve()
+        .then(function () { return sp.attach(v); })
+        .then(function () { return sp.load(url); })
+        .then(function () {
+          var langs = sp.getAudioLanguages() || [];
+          if (langs.length > 1) {
+            Array.prototype.forEach.call(langs, function (name, i) {
+              var o = document.createElement("option");
+              o.value = name; o.textContent = "Audio: " + name;
+              au.appendChild(o);
+            });
+            var hi = langs.filter(function (l) { return /^hi/i.test(l); })[0];
+            if (hi) sp.selectAudioLanguage(hi);
+            au.value = sp.getAudioLanguage() || langs[0];
+            au.style.display = "inline-block";
+            au.onchange = function () { sp.selectAudioLanguage(au.value); };
+          }
+          v.play().catch(function () { v.muted = true; mu.textContent = "Unmute"; v.play().catch(function () {}); });
+        })
+        .catch(function () { st.textContent = "DASH playback failed to start."; rt.style.display = "inline-block"; ov.classList.remove("hide"); });
+    }
     function startTs(url, fallback) {
       clean();
       if (!window.mpegts || !mpegts.isSupported()) return startHls(sUrl(".m3u8"));
@@ -1445,13 +1641,19 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     }
     async function boot() {
       clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
+      // Ask for the container the catalogue advertised. Probing ".ts" unconditionally
+      // made every DASH channel look like MPEG-TS, so the embed could never play one.
+      const wantDash = String(ch.container || "").toLowerCase() === "dash";
+      const probeExt = wantDash ? ".mpd" : ".ts";
       const c = new AbortController(); const tm = setTimeout(() => c.abort(), 8000);
       try {
-        const r = await fetch(sUrl(".ts"), { signal: c.signal }); clearTimeout(tm);
+        const r = await fetch(sUrl(probeExt), { signal: c.signal }); clearTimeout(tm);
         if (!r.ok) { const j = await r.json().catch(() => ({})); c.abort(); st.textContent = j.error || ("HTTP " + r.status); rt.style.display = "inline-block"; return; }
         const kind = (r.headers.get("x-stream-container") || "").toLowerCase(); c.abort();
-        if (kind === "hls") startHls(sUrl(".m3u8")); else startTs(sUrl(".ts"), true);
-      } catch { clearTimeout(tm); startTs(sUrl(".ts"), true); }
+        if (kind === "dash") startDash(sUrl(".mpd"));
+        else if (kind === "hls") startHls(sUrl(".m3u8"));
+        else startTs(sUrl(".ts"), true);
+      } catch { clearTimeout(tm); if (wantDash) startDash(sUrl(".mpd")); else startTs(sUrl(".ts"), true); }
     }
     v.onplaying = () => { ov.classList.add("hide"); pl.textContent = "Pause"; };
     v.onpause = () => { pl.textContent = "Play"; };
@@ -1670,7 +1872,23 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const tok = url.searchParams.get("t") || "";
     const verified = await verifySegmentToken(tok, cfg.proxySecret);
     if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
-    return proxyMediaStream(verified.u, verified.m, publicOrigin, cfg.proxySecret);
+    return proxyMediaStream(verified.u, verified.m, publicOrigin, cfg.proxySecret, overrideHeadersFromToken(verified));
+  }
+
+  // DASH segment/initialisation fetches. The tokenised part is the directory, so the
+  // path after it is whatever SegmentTemplate the manifest used, already expanded by
+  // the player ($Number$, $RepresentationID$, $Time$ and nested folders all survive).
+  if (path.startsWith("/api/live/dashseg/")) {
+    const rest = path.slice("/api/live/dashseg/".length);
+    const slash = rest.indexOf("/");
+    if (slash < 0) return jsonResponse(400, { ok: false, error: "Malformed DASH segment path" });
+    const tok = decodeURIComponent(rest.slice(0, slash));
+    const file = rest.slice(slash + 1);
+    const verified = await verifySegmentToken(tok, cfg.proxySecret);
+    if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
+    const target = new URL(file, verified.u.endsWith("/") ? verified.u : `${verified.u}/`);
+    if (url.search) target.search = url.search;
+    return proxyMediaStream(target.toString(), verified.m, publicOrigin, cfg.proxySecret, overrideHeadersFromToken(verified));
   }
 
   if (path.startsWith("/api/live/stream/")) {

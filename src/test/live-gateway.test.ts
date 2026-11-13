@@ -35,4 +35,16 @@ describe("Live TV & OG Embed Gateway", () => {
     const html = await res!.text();
     expect(html).toContain("/vendor/mpegts.js");
   });
+
+  it("embed page can play DASH channels, not just HLS and MPEG-TS", async () => {
+    const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/maxtv_seed-ss1h"), undefined);
+    const html = await res!.text();
+    // Shaka has to be on the page: without it the embed has no way to open an MPD.
+    expect(html).toContain("/vendor/shaka-player.compiled.js");
+    expect(html).toContain("startDash");
+    // The probe must ask for the container the catalogue named. Hard-coding ".ts" is
+    // exactly what left every DASH channel unplayable inside an embed.
+    expect(html).toContain("wantDash");
+    expect(html).toContain('probeExt = wantDash ? ".mpd" : ".ts"');
+  });
 });
