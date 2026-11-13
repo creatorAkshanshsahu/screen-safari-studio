@@ -168,6 +168,8 @@ export function LiveVideoSurface({
   const [statusMsg, setStatusMsg] = useState<string | null>("Connecting to live stream…");
   const [hasError, setHasError] = useState(false);
   const [localRetry, setLocalRetry] = useState(0);
+  /** Set when Shaka has named a concrete fault; the no-video timer must not overwrite it. */
+  const specificErrorRef = useRef(false);
 
   // A "playing" event only means the element started; it does not prove a frame was
   // decoded. Shaka reports playing for a stream whose segments never arrive, and the
@@ -193,6 +195,9 @@ export function LiveVideoSurface({
         setHasError(true);
         settled = true;
         clearInterval(poll);
+        // A specific refusal from Shaka is worth more than anything this timer can infer.
+        // Overwriting it with "no video arrived" is how a 450 turned into a mystery.
+        if (specificErrorRef.current) return;
         // Ask the gateway what the CDN actually answered for the segments the player
         // requested. Without that, "no video arrived" is six different faults wearing one
         // message, and every round trip becomes a guess.
@@ -341,13 +346,14 @@ export function LiveVideoSurface({
           const detail = event as { detail?: { code?: number; data?: unknown[] } } | undefined;
           const code = detail?.detail?.code;
           const payload = Array.isArray(detail?.detail?.data) ? detail.detail.data : [];
-          const httpish = payload.find(
-            (d): d is { status?: number; uris?: string[] } =>
-              typeof d === "object" && d !== null && ("status" in d || "uris" in d),
-          );
-          const status = httpish?.status;
-          const firstUri = httpish?.uris?.[0];
+          // Shaka passes positional arguments, not named fields: BAD_HTTP_STATUS is
+          // [uris, status]. Searching for an object with `.status` never matched anything.
+          const uris = payload.find((d): d is string[] => Array.isArray(d) && typeof d[0] === "string");
+          const numeric = payload.find((d): d is number => typeof d === "number");
+          const status = code === 1001 ? numeric : undefined;
+          const firstUri = uris?.[0];
           setHasError(true);
+          specificErrorRef.current = true;
           setStatusMsg(
             status
               ? `The CDN refused a segment (HTTP ${status}).${firstUri ? ` ${firstUri.split("?")[0]}` : ""}`
