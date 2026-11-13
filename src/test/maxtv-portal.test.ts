@@ -84,7 +84,7 @@ describe("maxTV Stalker portal", () => {
     expect(catalogueCall.headers["Cookie"]).toContain(
       `mac=${encodeURIComponent("00:1A:79:EE:03:9F")}`,
     );
-    expect(catalogueCall.headers["Cookie"]).toContain("timezone=Asia/Kolkata");
+    expect(catalogueCall.headers["Cookie"]).toContain("timezone=Europe/London");
     expect(catalogueCall.headers["User-Agent"]).toContain("MAG200");
   });
 

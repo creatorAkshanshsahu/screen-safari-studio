@@ -33,9 +33,8 @@ export const Route = createFileRoute("/live")({
 });
 
 export function LivePlayerContent() {
-  // maxTV leads, but the JioTV playlist is a first-class source, not just something
-  // that happens when the portal is down. Picking "jio" asks for it by name.
-  const [source, setSource] = useState<"maxtv" | "jio" | "all">("maxtv");
+  // maxTV leads, with JioTV and TG TV available both as first-class sources and automatic fallbacks.
+  const [source, setSource] = useState<"maxtv" | "jio" | "tgtv" | "all">("maxtv");
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("hindi");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
   const [query, setQuery] = useState("");
@@ -44,6 +43,7 @@ export function LivePlayerContent() {
   const [activeId, setActiveId] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [muted, setMuted] = useState(false);
+  const [autoMutedBanner, setAutoMutedBanner] = useState(false);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [containerKind, setContainerKind] = useState("MPEG-TS");
   const [audioTracks, setAudioTracks] = useState<AudioTrackOption[]>([]);
@@ -136,12 +136,18 @@ export function LivePlayerContent() {
   const m3uUrl = `${origin}/api/live/playlist.m3u?source=${source}&filter=${filter}`;
   const sdkCode = `<div id="og-live-tv"></div>\n<script src="${origin}/embed-sdk.js" data-target="#og-live-tv" data-source="${source}" data-filter="${filter}"></script>`;
 
+  const handleAutoMuted = useCallback(() => {
+    setMuted(true);
+    setAutoMutedBanner(true);
+  }, []);
+
   return (
     <main className="player-scene relative h-screen w-full overflow-hidden bg-black">
       {activeChannel && (
         <LiveVideoSurface
           channelId={activeChannel.id}
           channelName={activeChannel.name}
+          directUrl={activeChannel.directUrl}
           drm={activeChannel.drm ?? null}
           container={activeChannel.container}
           activeSource={activeChannel.source}
@@ -150,7 +156,21 @@ export function LivePlayerContent() {
           selectedAudioTrack={activeAudio}
           onAudioTracksChange={handleTracks}
           onContainerDetected={setContainerKind}
+          onAutoMuted={handleAutoMuted}
         />
+      )}
+
+      {autoMutedBanner && muted && (
+        <button
+          type="button"
+          onClick={() => {
+            setMuted(false);
+            setAutoMutedBanner(false);
+          }}
+          className="glass absolute left-1/2 top-24 z-30 -translate-x-1/2 rounded-full border border-accent/60 px-4 py-2 text-xs font-bold text-foreground shadow-lg transition hover:bg-accent hover:text-accent-foreground"
+        >
+          <VolumeX className="mr-1.5 inline size-4" /> Tap to Unmute Live Audio
+        </button>
       )}
 
       <div className="bg-player-scrim pointer-events-none absolute inset-0" />
@@ -182,6 +202,7 @@ export function LivePlayerContent() {
               [
                 ["maxtv", "maxTV"],
                 ["jio", "JioTV"],
+                ["tgtv", "TG TV"],
                 ["all", "Both"],
               ] as const
             ).map(([val, label]) => (
@@ -226,20 +247,23 @@ export function LivePlayerContent() {
       </div>
 
       {/* Say plainly where the list came from; never let a dead seed look like a working catalogue. */}
-      {(portalError || servedBy === "jio" || (source === "jio" && !loading)) && (
+      {(portalError || ((servedBy === "jio" || servedBy === "tgtv") && source === "maxtv") || ((source === "jio" || source === "tgtv") && !loading)) && (
         <div className="absolute left-4 right-4 top-20 z-30 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs md:left-8 md:right-auto md:max-w-xl">
-          {servedBy === "jio" && (
+          {servedBy === "jio" && source === "maxtv" && (
             <p className="font-bold text-accent">maxTV unreachable — playing the JioTV backup playlist ({visibleChannels.length} channels).</p>
+          )}
+          {servedBy === "tgtv" && source === "maxtv" && (
+            <p className="font-bold text-accent">maxTV &amp; JioTV unreachable — playing the TG TV live playlist ({visibleChannels.length} channels).</p>
           )}
           {portalError && (
             <p className="font-bold text-accent">No live source reachable — these {visibleChannels.length} sample channels will not play.</p>
           )}
           <p className="mt-0.5 text-muted-foreground">
             {portalError ??
-              backupError ??
-              (source === "jio" && visibleChannels.length === 0
-                ? "The JioTV playlist returned no channels. Press Refresh to try again."
-                : "Backup playlist is live.")}
+              (source === "jio" ? backupError : null) ??
+              ((source === "jio" || source === "tgtv") && visibleChannels.length === 0
+                ? "This playlist returned no channels. Press Refresh to try again."
+                : "Live playlist connected.")}
           </p>
         </div>
       )}
@@ -355,7 +379,14 @@ export function LivePlayerContent() {
       <div className="absolute inset-x-0 bottom-0 z-20 space-y-3 p-4 md:p-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
-            <Button variant="secondary" onClick={() => setMuted((m) => !m)} className="glass rounded-full px-4 text-xs font-bold">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setAutoMutedBanner(false);
+                setMuted((m) => !m);
+              }}
+              className="glass rounded-full px-4 text-xs font-bold"
+            >
               {muted ? <VolumeX className="mr-1.5 size-4" /> : <Volume2 className="mr-1.5 size-4" />}
               {muted ? "Unmute" : "Mute"}
             </Button>
