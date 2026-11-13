@@ -12,4 +12,11 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  vite: {
+    server: {
+      // Preview runs behind the sandbox proxy, whose hostname changes per session.
+      // Allow it (plus localhost) so the live preview can load the app.
+      allowedHosts: [".e2b.app", ".lovable.app", ".lovableproject.com", "localhost"],
+    },
+  },
 });

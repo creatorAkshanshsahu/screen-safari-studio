@@ -2,7 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, ChevronUp, ChevronDown, Volume2, Subtitles } from "lucide-react";
-import { channels } from "@/lib/catalog";
+import { channels, crimsonHue } from "@/lib/catalog";
 
 export const Route = createFileRoute("/live")({
   head: () => ({
@@ -24,7 +24,7 @@ function LivePlayer() {
   if (!c) return null;
   const go = (d: number) => setI((i + d + channels.length) % channels.length);
   return (
-    <main className="relative h-screen w-full overflow-hidden" style={{ background: `radial-gradient(circle at 60% 40%, oklch(0.45 0.12 ${c.hue}), oklch(0.1 0.02 ${c.hue}))` }}>
+    <main className="relative h-screen w-full overflow-hidden" style={{ background: `radial-gradient(circle at 60% 40%, oklch(0.42 0.13 ${crimsonHue(c.hue)}), oklch(0.1 0.03 ${crimsonHue(c.hue)}))` }}>
       <div className="bg-player-scrim absolute inset-0" />
       {/* Top bar */}
       <div className="absolute inset-x-0 top-0 flex items-center gap-3 p-4 md:p-10">
@@ -37,7 +37,7 @@ function LivePlayer() {
         <p className="px-2 py-1 text-xs font-bold uppercase tracking-widest text-muted-foreground">Channels</p>
         {channels.map((ch, k) => (
           <Button variant="secondary" key={ch.no} onClick={() => setI(k)} className={`flex items-center gap-3 rounded-xl p-2 text-left transition ${k === i ? "bg-primary text-primary-foreground" : "hover:bg-secondary"}`}>
-            <span className="grid size-12 shrink-0 place-items-center rounded-lg font-display font-bold" style={{ background: `oklch(0.5 0.14 ${ch.hue})` }}>{ch.no}</span>
+            <span className="grid size-12 shrink-0 place-items-center rounded-lg font-display font-bold" style={{ background: `oklch(0.46 0.15 ${crimsonHue(ch.hue)})` }}>{ch.no}</span>
             <span className="min-w-0">
               <span className="block truncate text-sm font-bold">{ch.name}</span>
               <span className={`block truncate text-xs ${k === i ? "opacity-70" : "text-muted-foreground"}`}>{ch.now}</span>

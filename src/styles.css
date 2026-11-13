@@ -5,8 +5,9 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --font-sans: "Rajdhani", system-ui, sans-serif;
-  --font-display: "Orbitron", system-ui, sans-serif;
+  --font-sans: "Sora", system-ui, sans-serif;
+  /* v.4.9 ships a single family (Sora regular/semibold/bold), so headings use it too. */
+  --font-display: "Sora", system-ui, sans-serif;
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -33,6 +34,13 @@
   --color-live: var(--live);
   --color-focus: var(--focus);
   --color-scrim: var(--scrim);
+  --color-crimson: var(--crimson);
+  --color-crimson-bright: var(--crimson-bright);
+  --color-crimson-deep: var(--crimson-deep);
+  --color-wine: var(--wine);
+  --color-abyss: var(--abyss);
+  --color-surface: var(--surface);
+  --color-surface-hi: var(--surface-hi);
   --color-player-text: var(--player-text);
   --color-player-muted: var(--player-muted);
   --color-player-surface: var(--player-surface);
@@ -42,43 +50,56 @@
 
 :root {
   --radius: 0.75rem;
-  --background: oklch(0.12 0.03 290);
-  --foreground: oklch(0.97 0 0);
-  --card: oklch(0.17 0.05 290);
-  --card-foreground: oklch(0.97 0 0);
-  --popover: oklch(0.17 0.05 290);
-  --popover-foreground: oklch(0.97 0 0);
-  --primary: oklch(0.68 0.3 340);
-  --primary-foreground: oklch(0.97 0 0);
+  /* Glossy crimson identity ported from creatorAkshanshsahu/v.4.9 (docs/ui-crimson-4.9.45.md).
+     STREAMR name/logo and layout are unchanged; only the palette, gloss and scrims move. */
+  --abyss: #07040a;
+  --night: #0c0710;
+  --surface: #17101b;
+  --surface-hi: #241528;
+  --crimson: #e11d2e;
+  --crimson-bright: #ff3448;
+  --crimson-deep: #8c0f1c;
+  --wine: #4a0812;
+  --gloss-hi: #ffebee;
+  --background: var(--abyss);
+  --foreground: #fcf7f8;
+  --card: var(--surface);
+  --card-foreground: #fcf7f8;
+  --popover: var(--surface);
+  --popover-foreground: #fcf7f8;
+  --primary: var(--crimson);
+  --primary-foreground: #fcf7f8;
   --secondary: oklch(1 0 0 / 14%);
-  --secondary-foreground: oklch(0.97 0 0);
-  --muted: oklch(0.22 0.05 290);
-  --muted-foreground: oklch(0.75 0.06 260);
-  --accent: oklch(0.85 0.16 200);
-  --accent-foreground: oklch(0.12 0.03 290);
+  --secondary-foreground: #fcf7f8;
+  --muted: var(--surface-hi);
+  --muted-foreground: #c4b4ba;
+  --accent: var(--crimson-bright);
+  --accent-foreground: #fcf7f8;
   --destructive: oklch(0.62 0.22 25);
-  --destructive-foreground: oklch(0.97 0 0);
-  --live: oklch(0.85 0.16 200);
-  --focus: oklch(0.85 0.16 200);
-  --scrim: oklch(0.08 0.03 290);
-  --border: oklch(0.85 0.16 200 / 25%);
+  --destructive-foreground: #fcf7f8;
+  --live: var(--crimson-bright);
+  --focus: var(--crimson-bright);
+  --scrim: var(--abyss);
+  --border: rgb(255 52 72 / 0.25);
   --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.97 0 0);
-  --brand-from: oklch(0.68 0.3 340);
-  --brand-to: oklch(0.85 0.16 200);
-  --gradient-brand: linear-gradient(90deg, var(--brand-from) 0%, var(--brand-to) 100%);
-  --gradient-hero: linear-gradient(90deg, var(--scrim) 0%, oklch(0.08 0.03 290 / 70%) 40%, transparent 75%),
+  --ring: #fcf7f8;
+  --brand-from: var(--crimson-bright);
+  --brand-to: var(--crimson);
+  --brand-deep: var(--crimson-deep);
+  /* Three-stop lacquer gradient (bright -> primary -> deep) with a near-white specular rim. */
+  --gradient-brand: linear-gradient(90deg, var(--brand-from) 0%, var(--brand-to) 55%, var(--brand-deep) 100%);
+  --gradient-hero: linear-gradient(90deg, var(--scrim) 0%, rgb(7 4 10 / 0.7) 40%, transparent 75%),
     linear-gradient(0deg, var(--background) 0%, transparent 35%);
   --gradient-player: linear-gradient(0deg, oklch(0 0 0 / 90%) 0%, transparent 45%),
     linear-gradient(180deg, oklch(0 0 0 / 70%) 0%, transparent 25%);
   --shadow-focus: 0 0 0 2px var(--focus), 0 0 24px var(--focus), 0 0 48px -6px var(--primary);
-  --player-text: oklch(0.98 0 0);
-  --player-muted: oklch(0.8 0.015 260);
-  --player-surface: oklch(0.14 0.025 290 / 82%);
-  --player-surface-hover: oklch(0.23 0.04 290 / 95%);
-  --player-border: oklch(0.9 0.03 260 / 23%);
-  --player-shade: oklch(0.07 0.015 290);
-  --player-overlay: linear-gradient(180deg, oklch(0.07 0.015 290 / 85%), transparent 24%, transparent 38%, oklch(0.07 0.015 290 / 85%) 76%, var(--player-shade));
+  --player-text: #fcf7f8;
+  --player-muted: #c4b4ba;
+  --player-surface: rgb(23 16 27 / 0.82);
+  --player-surface-hover: rgb(36 21 40 / 0.95);
+  --player-border: rgb(255 52 72 / 0.23);
+  --player-shade: var(--abyss);
+  --player-overlay: linear-gradient(180deg, rgb(7 4 10 / 0.85), transparent 24%, transparent 38%, rgb(7 4 10 / 0.85) 76%, var(--player-shade));
   --player-panel-shadow: 0 20px 80px oklch(0 0 0 / 50%);
 }
 
@@ -90,9 +111,8 @@
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
   }
-  h1, h2, h3 { font-family: var(--font-display); text-transform: uppercase; letter-spacing: 0.04em; }
-  h1 { text-shadow: 0 0 18px var(--primary), 0 0 40px oklch(0.85 0.16 200 / 40%); }
-  body { background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px); background-size: 64px 64px; background-attachment: fixed; }
+  h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.01em; }
+  h1 { text-shadow: 0 0 18px var(--primary), 0 0 40px rgb(255 52 72 / 0.4); }
 }
 
 @utility bg-hero-scrim { background: var(--gradient-hero); }
@@ -108,7 +128,7 @@
   &:hover, &:focus-visible { transform: scale(1.06); box-shadow: var(--shadow-focus); z-index: 10; }
 }
 @utility glass {
-  background: oklch(0.17 0.05 290 / 55%);
+  background: rgb(23 16 27 / 0.55);
   border: 1px solid var(--color-border);
   backdrop-filter: blur(24px) saturate(1.4);
 }
