@@ -8,16 +8,22 @@
 export interface LiveChannelItem {
   id: string;
   rawId: string;
-  source: "maxtv" | "starshare";
+  source: "maxtv" | "starshare" | "jio";
   name: string;
   category: string;
   logo: string;
   cmd?: string;
+  /** ClearKey material for DRM-protected playlist channels. */
+  drm?: { type: "clearkey"; keys: ClearKeyPair[]; licenseUrl?: string };
+  /** Transport hints the playlist itself declares. */
+  userAgent?: string;
+  cookie?: string;
+  mediaType?: "hls" | "dash" | "mp4";
 }
 
 export interface LiveChannelDto {
   id: string;
-  source: "maxtv" | "starshare";
+  source: "maxtv" | "starshare" | "jio";
   name: string;
   category: string;
   rawCategory: string;
@@ -25,6 +31,9 @@ export interface LiveChannelDto {
   embedUrl: string;
   iframeCode: string;
   streamUrl: string;
+  /** Present only for DRM channels; the page hands these straight to dash.js. */
+  drm?: { type: "clearkey"; keys: Array<{ kid: string; k: string }> };
+  container?: "hls" | "dash" | "mp4";
 }
 
 const MAG_USER_AGENT =
@@ -69,6 +78,7 @@ type GatewayConfig = {
   starshareFallback: string;
   starshareUser: string;
   starsharePass: string;
+  jioPlaylistUrl: string;
   proxySecret: string;
 };
 
@@ -84,18 +94,19 @@ function readEnv(env: unknown, key: string, fallback = ""): string {
 
 function getConfig(env: unknown): GatewayConfig {
   return {
-    maxtvPortal: readEnv(env, "MAXTV_PORTAL", "http://new.maxtv.be/c"),
+    maxtvPortal: readEnv(env, "MAXTV_PORTAL", "http://new.maxtv.be/stalker_portal/c/"),
     maxtvMac: readEnv(env, "MAXTV_MAC", "00:1A:79:EE:03:9F"),
-    maxtvSerial: readEnv(env, "MAXTV_SERIAL", "092014N028195"),
+    maxtvSerial: readEnv(env, "MAXTV_SERIAL", "92180365D21FE"),
     maxtvDeviceId: readEnv(
       env,
       "MAXTV_DEVICE_ID",
-      "EC32E82D78B465AA7B53263FB24AD856013BEFB9F0698B46AA9E0FE9D0675B51",
+      "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070",
     ),
     starshareServer: readEnv(env, "STARSHARE_SERVER", "http://livebox.pro:8080"),
     starshareFallback: readEnv(env, "STARSHARE_FALLBACK", "http://starshare.fans:8080"),
     starshareUser: readEnv(env, "STARSHARE_USER", ""),
     starsharePass: readEnv(env, "STARSHARE_PASS", ""),
+    jioPlaylistUrl: readEnv(env, "JIO_PLAYLIST_URL", "https://allinonereborn2.online/jiotv-m3u/jtv39.m3u8"),
     proxySecret: readEnv(env, "LIVE_PROXY_SECRET", "streamr-maxtv-live-gateway-v1"),
   };
 }
@@ -173,28 +184,93 @@ export function keepsByFilter(name = "", category = "", filter = "hindi"): boole
   return keepsIndianHindi(name, category);
 }
 
-// ---------- Stalker & Xtream Clients (Web Fetch) ----------
+// ---------- Stalker portal client (maxTV) ----------
+//
+// Ported from the working Android implementation in creatorAkshanshsahu/v.4.9
+// (app/src/main/java/com/aktv/app/StalkerPortal.kt + StalkerProtocol.kt).
+// The sequence a MAG set-top box performs is reproduced exactly:
+//   handshake -> get_profile -> get_genres/get_all_channels -> create_link
+// The address the portal's `server/load.php` actually lives at is discovered,
+// not guessed, because the configured web-client path is usually not the API.
 
-function stalkerCandidates(portalUrl: string): string[] {
-  const configured = (portalUrl || "http://new.maxtv.be/c").trim().replace(/\/+$/, "");
-  let origin = configured;
+/** One channel exactly as the portal advertises it. `cmd` is the handle traded for a stream URL. */
+interface StalkerChannel {
+  id: string;
+  name: string;
+  cmd: string;
+  genre: string;
+  logo: string;
+}
+
+/** The device identity a portal recognises. Defaults are the working set from the Android app. */
+interface StalkerAccount {
+  portal: string;
+  mac: string;
+  serial: string;
+  deviceId: string;
+}
+
+const STALKER_DEFAULT_PORTAL = "http://new.maxtv.be/stalker_portal/c/";
+const STALKER_DEFAULT_MAC = "00:1A:79:EE:03:9F";
+const STALKER_DEFAULT_SERIAL = "92180365D21FE";
+const STALKER_DEFAULT_DEVICE = "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070";
+
+/** `server/load.php` — the API every panel action is posted to. */
+const STALKER_API = "server/load.php";
+
+function stalkerOrigin(url: string): string {
   try {
-    const u = new URL(configured);
-    origin = `${u.protocol}//${u.host}`;
+    const u = new URL(url.trim());
+    return `${u.protocol}//${u.host}`;
   } catch {
-    // ignore malformed URL
+    return url.trim().replace(/\/+$/, "");
   }
-  const set = new Set<string>();
-  const add = (u: string) => {
-    if (u.startsWith("http")) set.add(u);
+}
+
+/**
+ * Every address a portal's API may live at, in the order the Android app tries them.
+ *
+ * The configured value is the *web client* path (`http://host/stalker_portal/c/`) and its
+ * `server/load.php` is normally one level up, at `http://host/stalker_portal/server/load.php`.
+ * Asking only for `<configured>/server/load.php` is what produces a 404 on most panels.
+ */
+function stalkerCandidates(portalUrl: string): string[] {
+  const configured = (portalUrl || STALKER_DEFAULT_PORTAL).trim().replace(/\/+$/, "");
+  const origin = stalkerOrigin(configured);
+  const out = new Set<string>();
+  const add = (url: string) => {
+    if (url.startsWith("http")) out.add(url);
   };
-  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/stalker_portal/server/load.php`);
-  add(`${origin}/stalker_portal/server/load.php`);
-  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/server/load.php`);
-  add(`${configured}/server/load.php`);
-  add(`${origin}/server/load.php`);
+
+  // Exactly as configured.
+  add(`${configured}/${STALKER_API}`);
+  // The web-client path is not the API: its load.php sits one level up.
+  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/${STALKER_API}`);
+  add(`${configured}/portal.php`);
+  // The same files on the bare host.
+  add(`${origin}/stalker_portal/${STALKER_API}`);
+  add(`${origin}/${STALKER_API}`);
   add(`${origin}/portal.php`);
-  return [...set];
+  add(`${origin}/stalker_portal/portal.php`);
+  // A panel that only answers over TLS.
+  if (configured.startsWith("http://")) {
+    const secure = `https://${configured.slice("http://".length)}`;
+    add(`${secure}/${STALKER_API}`);
+    if (secure.endsWith("/c")) add(`${secure.slice(0, -2)}/${STALKER_API}`);
+  }
+  return [...out];
+}
+
+/** A portal answered, but not with something usable. Carries the portal's own refusal when it gave one. */
+class StalkerError extends Error {
+  readonly status: number | null;
+  readonly detail: string;
+  constructor(status: number | null = null, detail = "") {
+    super(status !== null ? `The portal refused the request (HTTP ${status})` : detail || "The portal did not answer with a usable response");
+    this.name = "StalkerError";
+    this.status = status;
+    this.detail = detail;
+  }
 }
 
 function parseEnvelope(body: string): Record<string, unknown> | unknown[] | null {
@@ -212,31 +288,126 @@ function parseEnvelope(body: string): Record<string, unknown> | unknown[] | null
   }
 }
 
+/** The `js` envelope, or the root object when the portal did not wrap its answer. */
+function stalkerJs(body: string): Record<string, unknown> | null {
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return null;
+  const js = root["js"];
+  return js && typeof js === "object" && !Array.isArray(js) ? (js as Record<string, unknown>) : root;
+}
+
+/** The session token a handshake issues. */
+function stalkerToken(body: string): string | null {
+  const js = stalkerJs(body);
+  const tok = js?.["token"];
+  return typeof tok === "string" && tok.trim() ? tok.trim() : null;
+}
+
+/** The portal's own refusal text, when it sent one. */
+function stalkerError(body: string): string | null {
+  const js = stalkerJs(body);
+  const root = parseEnvelope(body);
+  const rootObj = root && !Array.isArray(root) ? root : null;
+  const text =
+    (typeof js?.["error"] === "string" && js["error"]) ||
+    (typeof js?.["msg"] === "string" && js["msg"]) ||
+    (typeof rootObj?.["error"] === "string" && rootObj["error"]) ||
+    "";
+  return String(text).trim() || null;
+}
+
+/** True when the portal says the token is gone, so the caller has to handshake again. */
+function isStalkerExpired(body: string): boolean {
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return false;
+  const js = (root["js"] && typeof root["js"] === "object" ? root["js"] : root) as Record<string, unknown>;
+  const flag = js["not_valid"];
+  if (flag === true) return true;
+  if (typeof flag === "number" && flag !== 0) return true;
+  const msg = `${String(js["error"] ?? "")} ${String(js["msg"] ?? "")} ${String(root["error"] ?? "")}`.toLowerCase();
+  return msg.includes("authorization failed") || msg.includes("not valid") || (msg.includes("token") && msg.includes("expire"));
+}
+
+/** `get_all_channels`: the `js.data` array of `{id, name, cmd, tv_genre_id, logo}`. */
+function stalkerChannels(body: string): StalkerChannel[] {
+  const js = stalkerJs(body);
+  const data = js?.["data"];
+  if (!Array.isArray(data)) return [];
+  const out: StalkerChannel[] = [];
+  for (const item of data) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const cmd = String(rec["cmd"] ?? "").trim();
+    const name = String(rec["name"] ?? rec["title"] ?? "").trim();
+    const id = String(rec["id"] ?? rec["ch_id"] ?? "").trim();
+    // A row without a name or without a handle cannot be shown or played.
+    if (!cmd || !name) continue;
+    out.push({
+      id: id || name,
+      name,
+      cmd,
+      genre: String(rec["tv_genre_id"] ?? "").trim(),
+      logo: String(rec["logo"] ?? "").trim(),
+    });
+  }
+  return out;
+}
+
+/** `get_genres`: `[{id, title}]`, or the same array under `js`. */
+function stalkerGenres(body: string): Map<string, string> {
+  const root = parseEnvelope(body);
+  let array: unknown[] | null = null;
+  if (Array.isArray(root)) array = root;
+  else if (root && typeof root === "object") {
+    const jsRaw = root["js"];
+    if (jsRaw && typeof jsRaw === "object" && !Array.isArray(jsRaw)) {
+      const nested = (jsRaw as Record<string, unknown>)["data"];
+      if (Array.isArray(nested)) array = nested;
+    } else if (Array.isArray(jsRaw)) array = jsRaw;
+    if (!array) {
+      const data = root["data"];
+      if (Array.isArray(data)) array = data;
+    }
+  }
+  const out = new Map<string, string>();
+  if (!array) return out;
+  for (const item of array) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const id = String(rec["id"] ?? "").trim();
+    const title = String(rec["title"] ?? "").trim();
+    if (id && title) out.set(id, title);
+  }
+  return out;
+}
+
+/** `create_link`: the raw `js.cmd` handle, still carrying the player's `ffmpeg ` prefix. */
+function stalkerLink(body: string): string | null {
+  const js = stalkerJs(body);
+  const cmd = js?.["cmd"];
+  return typeof cmd === "string" && cmd.trim() ? cmd.trim() : null;
+}
+
+/**
+ * The URL inside a portal command. Portals answer `ffmpeg http://host/…/index.m3u8`, and some append
+ * Kodi-style `|User-Agent=…` parameters that players cannot use, so both are cut away here.
+ */
 function extractStalkerStreamUrl(cmd: string): string | null {
   const clean = String(cmd || "")
     .trim()
-    .replace(/^ff(?:mpeg|rt\d*)\s+/i, "")
+    .replace(/^ffmpeg/i, "")
     .trim()
     .split("|")[0]
     ?.trim() ?? "";
   return /^(?:https?|rtsp):\/\//i.test(clean) ? clean : null;
 }
 
-function isStalkerExpired(body: string): boolean {
-  const root = parseEnvelope(body);
-  if (!root || Array.isArray(root)) return false;
-  const js = (root["js"] && typeof root["js"] === "object" ? root["js"] : root) as Record<string, unknown>;
-  if (js["not_valid"] === true || (typeof js["not_valid"] === "number" && js["not_valid"] !== 0)) return true;
-  const msg = `${String(js["error"] ?? "")} ${String(js["msg"] ?? "")} ${String(root["error"] ?? "")}`.toLowerCase();
-  return msg.includes("authorization failed") || msg.includes("not valid") || (msg.includes("token") && msg.includes("expire"));
-}
-
-async function fetchTextTimeout(url: string, headers: Record<string, string>, timeoutMs = 15000): Promise<string> {
+async function fetchTextTimeout(url: string, headers: Record<string, string>, timeoutMs = 20000): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { headers, redirect: "follow", signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const res = await fetch(url, { headers, signal: ctrl.signal });
+    if (res.status !== 200) throw new StalkerError(res.status);
     return await res.text();
   } finally {
     clearTimeout(timer);
@@ -249,12 +420,22 @@ const stalkerSession: {
   profiled: boolean;
 } = { endpoint: null, token: null, profiled: false };
 
-function stalkerHeaders(cfg: GatewayConfig, auth: boolean): Record<string, string> {
+function stalkerAccount(cfg: GatewayConfig): StalkerAccount {
+  return {
+    portal: cfg.maxtvPortal,
+    mac: cfg.maxtvMac,
+    serial: cfg.maxtvSerial,
+    deviceId: cfg.maxtvDeviceId,
+  };
+}
+
+function stalkerHeaders(cfg: GatewayConfig, account: StalkerAccount, auth: boolean): Record<string, string> {
   const h: Record<string, string> = {
-    Cookie: `mac=${encodeURIComponent(cfg.maxtvMac)}; stb_lang=en; timezone=Europe/London`,
+    Cookie: `mac=${encodeURIComponent(account.mac)}; stb_lang=en; timezone=Europe/London`,
     "User-Agent": MAG_USER_AGENT,
     "X-User-Agent": MAG_DEVICE_UA,
     Accept: "*/*",
+    // The web-client path the portal was issued with, independent of where its API turned out to be.
     Referer: `${cfg.maxtvPortal.replace(/\/+$/, "")}/`,
   };
   if (auth && stalkerSession.token) h["Authorization"] = `Bearer ${stalkerSession.token}`;
@@ -262,39 +443,78 @@ function stalkerHeaders(cfg: GatewayConfig, auth: boolean): Record<string, strin
 }
 
 function buildStalkerUrl(base: string, type: string, action: string, params: Record<string, string>): string {
-  const u = new URL(base);
-  u.searchParams.set("type", type);
-  u.searchParams.set("action", action);
-  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
-  u.searchParams.set("JsHttpRequest", "1-xml");
-  return u.toString();
+  const url = new URL(base);
+  url.searchParams.set("type", type);
+  url.searchParams.set("action", action);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("JsHttpRequest", "1-xml");
+  return url.toString();
 }
 
+async function stalkerRaw(
+  cfg: GatewayConfig,
+  account: StalkerAccount,
+  base: string,
+  type: string,
+  action: string,
+  params: Record<string, string>,
+  auth: boolean,
+): Promise<string> {
+  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 20000);
+  return body;
+}
+
+/**
+ * Asks every candidate address for a handshake once and keeps the one that answers with a token.
+ * A portal that refuses in its own words (expired MAC, too many connections) is reported in those
+ * words instead of as a list of HTTP codes.
+ */
 async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
-  const candidates = stalkerSession.endpoint ? [stalkerSession.endpoint] : stalkerCandidates(cfg.maxtvPortal);
+  const account = stalkerAccount(cfg);
+  if (stalkerSession.endpoint) {
+    const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, "stb", "handshake", { token: "", prehash: "0" }, false);
+    const issued = stalkerToken(body);
+    if (!issued) throw new StalkerError(null, stalkerError(body) ?? "the portal issued no token");
+    stalkerSession.token = issued;
+    stalkerSession.profiled = false;
+    return issued;
+  }
+
+  const failures: string[] = [];
+  let spoken: string | null = null;
   let lastErr: unknown = null;
-  for (const candidate of candidates) {
+
+  for (const candidate of stalkerCandidates(cfg.maxtvPortal)) {
     try {
-      const body = await fetchTextTimeout(
-        buildStalkerUrl(candidate, "stb", "handshake", { token: "", prehash: "0" }),
-        stalkerHeaders(cfg, false),
-        10000,
-      );
-      const root = parseEnvelope(body);
-      const js = root && !Array.isArray(root) ? ((root["js"] as Record<string, unknown>) ?? root) : null;
-      const tok = typeof js?.["token"] === "string" ? js["token"].trim() : "";
-      if (tok) {
-        stalkerSession.endpoint = candidate;
-        stalkerSession.token = tok;
-        stalkerSession.profiled = false;
-        return tok;
+      const body = await stalkerRaw(cfg, account, candidate, "stb", "handshake", { token: "", prehash: "0" }, false);
+      const issued = stalkerToken(body);
+      if (!issued) {
+        const detail = stalkerError(body);
+        if (detail && !spoken) spoken = detail;
+        failures.push(`${candidate} no token`);
+        continue;
       }
+      stalkerSession.endpoint = candidate;
+      stalkerSession.token = issued;
+      stalkerSession.profiled = false;
+      return issued;
     } catch (e) {
       lastErr = e;
+      if (e instanceof StalkerError) {
+        if (e.status === null && e.detail && !spoken) spoken = e.detail;
+        failures.push(`${candidate} ${e.status !== null ? `HTTP ${e.status}` : "no token"}`);
+      } else {
+        failures.push(`${candidate} ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   }
+
   stalkerSession.endpoint = null;
-  throw lastErr instanceof Error ? lastErr : new Error("maxTV handshake failed");
+  stalkerSession.token = null;
+  const tried = failures.slice(0, 4).join(", ") + (failures.length > 4 ? " …" : "");
+  const detail = spoken ?? (failures.length ? `no portal at this address (tried ${tried})` : "no portal at this address");
+  if (lastErr instanceof StalkerError) throw new StalkerError(lastErr.status, lastErr.detail || detail);
+  throw new StalkerError(null, detail);
 }
 
 async function stalkerRequest(
@@ -304,103 +524,92 @@ async function stalkerRequest(
   params: Record<string, string>,
   retried = false,
 ): Promise<string> {
+  const account = stalkerAccount(cfg);
   if (!stalkerSession.token || !stalkerSession.endpoint) await stalkerHandshake(cfg);
+
   if (!stalkerSession.profiled && stalkerSession.endpoint) {
     stalkerSession.profiled = true;
+    // Some portals answer get_profile only after a second step they do not advertise; the token is
+    // what the catalogue calls need, so a refusal here is not fatal.
     try {
-      await fetchTextTimeout(
-        buildStalkerUrl(stalkerSession.endpoint, "stb", "get_profile", {
+      await stalkerRaw(
+        cfg,
+        account,
+        stalkerSession.endpoint,
+        "stb",
+        "get_profile",
+        {
           hd: "1",
           auth_second_step: "1",
           prehash: "0",
           num_banks: "2",
           stb_type: "MAG254",
-          sn: cfg.maxtvSerial,
-          device_id: cfg.maxtvDeviceId,
-          device_id2: cfg.maxtvDeviceId,
+          sn: account.serial,
+          device_id: account.deviceId,
+          device_id2: account.deviceId,
+          signature: "",
           client_type: "STB",
           image_version: "218",
           video_out: "hdmi",
           hw_version: "1.7-BD-00",
           api_signature: "262",
-        }),
-        stalkerHeaders(cfg, true),
-        10000,
+        },
+        true,
       );
     } catch {
       // non-fatal on portals that do not enforce get_profile
     }
   }
-  const body = await fetchTextTimeout(
-    buildStalkerUrl(stalkerSession.endpoint!, type, action, params),
-    stalkerHeaders(cfg, true),
-    22000,
-  );
+
+  if (!stalkerSession.endpoint) throw new StalkerError(null, "no portal address was reached");
+  const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, type, action, params, true);
+
+  // An expired token is normal on a portal that sat idle; handshake once and repeat the call.
   if (!retried && isStalkerExpired(body)) {
     stalkerSession.token = null;
+    stalkerSession.endpoint = null;
     await stalkerHandshake(cfg);
     return stalkerRequest(cfg, type, action, params, true);
   }
   return body;
 }
 
-async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
-  let portalOrigin = "http://new.maxtv.be";
+/** The whole maxTV catalogue, in the order the portal lists it. */
+async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
+  const account = stalkerAccount(cfg);
+  const channelsBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
+  const listed = stalkerChannels(channelsBody);
+  if (listed.length === 0) {
+    throw new StalkerError(null, stalkerError(channelsBody) ?? "The portal lists no channels");
+  }
+
+  // Genres are best effort: a portal may refuse them without refusing the channels.
+  let genres = new Map<string, string>();
   try {
-    const u = new URL(cfg.maxtvPortal);
-    portalOrigin = `${u.protocol}//${u.host}`;
+    genres = stalkerGenres(await stalkerRequest(cfg, "itv", "get_genres", {}));
   } catch {
-    // keep default
+    genres = new Map();
   }
 
-  const genresBody = await stalkerRequest(cfg, "itv", "get_genres", {}).catch(() => "");
-  const genresMap = new Map<string, string>();
-  const gEnv = parseEnvelope(genresBody);
-  const gArr = Array.isArray(gEnv)
-    ? gEnv
-    : gEnv && typeof gEnv === "object"
-      ? (((gEnv["js"] as Record<string, unknown> | undefined)?.["data"] ?? gEnv["js"] ?? gEnv["data"]) as unknown[])
-      : [];
-  if (Array.isArray(gArr)) {
-    for (const item of gArr) {
-      const rec = item as Record<string, unknown>;
-      const id = String(rec?.["id"] ?? "").trim();
-      const title = String(rec?.["title"] ?? "").trim();
-      if (id && title && id !== "*" && title.toLowerCase() !== "all") genresMap.set(id, title);
-    }
-  }
+  const origin = stalkerOrigin(account.portal);
+  const channels: LiveChannelItem[] = listed.map((c) => {
+    const genre = genres.get(c.genre);
+    return {
+      id: `st:${c.id}`,
+      rawId: c.id,
+      source: "maxtv" as const,
+      name: c.name,
+      // The portal publishes logo paths relative to its own host.
+      category: genre && genre.trim() && genre !== "*" && genre.toLowerCase() !== "all" ? genre : "maxTV",
+      logo: c.logo.startsWith("/") ? `${origin}${c.logo}` : c.logo,
+      cmd: c.cmd,
+    };
+  });
 
-  const chBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
-  const chEnv = parseEnvelope(chBody);
-  const data =
-    chEnv && !Array.isArray(chEnv)
-      ? (((chEnv["js"] as Record<string, unknown> | undefined)?.["data"] ?? chEnv["data"]) as unknown[])
-      : [];
-  if (!Array.isArray(data) || data.length === 0) throw new Error("Empty maxTV catalogue");
-
-  const out: LiveChannelItem[] = [];
-  for (const raw of data) {
-    const item = raw as Record<string, unknown>;
-    const cmd = String(item?.["cmd"] ?? "").trim();
-    const name = String(item?.["name"] ?? item?.["title"] ?? "").trim();
-    const rawId = String(item?.["id"] ?? item?.["ch_id"] ?? "").trim();
-    if (!cmd || !name) continue;
-    const genreId = String(item?.["tv_genre_id"] ?? "").trim();
-    const logoRaw = String(item?.["logo"] ?? "").trim();
-    const logo = logoRaw.startsWith("/") ? `${portalOrigin}${logoRaw}` : logoRaw;
-    out.push({
-      id: `st:${rawId || name}`,
-      rawId: rawId || name,
-      source: "maxtv",
-      name,
-      category: genresMap.get(genreId) || "maxTV",
-      logo,
-      cmd,
-    });
-  }
-  return out;
+  return { channels, endpoint: stalkerSession.endpoint };
 }
 
+/** The playable URL for one channel handle. */
 async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string> {
   const body = await stalkerRequest(cfg, "itv", "create_link", {
     cmd,
@@ -410,14 +619,378 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
     download: "0",
     force_ch_link_check: "0",
   });
-  const env = parseEnvelope(body);
-  const rawCmd =
-    env && !Array.isArray(env)
-      ? String(((env["js"] as Record<string, unknown> | undefined)?.["cmd"] ?? env["cmd"]) || "")
-      : "";
-  const url = extractStalkerStreamUrl(rawCmd) || extractStalkerStreamUrl(cmd);
-  if (!url) throw new Error("maxTV returned no playable stream URL");
+  // A portal may hand back the channel's own address unchanged; that is a valid answer too.
+  const url = extractStalkerStreamUrl(stalkerLink(body) ?? "") || extractStalkerStreamUrl(cmd);
+  if (!url) throw new StalkerError(null, stalkerError(body) ?? "The portal returned no playable link for this channel");
   return url;
+}
+
+// ---------- JioTV M3U backup source ----------
+//
+// A plain HLS playlist used as the fallback when the maxTV portal is unreachable.
+// Format is standard extended M3U:
+//   #EXTINF:-1 tvg-id="144" tvg-name="Colors HD" tvg-logo="…" group-title="Entertainment", Colors HD
+//   https://host/path/144/master.m3u8
+// Every stream is HLS, so it is proxied through the same manifest rewriter that
+// mpegts/HLS playback already uses.
+
+interface ParsedM3uEntry {
+  name: string;
+  url: string;
+  tvgId: string;
+  logo: string;
+  group: string;
+  /** `#KODIPROP:...license_type=clearkey` — these channels are DRM protected. */
+  licenseType: string;
+  /** `#KODIPROP:...license_key=…`; either a key-document URL or an inline `kid:key`. */
+  licenseKey: string;
+  /** `#EXTVLCOPT:http-user-agent=…` — the playlist's own UA, required by the media host. */
+  userAgent: string;
+  /** `#EXTHTTP:{"cookie":"…"}` — a CDN token, only for the playlist host. */
+  cookie: string;
+}
+
+const JIO_ATTR_RE = /([A-Za-z0-9_-]+)="([^"]*)"/g;
+
+function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const out: ParsedM3uEntry[] = [];
+  let pending: Omit<ParsedM3uEntry, "url"> | null = null;
+  // Directives may appear before the #EXTINF or between it and the media URL.
+  let preLicenseType = "";
+  let preLicenseKey = "";
+  let preUserAgent = "";
+  let preCookie = "";
+
+  const attrValue = (line: string, key: string): string => {
+    const m = line.match(new RegExp(`${key}="([^"]*)"`, "i"));
+    return m?.[1]?.trim() ?? "";
+  };
+
+  const resetPre = () => {
+    preLicenseType = "";
+    preLicenseKey = "";
+    preUserAgent = "";
+    preCookie = "";
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+
+    if (line.startsWith("#EXTINF")) {
+      const comma = line.lastIndexOf(",");
+      const name = comma >= 0 ? line.slice(comma + 1).trim() : "";
+      if (!name) continue;
+      const head = line.slice(0, comma);
+      const attrs: Record<string, string> = {};
+      for (const m of head.matchAll(JIO_ATTR_RE)) attrs[m[1]!.toLowerCase()] = m[2]!.trim();
+      pending = {
+        ...{
+          name,
+          tvgId: attrs["tvg-id"] || attrs["tvg-chno"] || attrs["channel-id"] || "",
+          logo: attrs["tvg-logo"] || "",
+          group: attrs["group-title"] || "",
+        },
+        ...{ licenseType: preLicenseType, licenseKey: preLicenseKey, userAgent: preUserAgent, cookie: preCookie },
+      };
+      resetPre();
+
+      // Directives between the #EXTINF and the media URL override the ones above it.
+      let j = i + 1;
+      for (; j < lines.length; j++) {
+        const l = lines[j]!;
+        if (l.startsWith("#EXTINF")) break;
+        if (!l.startsWith("#")) break;
+        const type = l.match(/^#KODIPROP:inputstream\.adaptive\.license_type=(\S+)/i);
+        const key = l.match(/^#KODIPROP:inputstream\.adaptive\.license_key=(\S+)/i);
+        const ua = l.match(/^#EXTVLCOPT:http-user-agent=(\S+)/i);
+        const cookie = l.match(/^#EXTHTTP:\{"cookie":"([^"]*)"\}/i);
+        if (type) pending!.licenseType = type[1]!;
+        if (key) pending!.licenseKey = key[1]!;
+        if (ua) pending!.userAgent = ua[1]!;
+        if (cookie) pending!.cookie = cookie[1]!;
+      }
+      i = j - 1;
+      continue;
+    }
+
+    if (line.startsWith("#")) {
+      const type = line.match(/^#KODIPROP:inputstream\.adaptive\.license_type=(\S+)/i);
+      const key = line.match(/^#KODIPROP:inputstream\.adaptive\.license_key=(\S+)/i);
+      const ua = line.match(/^#EXTVLCOPT:http-user-agent=(\S+)/i);
+      const cookie = line.match(/^#EXTHTTP:\{"cookie":"([^"]*)"\}/i);
+      if (type) preLicenseType = type[1]!;
+      if (key) preLicenseKey = key[1]!;
+      if (ua) preUserAgent = ua[1]!;
+      if (cookie) preCookie = cookie[1]!;
+      continue;
+    }
+
+    // A media URL. It needs a pending entry; some lists carry the id only in `?id=`.
+    let abs = "";
+    try {
+      abs = new URL(line, baseUrl).toString();
+    } catch {
+      abs = line;
+    }
+    if (pending && /^https?:\/\//i.test(abs)) {
+      const idFromUrl = abs.match(/[?&]id=(\d{1,10})/)?.[1] ?? "";
+      const tvgId = pending.tvgId || idFromUrl;
+      if (tvgId || pending.name) {
+        out.push({ ...pending, tvgId, url: abs });
+      }
+    }
+    pending = null;
+    resetPre();
+  }
+  return out;
+}
+
+/** "dash", "hls" or "mp4" from the media URL, never from the page. */
+function jioMediaType(url: string): "hls" | "mp4" | "dash" {
+  const ext = url.split("?")[0]!.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "m3u8") return "hls";
+  if (ext === "mp4") return "mp4";
+  return "dash";
+}
+
+/** The headers an IPTV player sends: the playlist's own UA, no Origin/Referer (the CDN 451s on those). */
+function jioMediaHeaders(entry: ParsedM3uEntry, includeCookie: boolean): Record<string, string> {
+  const h: Record<string, string> = { "User-Agent": entry.userAgent || JIO_UA_OVERRIDE };
+  if (includeCookie && entry.cookie) h["Cookie"] = entry.cookie;
+  return h;
+}
+
+/** A real manifest, not an HTML error page or a login wall that happens to return 200. */
+function isManifest(type: "hls" | "mp4" | "dash", body: string): boolean {
+  const head = body.slice(0, 2048);
+  if (type === "hls") return head.trimStart().startsWith("#EXTM3U");
+  if (type === "mp4") return false;
+  return /<MPD/i.test(head) || /urn:mpeg:dash/i.test(head);
+}
+
+interface ClearKeyPair {
+  kid: string;
+  k: string;
+}
+
+/**
+ * The provider's ClearKey document: `{"keys":[{"kty":"oct","k":"…","kid":"…"}]}`.
+ * Plain `kid:key` pairs and `{"keys":{"kid":"key"}}` are accepted too.
+ */
+function parseClearKeys(body: string): ClearKeyPair[] {
+  if (!body.trim() || body.length > 64 * 1024) return [];
+  const out: ClearKeyPair[] = [];
+  const normalised = (v: string | undefined | null): string | null => {
+    const t = (v ?? "").trim();
+    if (/^[0-9a-fA-F]{32}$/.test(t)) return t;
+    if (/^[A-Za-z0-9_-]{16,88}$/.test(t)) return t;
+    return null;
+  };
+  const push = (kid: unknown, key: unknown) => {
+    const id = normalised(typeof kid === "string" ? kid : "");
+    const k = normalised(typeof key === "string" ? key : "");
+    if (id && k) out.push({ kid: id, k });
+  };
+
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const keys = parsed["keys"];
+    if (Array.isArray(keys)) {
+      for (const item of keys.slice(0, 8)) {
+        if (!item || typeof item !== "object") continue;
+        const rec = item as Record<string, unknown>;
+        push(rec["kid"] ?? rec["keyId"], rec["k"] ?? rec["key"]);
+      }
+    } else if (keys && typeof keys === "object") {
+      for (const [kid, k] of Object.entries(keys as Record<string, unknown>)) push(kid, k);
+    }
+    if (out.length === 0) push(parsed["kid"], parsed["k"]);
+    return out;
+  } catch {
+    // Not JSON: fall back to plain kid:key tokens.
+  }
+  for (const token of body.trim().split(/[,;\s]+/)) {
+    if (!token.includes(":")) continue;
+    push(token.slice(0, token.indexOf(":")), token.slice(token.indexOf(":") + 1));
+  }
+  return out;
+}
+
+/** `cenc:default_KID` values from an MPD, normalised to base64url (the form ClearKey uses). */
+function defaultKids(mpd: string): string[] {
+  const out = new Set<string>();
+  const re = /cenc:default_KID\s*=\s*["']([0-9a-fA-F-]{32,36})["']/g;
+  for (const m of mpd.matchAll(re)) {
+    const hex = m[1]!.replace(/-/g, "");
+    if (hex.length !== 32) continue;
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    out.add(toBase64Url(bytes));
+  }
+  return [...out];
+}
+
+/** The key endpoint the playlist advertises, when it is HTTPS on the playlist's own host. */
+function jioLicenseUrl(entry: ParsedM3uEntry, siteHost: string): string | null {
+  const raw = (entry.licenseKey || "").trim();
+  if (!/^https:\/\//i.test(raw)) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "https:" || u.username || !u.hostname) return null;
+    if (u.hostname.toLowerCase() !== siteHost.toLowerCase()) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+const JIO_UA_OVERRIDE = "@allinone_reborn";
+const JIO_SITE = "https://allinonereborn2.online";
+const jioKeyCache = new Map<string, { keys: ClearKeyPair[]; until: number }>();
+
+/** Reads the provider's key document. Keys stay in memory and are never written to disk. */
+async function jioKeysFor(entry: ParsedM3uEntry, siteHost: string): Promise<ClearKeyPair[]> {
+  // Inline `kid:key` needs no request.
+  const inline: ClearKeyPair[] = [];
+  if (entry.licenseKey && !/^https?:\/\//i.test(entry.licenseKey)) {
+    for (const pair of entry.licenseKey.split(",")) {
+      const i = pair.indexOf(":");
+      if (i > 0) inline.push({ kid: pair.slice(0, i).trim(), k: pair.slice(i + 1).trim() });
+    }
+  }
+  const url = jioLicenseUrl(entry, siteHost);
+  if (!url) return inline;
+
+  const cached = jioKeyCache.get(url);
+  if (cached && cached.until > Date.now()) return [...inline, ...cached.keys];
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Origin: JIO_SITE,
+        Referer: `${JIO_SITE}/`,
+        Accept: "application/json",
+        "User-Agent": JIO_UA_OVERRIDE,
+      },
+    });
+    if (!res.ok) return inline;
+    const keys = parseClearKeys(await res.text());
+    if (keys.length) jioKeyCache.set(url, { keys, until: Date.now() + 10 * 60 * 1000 });
+    return [...inline, ...keys];
+  } catch {
+    return inline;
+  }
+}
+
+let jioPlaylistShape = 0;
+
+const jioCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | null } = {
+  items: [],
+  fetchedAt: 0,
+  error: null,
+};
+
+async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
+  // The front door refuses a scriptless client (HTTP 415) when the request looks like a
+  // media player. Try the shapes the Android app tries, cheapest first, and keep the one
+  // that answers for the rest of this process.
+  const shapes: Array<Record<string, string>> = [
+    { Accept: "*/*" },
+    { Accept: "*/*", "User-Agent": JIO_UA_OVERRIDE },
+    { Accept: "application/vnd.apple.mpegurl, application/x-mpegurl" },
+    { Origin: JIO_SITE, Referer: `${JIO_SITE}/`, Accept: "*/*" },
+    {
+      Origin: JIO_SITE,
+      Referer: `${JIO_SITE}/`,
+      Accept: "application/vnd.apple.mpegurl, application/x-mpegurl",
+      "User-Agent": JIO_UA_OVERRIDE,
+    },
+  ];
+
+  let text = "";
+  let status = 0;
+  let networkError = "";
+  const order = [jioPlaylistShape, ...shapes.map((_, i) => i)];
+  for (const idx of order) {
+    try {
+      const res = await fetch(cfg.jioPlaylistUrl, { headers: shapes[idx]! });
+      if (!res.ok) {
+        status = res.status;
+        continue;
+      }
+      const body = await res.text();
+      if (!body.trimStart().startsWith("#EXTM3U")) continue;
+      text = body;
+      jioPlaylistShape = idx!;
+      break;
+    } catch (e) {
+      networkError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  if (!text) {
+    if (status) throw new Error(`Backup playlist returned HTTP ${status}`);
+    throw new Error(`Backup playlist unreachable (${networkError || "no response"})`);
+  }
+
+  const entries = parseM3u(text, cfg.jioPlaylistUrl);
+  if (entries.length === 0) throw new Error("Backup playlist listed no channels");
+
+  const siteHost = (() => {
+    try {
+      return new URL(cfg.jioPlaylistUrl).hostname;
+    } catch {
+      return "allinonereborn2.online";
+    }
+  })();
+
+  const items: LiveChannelItem[] = [];
+  for (const [i, e] of entries.entries()) {
+    const mediaType = jioMediaType(e.url);
+    // Only DRM-protected entries need a key round-trip; plain HLS does not.
+    let drm: LiveChannelItem["drm"];
+    if (e.licenseType.toLowerCase() === "clearkey" || e.licenseKey) {
+      const keys = await jioKeysFor(e, siteHost);
+      const licenseUrl = jioLicenseUrl(e, siteHost) ?? undefined;
+      drm = { type: "clearkey", keys, ...(licenseUrl ? { licenseUrl } : {}) };
+    }
+    items.push({
+      // Stable id: the playlist's own channel number, else its position.
+      id: `jio:${e.tvgId || i}`,
+      rawId: e.tvgId || String(i),
+      source: "jio" as const,
+      name: e.name,
+      category: e.group || "JioTV",
+      logo: e.logo,
+      cmd: e.url,
+      mediaType,
+      userAgent: e.userAgent || JIO_UA_OVERRIDE,
+      ...(e.cookie ? { cookie: e.cookie } : {}),
+      ...(drm ? { drm } : {}),
+    });
+  }
+  return items;
+}
+
+async function loadJioCached(cfg: GatewayConfig, force = false): Promise<LiveChannelItem[]> {
+  if (!force && jioCache.items.length > 0 && Date.now() - jioCache.fetchedAt < CATALOGUE_TTL_MS) {
+    return jioCache.items;
+  }
+  try {
+    const live = await fetchJioCatalogue(cfg);
+    jioCache.items = live;
+    jioCache.fetchedAt = Date.now();
+    jioCache.error = null;
+    return live;
+  } catch (e) {
+    jioCache.error = e instanceof Error ? e.message : String(e);
+    return jioCache.items;
+  }
 }
 
 const xtreamState: { workingOrigin: string; canonUser: string; canonPass: string } = {
@@ -486,10 +1059,10 @@ async function fetchStarshareCatalogue(cfg: GatewayConfig): Promise<LiveChannelI
 // ---------- In-Memory Catalogue Cache ----------
 
 const memCache: {
-  maxtv: { items: LiveChannelItem[]; fetchedAt: number; usingSeed: boolean; error: string | null };
+  maxtv: { items: LiveChannelItem[]; fetchedAt: number; usingSeed: boolean; error: string | null; endpoint: string | null };
   starshare: { items: LiveChannelItem[]; fetchedAt: number; error: string | null };
 } = {
-  maxtv: { items: [], fetchedAt: 0, usingSeed: false, error: null },
+  maxtv: { items: [], fetchedAt: 0, usingSeed: false, error: null, endpoint: null },
   starshare: { items: [], fetchedAt: 0, error: null },
 };
 
@@ -498,8 +1071,10 @@ async function loadMaxtvCached(cfg: GatewayConfig, force = false): Promise<LiveC
     return memCache.maxtv.items;
   }
   try {
-    const live = await fetchMaxtvCatalogue(cfg);
-    memCache.maxtv = { items: live, fetchedAt: Date.now(), usingSeed: false, error: null };
+    const { channels: live, endpoint } = await fetchMaxtvCatalogue(cfg);
+    // Remember the address that answered so later calls skip discovery.
+    if (endpoint) memCache.maxtv.endpoint = endpoint;
+    memCache.maxtv = { items: live, fetchedAt: Date.now(), usingSeed: false, error: null, endpoint: endpoint ?? memCache.maxtv.endpoint };
     return live;
   } catch (e) {
     const fallback = memCache.maxtv.items.length > 0 ? memCache.maxtv.items : PREVIEW_SEED_CHANNELS;
@@ -508,6 +1083,7 @@ async function loadMaxtvCached(cfg: GatewayConfig, force = false): Promise<LiveC
       fetchedAt: Date.now(),
       usingSeed: fallback === PREVIEW_SEED_CHANNELS,
       error: e instanceof Error ? e.message : String(e),
+      endpoint: memCache.maxtv.endpoint,
     };
     return fallback;
   }
@@ -534,11 +1110,18 @@ async function loadStarshareCached(cfg: GatewayConfig, force = false): Promise<L
 async function getChannelsBySource(cfg: GatewayConfig, source: string, force = false): Promise<LiveChannelItem[]> {
   const s = source.toLowerCase();
   if (s === "starshare") return loadStarshareCached(cfg, force);
+  if (s === "jio") return loadJioCached(cfg, force);
   if (s === "all") {
-    const [m, x] = await Promise.all([loadMaxtvCached(cfg, force), loadStarshareCached(cfg, force)]);
-    return [...m, ...x];
+    const [m, j] = await Promise.all([loadMaxtvCached(cfg, force), loadJioCached(cfg, force)]);
+    return [...m, ...j];
   }
-  return loadMaxtvCached(cfg, force);
+  // The default path is "maxTV, with the backup playlist behind it".
+  // A portal that answered with a real catalogue wins; anything else falls through
+  // to JioTV so a viewer still gets channels that actually play.
+  const maxtv = await loadMaxtvCached(cfg, force);
+  if (!memCache.maxtv.usingSeed && maxtv.length > 0) return maxtv;
+  const jio = await loadJioCached(cfg, force);
+  return jio.length > 0 ? jio : maxtv;
 }
 
 // ---------- Web Crypto HMAC Signing for HLS Segments ----------
@@ -557,16 +1140,32 @@ function fromBase64Url(str: string): Uint8Array {
   return out;
 }
 
-async function signSegmentToken(url: string, mode: "mag" | "xtream", secret: string): Promise<string> {
+async function signSegmentToken(
+  url: string,
+  mode: "mag" | "xtream",
+  secret: string,
+  headers?: { ua?: string; ck?: string },
+): Promise<string> {
   const enc = new TextEncoder();
-  const payload = toBase64Url(enc.encode(JSON.stringify({ u: url, m: mode })));
+  const signed: Record<string, unknown> = { u: url, m: mode };
+  // Child requests (segments, sub-manifests) must keep the playlist's own UA and
+  // cookie. Without them the Jio CDN answers 451 to the bare browser request.
+  if (headers?.ua) signed["h"] = { ua: headers.ua, ...(headers.ck ? { ck: headers.ck } : {}) };
+  const payload = toBase64Url(enc.encode(JSON.stringify(signed)));
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sigBuf = await crypto.subtle.sign("HMAC", key, enc.encode(payload));
   const sig = toBase64Url(new Uint8Array(sigBuf)).slice(0, 22);
   return `${payload}.${sig}`;
 }
 
-async function verifySegmentToken(token: string, secret: string): Promise<{ u: string; m: "mag" | "xtream" } | null> {
+interface VerifiedSegmentToken {
+  u: string;
+  m: "mag" | "xtream";
+  ua?: string;
+  ck?: string;
+}
+
+async function verifySegmentToken(token: string, secret: string): Promise<VerifiedSegmentToken | null> {
   const [payload, sig] = String(token || "").split(".");
   if (!payload || !sig) return null;
   const enc = new TextEncoder();
@@ -575,9 +1174,18 @@ async function verifySegmentToken(token: string, secret: string): Promise<{ u: s
   const expected = toBase64Url(new Uint8Array(sigBuf)).slice(0, 22);
   if (sig !== expected) return null;
   try {
-    const parsed = JSON.parse(new TextDecoder().decode(fromBase64Url(payload))) as { u?: string; m?: "mag" | "xtream" };
+    const parsed = JSON.parse(new TextDecoder().decode(fromBase64Url(payload))) as {
+      u?: string;
+      m?: "mag" | "xtream";
+      h?: { ua?: string; ck?: string };
+    };
     if (!parsed?.u || !/^https?:\/\//i.test(parsed.u)) return null;
-    return { u: parsed.u, m: parsed.m === "xtream" ? "xtream" : "mag" };
+    return {
+      u: parsed.u,
+      m: parsed.m === "xtream" ? "xtream" : "mag",
+      ...(parsed.h?.ua ? { ua: parsed.h.ua } : {}),
+      ...(parsed.h?.ck ? { ck: parsed.h.ck } : {}),
+    };
   } catch {
     return null;
   }
@@ -589,6 +1197,7 @@ async function rewriteHlsManifestWeb(
   mode: "mag" | "xtream",
   publicOrigin: string,
   secret: string,
+  headers?: { ua?: string; ck?: string },
 ): Promise<string> {
   const lines = manifestText.split(/\r?\n/);
   const out: string[] = [];
@@ -601,7 +1210,7 @@ async function rewriteHlsManifestWeb(
     } catch {
       return ref;
     }
-    const tok = await signSegmentToken(abs, mode, secret);
+    const tok = await signSegmentToken(abs, mode, secret, headers);
     return `${publicOrigin}/api/live/segment?t=${encodeURIComponent(tok)}`;
   };
 
@@ -624,6 +1233,99 @@ async function rewriteHlsManifestWeb(
     out.push(await signRef(trimmed));
   }
   return out.join("\n");
+}
+
+function overrideHeadersFromToken(v: VerifiedSegmentToken): Record<string, string> | undefined {
+  if (!v.ua) return undefined;
+  return { "User-Agent": v.ua, ...(v.ck ? { Cookie: v.ck } : {}) };
+}
+
+/** The UA/cookie pair to seal into child tokens, derived from the upstream request. */
+function tokenHeadersFrom(overrideHeaders?: Record<string, string>): { ua?: string; ck?: string } | undefined {
+  const ua = overrideHeaders?.["User-Agent"];
+  if (!ua) return undefined;
+  const ck = overrideHeaders?.["Cookie"];
+  return ck ? { ua, ck } : { ua };
+}
+
+/**
+ * DASH manifests need the same treatment as HLS playlists: an absolute BaseURL or
+ * SegmentTemplate points the browser straight at the CDN, where it arrives with no
+ * User-Agent and no CORS grant, so every segment is refused. Rewrite those references
+ * onto our signed segment proxy.
+ *
+ * The signature covers a *directory*, never a file name, so DASH template tokens
+ * ($Number$, $RepresentationID$, $Time$, $Bandwidth$) are expanded by the player and
+ * survive intact in the path appended after it.
+ */
+async function rewriteDashManifestWeb(
+  mpdText: string,
+  manifestUrl: string,
+  mode: "mag" | "xtream",
+  publicOrigin: string,
+  secret: string,
+  headers?: { ua?: string; ck?: string },
+): Promise<string> {
+  const resolve = (raw: string): URL | null => {
+    try {
+      return new URL(raw, manifestUrl);
+    } catch {
+      return null;
+    }
+  };
+
+  /** An absolute directory -> a proxied directory whose token carries its UA/cookie. */
+  const proxyDir = async (dirUrl: string): Promise<string> => {
+    const tok = await signSegmentToken(dirUrl, mode, secret, headers);
+    return `${publicOrigin}/api/live/dashseg/${tok}/`;
+  };
+
+  /** An absolute file reference -> proxied path, keeping template tokens and query. */
+  const proxyFile = async (url: URL): Promise<string> => {
+    const cut = url.pathname.lastIndexOf("/");
+    const dir = `${url.origin}${url.pathname.slice(0, cut + 1)}`;
+    const file = url.pathname.slice(cut + 1);
+    return `${await proxyDir(dir)}${file}${url.search}`;
+  };
+
+  let out = mpdText;
+
+  // Attributes that may hold an absolute media reference. `media` and
+  // `initialization` are the SegmentTemplate pair; the rest are SegmentBase/List.
+  const attrRe = /\b(media|initialization|sourceURL|index)="(https?:\/\/[^"]*)"/gi;
+  for (const m of [...out.matchAll(attrRe)]) {
+    const resolved = resolve(m[2]!);
+    if (!resolved) continue;
+    out = out.replace(m[0]!, `${m[1]!}="${await proxyFile(resolved)}"`);
+  }
+
+  // Every BaseURL, wherever it sits, must land on our proxy. Nested BaseURLs then
+  // concatenate correctly because each one is rewritten to a fully-qualified URL.
+  if (/<BaseURL>/i.test(out)) {
+    const tags = [...out.matchAll(/<BaseURL>\s*([\s\S]*?)\s*<\/BaseURL>/gi)];
+    for (const m of tags) {
+      const resolved = resolve(m[1]!);
+      if (!resolved) continue;
+      // A BaseURL without a trailing slash is a file-name *prefix*, not a directory.
+      const isDir = resolved.pathname.endsWith("/");
+      const cut = resolved.pathname.lastIndexOf("/");
+      const suffix = isDir ? "" : resolved.pathname.slice(cut + 1);
+      const dir = `${resolved.origin}${resolved.pathname.slice(0, cut + 1)}`;
+      out = out.replace(m[0]!, `<BaseURL>${await proxyDir(dir)}${suffix}</BaseURL>`);
+    }
+  } else {
+    // With no BaseURL the player resolves against the manifest URL, i.e. our
+    // /api/live/stream/... route, where no segments exist. Pin it to the real one.
+    const self = resolve(manifestUrl);
+    if (self) {
+      const cut = self.pathname.lastIndexOf("/");
+      const dir = `${self.origin}${self.pathname.slice(0, cut + 1)}`;
+      const proxied = await proxyDir(dir);
+      out = out.replace(/<MPD\b[^>]*>/i, (tag) => `${tag}<BaseURL>${proxied}</BaseURL>`);
+    }
+  }
+
+  return out;
 }
 
 function corsEmbedHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -652,9 +1354,11 @@ async function proxyMediaStream(
   mode: "mag" | "xtream",
   publicOrigin: string,
   secret: string,
+  overrideHeaders?: Record<string, string>,
 ): Promise<Response> {
-  const headers: Record<string, string> =
-    mode === "xtream"
+  const headers: Record<string, string> = overrideHeaders
+    ? { Accept: "*/*", ...overrideHeaders }
+    : mode === "xtream"
       ? { "User-Agent": XTREAM_USER_AGENT, Accept: "*/*", "Icy-MetaData": "1" }
       : { "User-Agent": MAG_USER_AGENT, "X-User-Agent": MAG_DEVICE_UA, Accept: "*/*", "Icy-MetaData": "1" };
 
@@ -687,8 +1391,47 @@ async function proxyMediaStream(
   }
 
   const ctype = (upRes.headers.get("content-type") || "").toLowerCase();
-  const headText = new TextDecoder().decode(first.value.subarray(0, 32)).trimStart();
-  const isHls = ctype.includes("mpegurl") || currentUrl.split("?")[0]!.toLowerCase().endsWith(".m3u8") || headText.startsWith("#EXTM3U");
+  const headText = new TextDecoder().decode(first.value.subarray(0, 64)).trimStart();
+  const pathLower = currentUrl.split("?")[0]!.toLowerCase();
+  const isHls = ctype.includes("mpegurl") || pathLower.endsWith(".m3u8") || headText.startsWith("#EXTM3U");
+  const isDash = ctype.includes("dash+xml") || pathLower.endsWith(".mpd") || /^<\?xml|^<MPD/i.test(headText);
+
+  if (isDash) {
+    // An MPD is small; buffer it and hand it back whole so the player can read it.
+    const chunks: Uint8Array[] = [first.value];
+    let total = first.value.byteLength;
+    while (total < 4 * 1024 * 1024) {
+      const next = await reader.read();
+      if (next.done || !next.value) break;
+      chunks.push(next.value);
+      total += next.value.byteLength;
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    const mpdText = new TextDecoder().decode(merged);
+    // Hand over a manifest whose every reference points back at us. Untouched, the
+    // player would walk straight out to the CDN and lose the UA that keeps it alive.
+    const rewritten = await rewriteDashManifestWeb(
+      mpdText,
+      currentUrl,
+      mode,
+      publicOrigin,
+      secret,
+      tokenHeadersFrom(overrideHeaders),
+    );
+    return new Response(rewritten, {
+      status: 200,
+      headers: corsEmbedHeaders({
+        "Content-Type": "application/dash+xml; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Stream-Container": "dash",
+      }),
+    });
+  }
 
   if (isHls) {
     const chunks: Uint8Array[] = [first.value];
@@ -706,7 +1449,14 @@ async function proxyMediaStream(
       offset += c.byteLength;
     }
     const manifestText = new TextDecoder().decode(merged);
-    const rewritten = await rewriteHlsManifestWeb(manifestText, currentUrl, mode, publicOrigin, secret);
+    const rewritten = await rewriteHlsManifestWeb(
+      manifestText,
+      currentUrl,
+      mode,
+      publicOrigin,
+      secret,
+      tokenHeadersFrom(overrideHeaders),
+    );
     return new Response(rewritten, {
       status: 200,
       headers: corsEmbedHeaders({
@@ -787,15 +1537,17 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
   </div>
   <script src="/vendor/mpegts.js"></script>
   <script src="/vendor/hls.min.js"></script>
+  <script src="/vendor/shaka-player.compiled.js"></script>
   <script>
     const ch = ${boot};
     const v = document.getElementById("v"), ov = document.getElementById("ov"), st = document.getElementById("st"), rt = document.getElementById("rt"), au = document.getElementById("au"), mu = document.getElementById("mu"), pl = document.getElementById("pl");
     document.getElementById("nm").textContent = ch.name;
     if (new URLSearchParams(location.search).get("muted") === "1") { v.muted = true; mu.textContent = "Unmute"; }
-    let mp = null, hp = null;
+    let mp = null, hp = null, sp = null;
     function clean() {
       if (mp) { try { mp.unload(); mp.detachMediaElement(); mp.destroy(); } catch {} mp = null; }
       if (hp) { try { hp.destroy(); } catch {} hp = null; }
+      if (sp) { try { sp.destroy(); } catch {} sp = null; }
       au.style.display = "none"; au.innerHTML = "";
     }
     function sUrl(ext) { return "/api/live/stream/" + encodeURIComponent(ch.id) + ext + "?_t=" + Date.now(); }
@@ -822,6 +1574,63 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         });
       } else { v.src = url; v.play().catch(() => {}); }
     }
+    function hexKey(v) {
+      v = String(v == null ? "" : v).trim();
+      if (!v) return null;
+      if (/^[0-9a-fA-F]{32}$/.test(v)) return v.toLowerCase();
+      var n = v.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+      if (!/^[A-Za-z0-9+/]+$/.test(n)) return null;
+      var p = n + "===".slice((n.length + 3) % 4);
+      try {
+        var b = atob(p);
+        if (b.length !== 16) return null;
+        var h = "";
+        for (var i = 0; i < b.length; i++) h += b.charCodeAt(i).toString(16).padStart(2, "0");
+        return h;
+      } catch (e) { return null; }
+    }
+    function startDash(url) {
+      clean();
+      if (!window.shaka) { st.textContent = "DASH playback engine did not load."; rt.style.display = "inline-block"; ov.classList.remove("hide"); return; }
+      shaka.polyfill.installAll();
+      if (!shaka.Player.isBrowserSupported()) { st.textContent = "This browser cannot play protected DASH streams."; rt.style.display = "inline-block"; ov.classList.remove("hide"); return; }
+      if (shaka.log && shaka.LogLevel) shaka.log.setLevel(shaka.LogLevel.NONE);
+      sp = new shaka.Player();
+      var ck = {};
+      ((ch.drm && ch.drm.keys) || []).forEach(function (pair) {
+        var kid = hexKey(pair.kid), k = hexKey(pair.k);
+        if (kid && k) ck[kid] = k;
+      });
+      sp.configure({
+        drm: Object.keys(ck).length ? { clearKeys: ck } : {},
+        streaming: { lowLatencyMode: true, rebufferingGoal: 2, bufferingGoal: 20, retryParameters: { maxAttempts: 4, baseDelay: 500, backoffFactor: 2, timeout: 20000 } },
+        manifest: { retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, timeout: 20000 } }
+      });
+      sp.addEventListener("error", function () {
+        st.textContent = Object.keys(ck).length ? "This DRM channel was refused. Its ClearKey document may have rotated." : "This channel is DRM protected and no key was provided.";
+        rt.style.display = "inline-block"; ov.classList.remove("hide");
+      });
+      Promise.resolve()
+        .then(function () { return sp.attach(v); })
+        .then(function () { return sp.load(url); })
+        .then(function () {
+          var langs = sp.getAudioLanguages() || [];
+          if (langs.length > 1) {
+            Array.prototype.forEach.call(langs, function (name, i) {
+              var o = document.createElement("option");
+              o.value = name; o.textContent = "Audio: " + name;
+              au.appendChild(o);
+            });
+            var hi = langs.filter(function (l) { return /^hi/i.test(l); })[0];
+            if (hi) sp.selectAudioLanguage(hi);
+            au.value = sp.getAudioLanguage() || langs[0];
+            au.style.display = "inline-block";
+            au.onchange = function () { sp.selectAudioLanguage(au.value); };
+          }
+          v.play().catch(function () { v.muted = true; mu.textContent = "Unmute"; v.play().catch(function () {}); });
+        })
+        .catch(function () { st.textContent = "DASH playback failed to start."; rt.style.display = "inline-block"; ov.classList.remove("hide"); });
+    }
     function startTs(url, fallback) {
       clean();
       if (!window.mpegts || !mpegts.isSupported()) return startHls(sUrl(".m3u8"));
@@ -832,13 +1641,19 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     }
     async function boot() {
       clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
+      // Ask for the container the catalogue advertised. Probing ".ts" unconditionally
+      // made every DASH channel look like MPEG-TS, so the embed could never play one.
+      const wantDash = String(ch.container || "").toLowerCase() === "dash";
+      const probeExt = wantDash ? ".mpd" : ".ts";
       const c = new AbortController(); const tm = setTimeout(() => c.abort(), 8000);
       try {
-        const r = await fetch(sUrl(".ts"), { signal: c.signal }); clearTimeout(tm);
+        const r = await fetch(sUrl(probeExt), { signal: c.signal }); clearTimeout(tm);
         if (!r.ok) { const j = await r.json().catch(() => ({})); c.abort(); st.textContent = j.error || ("HTTP " + r.status); rt.style.display = "inline-block"; return; }
         const kind = (r.headers.get("x-stream-container") || "").toLowerCase(); c.abort();
-        if (kind === "hls") startHls(sUrl(".m3u8")); else startTs(sUrl(".ts"), true);
-      } catch { clearTimeout(tm); startTs(sUrl(".ts"), true); }
+        if (kind === "dash") startDash(sUrl(".mpd"));
+        else if (kind === "hls") startHls(sUrl(".m3u8"));
+        else startTs(sUrl(".ts"), true);
+      } catch { clearTimeout(tm); if (wantDash) startDash(sUrl(".mpd")); else startTs(sUrl(".ts"), true); }
     }
     v.onplaying = () => { ov.classList.add("hide"); pl.textContent = "Pause"; };
     v.onpause = () => { pl.textContent = "Play"; };
@@ -894,7 +1709,10 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
     logo: ch.logo,
     embedUrl,
     iframeCode: `<iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>`,
-    streamUrl: `${publicOrigin}/api/live/stream/${enc}.ts`,
+    // The extension follows the container so the player probes the right engine.
+    streamUrl: `${publicOrigin}/api/live/stream/${enc}.${ch.mediaType === "dash" ? "mpd" : ch.mediaType === "hls" ? "m3u8" : "ts"}`,
+    ...(ch.drm && ch.drm.keys.length ? { drm: { type: "clearkey" as const, keys: ch.drm.keys } } : {}),
+    ...(ch.mediaType ? { container: ch.mediaType } : {}),
   };
 }
 
@@ -956,12 +1774,37 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const categories = [...new Set(filtered.map((c) => displayCategoryName(c.category)))];
     const channels = filtered.slice(0, limit).map((c) => toDto(c, publicOrigin));
 
+    // Report what is actually being served. A seed row can never masquerade as a working
+    // catalogue, and when the backup playlist is carrying the list that is stated plainly.
+    const usingSeed = filtered.length > 0 && filtered.every((c) => String(c.cmd || "").startsWith("seed://"));
+    const hasJio = filtered.some((c) => c.source === "jio");
+    const hasMaxtv = filtered.some((c) => c.source === "maxtv");
+
+    const served: "maxtv" | "jio" | "starshare" | "mixed" | "seed" =
+      source === "starshare"
+        ? "starshare"
+        : usingSeed
+          ? "seed"
+          : source === "jio"
+            ? "jio"
+            : hasJio && hasMaxtv
+              ? "mixed"
+              : hasJio
+                ? "jio"
+                : "maxtv";
+
+    const portalError = usingSeed ? memCache.maxtv.error : null;
+
     return jsonResponse(200, {
       ok: true,
       source,
+      servedBy: served,
       filter,
       totalMatching: filtered.length,
-      usingPreviewSeed: source !== "starshare" && memCache.maxtv.usingSeed,
+      usingPreviewSeed: usingSeed,
+      portalError,
+      portalEndpoint: memCache.maxtv.endpoint,
+      backupError: source === "maxtv" || source === "all" ? jioCache.error : null,
       categories,
       channels,
     });
@@ -989,15 +1832,67 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     });
   }
 
+  if (path === "/api/live/resolve") {
+    const id = url.searchParams.get("id") || "";
+    if (!id) return jsonResponse(400, { ok: false, error: "id is required" });
+    const pool = await getChannelsBySource(cfg, "all", false);
+    const ch = pool.find((c) => c.id === id || c.rawId === id);
+    if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
+
+    if (ch.source === "jio") {
+      return jsonResponse(200, {
+        ok: true,
+        channel: ch.name,
+        source: "jio",
+        container: ch.mediaType ?? "dash",
+        upstreamUrl: ch.cmd ?? "",
+        clearkeys: ch.drm?.keys ?? [],
+        userAgent: ch.userAgent ?? JIO_UA_OVERRIDE,
+        hasCookie: Boolean(ch.cookie),
+        proxyUrl: `${publicOrigin}/api/live/stream/${encodeURIComponent(ch.id)}.${ch.mediaType === "hls" ? "m3u8" : ch.mediaType === "mp4" ? "ts" : "mpd"}`,
+      });
+    }
+
+    try {
+      const resolved = await resolveMaxtvLink(cfg, ch.cmd || "");
+      return jsonResponse(200, {
+        ok: true,
+        channel: ch.name,
+        source: ch.source,
+        container: "mpegts",
+        upstreamUrl: resolved,
+        proxyUrl: `${publicOrigin}/api/live/stream/${encodeURIComponent(ch.id)}.ts`,
+      });
+    } catch (e) {
+      return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Failed to resolve link" });
+    }
+  }
+
   if (path === "/api/live/segment") {
     const tok = url.searchParams.get("t") || "";
     const verified = await verifySegmentToken(tok, cfg.proxySecret);
     if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
-    return proxyMediaStream(verified.u, verified.m, publicOrigin, cfg.proxySecret);
+    return proxyMediaStream(verified.u, verified.m, publicOrigin, cfg.proxySecret, overrideHeadersFromToken(verified));
+  }
+
+  // DASH segment/initialisation fetches. The tokenised part is the directory, so the
+  // path after it is whatever SegmentTemplate the manifest used, already expanded by
+  // the player ($Number$, $RepresentationID$, $Time$ and nested folders all survive).
+  if (path.startsWith("/api/live/dashseg/")) {
+    const rest = path.slice("/api/live/dashseg/".length);
+    const slash = rest.indexOf("/");
+    if (slash < 0) return jsonResponse(400, { ok: false, error: "Malformed DASH segment path" });
+    const tok = decodeURIComponent(rest.slice(0, slash));
+    const file = rest.slice(slash + 1);
+    const verified = await verifySegmentToken(tok, cfg.proxySecret);
+    if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
+    const target = new URL(file, verified.u.endsWith("/") ? verified.u : `${verified.u}/`);
+    if (url.search) target.search = url.search;
+    return proxyMediaStream(target.toString(), verified.m, publicOrigin, cfg.proxySecret, overrideHeadersFromToken(verified));
   }
 
   if (path.startsWith("/api/live/stream/")) {
-    const rawId = decodeURIComponent(path.slice("/api/live/stream/".length)).replace(/\.(?:ts|m3u8)$/i, "");
+    const rawId = decodeURIComponent(path.slice("/api/live/stream/".length)).replace(/\.(?:ts|m3u8|mpd)$/i, "");
     const preferHls = path.toLowerCase().endsWith(".m3u8");
     const pool = rawId.startsWith("xt:")
       ? await loadStarshareCached(cfg, false)
@@ -1012,10 +1907,23 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       return proxyMediaStream(`${origin}/live/${u}/${p}/${ch.rawId}.${preferHls ? "m3u8" : "ts"}`, "xtream", publicOrigin, cfg.proxySecret);
     }
 
+    // JioTV backup entries carry their own media URL, so they need no portal round-trip.
+    if (ch.source === "jio") {
+      if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This backup channel has no stream URL" });
+      try {
+        // The playlist's own UA, and never Origin/Referer: the CDN answers 451 to those.
+        const headers: Record<string, string> = { "User-Agent": ch.userAgent || JIO_UA_OVERRIDE };
+        if (ch.cookie) headers["Cookie"] = ch.cookie;
+        return await proxyMediaStream(ch.cmd, "xtream", publicOrigin, cfg.proxySecret, headers);
+      } catch (e) {
+        return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Backup stream failed" });
+      }
+    }
+
     if (String(ch.cmd || "").startsWith("seed://")) {
       return jsonResponse(503, {
         ok: false,
-        error: "Live stream connects directly to maxTV once deployed on Lovable / internet-enabled runtime.",
+        error: "No live source is reachable. maxTV did not answer and the backup playlist is unavailable.",
       });
     }
 

@@ -7,9 +7,29 @@ export interface AudioTrackOption {
   label: string;
 }
 
+interface ShakaPlayerInstance {
+  configure: (config: Record<string, unknown>) => void;
+  attach: (el: HTMLMediaElement) => Promise<void>;
+  load: (url: string, startTime?: number) => Promise<void>;
+  destroy: () => Promise<void>;
+  addEventListener: (type: string, cb: (event: unknown) => void) => void;
+  getAudioLanguages: () => string[];
+  selectAudioLanguage: (language: string, role?: string) => void;
+  getAudioLanguage: () => string;
+}
+
+export interface ChannelDrm {
+  type: "clearkey";
+  keys: Array<{ kid: string; k: string }>;
+}
+
 interface LiveVideoSurfaceProps {
   channelId: string;
   channelName: string;
+  /** ClearKey material for DRM channels, handed over by the catalogue. */
+  drm?: ChannelDrm | null | undefined;
+  /** Stated by the catalogue: "dash" | "hls". */
+  container?: string | undefined;
   muted: boolean;
   reloadNonce: number;
   selectedAudioTrack: number;
@@ -32,6 +52,16 @@ declare global {
       };
       Events: { ERROR: string };
     };
+    shaka?: {
+      /** Constructor, with Shaka's static capability probe hung off it. */
+      Player: {
+        new (): ShakaPlayerInstance;
+        isBrowserSupported: () => boolean;
+      };
+      polyfill: { installAll: () => void };
+      log?: { setLevel: (level: number) => void };
+      LogLevel?: { NONE: number };
+    };
     Hls?: {
       isSupported: () => boolean;
       Events: { MANIFEST_PARSED: string; AUDIO_TRACKS_UPDATED: string; ERROR: string };
@@ -47,11 +77,39 @@ declare global {
   }
 }
 
+/**
+ * Normalise a ClearKey key id or key into 32 hex chars.
+ *
+ * Shaka accepts either 32 hex chars or 22-char unpadded base64url, and decides
+ * which by *length alone*: exactly 22 means "base64", anything else goes through
+ * a hex parser. A 16-byte key encoded as base64url is 22 chars, but a 16-byte
+ * key id we already emit is 22 only when unpadded — and a padded 24-char form, or
+ * a 32-char base64 string, fails the length test and gets parsed as hex, quietly
+ * producing a wrong key. Converting everything to hex removes the ambiguity.
+ */
+function toHexKeyId(value: string): string | null {
+  const v = (value ?? "").trim();
+  if (!v) return null;
+  if (/^[0-9a-fA-F]{32}$/.test(v)) return v.toLowerCase();
+  const normalised = v.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  if (!/^[A-Za-z0-9+/]+$/.test(normalised)) return null;
+  const padded = normalised + "===".slice((normalised.length + 3) % 4);
+  try {
+    const bin = atob(padded);
+    if (bin.length !== 16) return null;
+    let hex = "";
+    for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
+    return hex;
+  } catch {
+    return null;
+  }
+}
+
 let scriptsPromise: Promise<void> | null = null;
 
 function ensurePlayerEnginesLoaded(): Promise<void> {
   if (typeof window === "undefined") return Promise.resolve();
-  if (window.mpegts && window.Hls) return Promise.resolve();
+  if (window.mpegts && window.Hls && window.shaka) return Promise.resolve();
   if (scriptsPromise) return scriptsPromise;
 
   const loadScript = (src: string) =>
@@ -68,13 +126,19 @@ function ensurePlayerEnginesLoaded(): Promise<void> {
       document.head.appendChild(el);
     });
 
-  scriptsPromise = Promise.all([loadScript("/vendor/mpegts.js"), loadScript("/vendor/hls.min.js")]).then(() => undefined);
+  scriptsPromise = Promise.all([
+    loadScript("/vendor/mpegts.js"),
+    loadScript("/vendor/hls.min.js"),
+    loadScript("/vendor/shaka-player.compiled.js"),
+  ]).then(() => undefined);
   return scriptsPromise;
 }
 
 export function LiveVideoSurface({
   channelId,
   channelName,
+  drm,
+  container,
   muted,
   reloadNonce,
   selectedAudioTrack,
@@ -83,6 +147,7 @@ export function LiveVideoSurface({
 }: LiveVideoSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<InstanceType<NonNullable<Window["Hls"]>> | null>(null);
+  const shakaRef = useRef<InstanceType<NonNullable<Window["shaka"]>["Player"]> | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>("Connecting to live stream…");
   const [hasError, setHasError] = useState(false);
   const [localRetry, setLocalRetry] = useState(0);
@@ -120,10 +185,101 @@ export function LiveVideoSurface({
         }
         hlsRef.current = null;
       }
+      if (shakaRef.current) {
+        try {
+          void shakaRef.current.destroy();
+        } catch {
+          // ignore teardown errors
+        }
+        shakaRef.current = null;
+      }
     };
 
-    const streamUrl = (ext: ".ts" | ".m3u8") =>
+    const streamUrl = (ext: ".ts" | ".m3u8" | ".mpd") =>
       `/api/live/stream/${encodeURIComponent(channelId)}${ext}?_t=${Date.now()}`;
+
+    // DASH + ClearKey through Shaka. Shaka wants each key as 32 hex chars or as
+    // *unpadded* 22-char base64url; a 32-char base64url string (which is what a
+    // default_KID produces) is silently misread as hex, so normalise both forms
+    // to hex and let Shaka encode them itself.
+    const startDash = (url: string) => {
+      if (cancelled || !videoRef.current) return;
+      cleanup();
+      const shaka = window.shaka;
+      if (!shaka) {
+        setHasError(true);
+        setStatusMsg("DASH playback engine did not load.");
+        return;
+      }
+      onContainerDetected?.("DASH");
+      try {
+        shaka.polyfill.installAll();
+        if (!shaka.Player.isBrowserSupported()) {
+          setHasError(true);
+          setStatusMsg("This browser cannot play protected DASH streams.");
+          return;
+        }
+        shaka.log?.setLevel(shaka.LogLevel?.NONE ?? 0);
+        const player = new shaka.Player();
+        shakaRef.current = player;
+
+        const clearKeys: Record<string, string> = {};
+        for (const pair of drm?.keys ?? []) {
+          const kid = toHexKeyId(pair.kid);
+          const key = toHexKeyId(pair.k);
+          if (kid && key) clearKeys[kid] = key;
+        }
+
+        player.configure({
+          drm: {
+            ...(Object.keys(clearKeys).length ? { clearKeys } : {}),
+            // Jio's CDN serves a clear-key licence; never block on a server cert.
+            advanced: {},
+          },
+          streaming: {
+            lowLatencyMode: true,
+            rebufferingGoal: 2,
+            bufferingGoal: 20,
+            retryParameters: { maxAttempts: 4, baseDelay: 500, backoffFactor: 2, timeout: 20000 },
+          },
+          manifest: { retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, timeout: 20000 } },
+        });
+
+        player.addEventListener("error", () => {
+          if (cancelled) return;
+          setHasError(true);
+          setStatusMsg(
+            Object.keys(clearKeys).length
+              ? "This DRM channel was refused. Its ClearKey document may have rotated."
+              : "This channel is DRM protected and no key was provided.",
+          );
+        });
+
+        void (async () => {
+          try {
+            await player.attach(videoRef.current!);
+            await player.load(url);
+            if (cancelled) return;
+            const langs = player.getAudioLanguages() ?? [];
+            if (langs.length > 1) {
+              const hindi = langs.find((l) => /^hi/i.test(l));
+              if (hindi) player.selectAudioLanguage(hindi);
+            }
+            const opts: AudioTrackOption[] = langs.map((name, idx) => ({ index: idx, label: name }));
+            onAudioTracksChange?.(opts, Math.max(langs.indexOf(player.getAudioLanguage() ?? ""), 0));
+            await videoRef.current?.play().catch(() => undefined);
+          } catch {
+            if (!cancelled) {
+              setHasError(true);
+              setStatusMsg("DASH playback failed to start.");
+            }
+          }
+        })();
+      } catch {
+        setHasError(true);
+        setStatusMsg("DASH playback failed to start.");
+      }
+    };
 
     const startHls = (url: string) => {
       if (cancelled || !videoRef.current) return;
@@ -206,8 +362,11 @@ export function LiveVideoSurface({
 
       const probeCtrl = new AbortController();
       const timer = setTimeout(() => probeCtrl.abort(), 8000);
+      // DASH manifests are not MPEG-TS: ask for the container the catalogue advertised.
+      const wantDash = (container || "").toLowerCase() === "dash";
+      const probeExt = wantDash ? ".mpd" : ".ts";
       try {
-        const res = await fetch(streamUrl(".ts"), { signal: probeCtrl.signal });
+        const res = await fetch(streamUrl(probeExt), { signal: probeCtrl.signal });
         clearTimeout(timer);
         if (!res.ok) {
           const j = (await res.json().catch(() => ({}))) as { error?: string };
@@ -220,7 +379,8 @@ export function LiveVideoSurface({
         }
         const kind = (res.headers.get("x-stream-container") || "").toLowerCase();
         probeCtrl.abort();
-        if (kind === "hls") startHls(streamUrl(".m3u8"));
+        if (kind === "dash") startDash(streamUrl(".mpd"));
+        else if (kind === "hls") startHls(streamUrl(".m3u8"));
         else startMpegTs(streamUrl(".ts"), true);
       } catch {
         clearTimeout(timer);
@@ -234,7 +394,7 @@ export function LiveVideoSurface({
       cancelled = true;
       cleanup();
     };
-  }, [channelId, channelName, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected]);
+  }, [channelId, channelName, drm, container, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected]);
 
   return (
     <div className="absolute inset-0 bg-black">

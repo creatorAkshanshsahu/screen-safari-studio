@@ -48,6 +48,9 @@ export function LivePlayerContent() {
   const [activeAudio, setActiveAudio] = useState(-1);
   const [showEmbedModal, setShowEmbedModal] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [portalError, setPortalError] = useState<string | null>(null);
+  const [servedBy, setServedBy] = useState<string>("");
+  const [backupError, setBackupError] = useState<string | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -65,10 +68,16 @@ export function LivePlayerContent() {
         const data = (await res.json()) as {
           channels?: LiveChannelDto[];
           categories?: string[];
+          portalError?: string | null;
+          servedBy?: string;
+          backupError?: string | null;
         };
         const list = data.channels ?? [];
         setChannels(list);
         setCategories(data.categories ?? []);
+        setPortalError(data.portalError ?? null);
+        setServedBy(data.servedBy ?? "");
+        setBackupError(data.backupError ?? null);
         setSelectedCategory("");
         if (list.length > 0) {
           setActiveId((prev) => (prev && list.some((c) => c.id === prev) ? prev : list[0]!.id));
@@ -131,6 +140,8 @@ export function LivePlayerContent() {
         <LiveVideoSurface
           channelId={activeChannel.id}
           channelName={activeChannel.name}
+          drm={activeChannel.drm ?? null}
+          container={activeChannel.container}
           muted={muted}
           reloadNonce={reloadNonce}
           selectedAudioTrack={activeAudio}
@@ -157,18 +168,7 @@ export function LivePlayerContent() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div className="glass flex rounded-full p-1 text-xs font-semibold">
-            {(["maxtv", "starshare", "all"] as const).map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => setSource(s)}
-                className={`rounded-full px-3 py-1 transition ${source === s ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
-              >
-                {s === "maxtv" ? "maxTV" : s === "starshare" ? "StarShare" : "Both"}
-              </button>
-            ))}
-          </div>
+          <div className="glass flex items-center rounded-full px-3 py-1 text-xs font-bold text-accent">maxTV</div>
 
           <div className="glass flex rounded-full p-1 text-xs font-semibold">
             {(
@@ -198,6 +198,19 @@ export function LivePlayerContent() {
           </Button>
         </div>
       </div>
+
+      {/* Say plainly where the list came from; never let a dead seed look like a working catalogue. */}
+      {(portalError || servedBy === "jio") && (
+        <div className="absolute left-4 right-4 top-20 z-30 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs md:left-8 md:right-auto md:max-w-xl">
+          {servedBy === "jio" && (
+            <p className="font-bold text-accent">maxTV unreachable — playing the JioTV backup playlist ({visibleChannels.length} channels).</p>
+          )}
+          {portalError && (
+            <p className="font-bold text-accent">No live source reachable — these {visibleChannels.length} sample channels will not play.</p>
+          )}
+          <p className="mt-0.5 text-muted-foreground">{portalError ?? backupError ?? "Backup playlist is live."}</p>
+        </div>
+      )}
 
       {/* Desktop Channel Guide Drawer */}
       <aside className="glass absolute bottom-32 right-4 top-24 z-20 hidden w-88 flex-col gap-2.5 overflow-hidden rounded-2xl p-3 lg:right-8 lg:flex">
