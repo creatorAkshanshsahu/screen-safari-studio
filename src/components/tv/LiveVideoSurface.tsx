@@ -301,13 +301,24 @@ export function LiveVideoSurface({
           manifest: { retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, timeout: 20000 } },
         });
 
-        player.addEventListener("error", () => {
+        player.addEventListener("error", (event) => {
           if (cancelled) return;
+          const detail = event as { detail?: { code?: number; data?: unknown[] } } | undefined;
+          const code = detail?.detail?.code;
+          const payload = Array.isArray(detail?.detail?.data) ? detail.detail.data : [];
+          const httpish = payload.find(
+            (d): d is { status?: number; uris?: string[] } =>
+              typeof d === "object" && d !== null && ("status" in d || "uris" in d),
+          );
+          const status = httpish?.status;
+          const firstUri = httpish?.uris?.[0];
           setHasError(true);
           setStatusMsg(
-            Object.keys(clearKeys).length
-              ? "This DRM channel was refused. Its ClearKey document may have rotated."
-              : "This channel is DRM protected and no key was provided.",
+            status
+              ? `The CDN refused a segment (HTTP ${status}).${firstUri ? ` ${firstUri.split("?")[0]}` : ""}`
+              : code === 6001 || code === 6002
+                ? "This channel is DRM protected and the key was rejected."
+                : `Playback failed${code ? ` (Shaka error ${code})` : ""}. Press Retry.`,
           );
         });
 
