@@ -79,7 +79,12 @@ describe("maxTV Stalker portal", () => {
     // The catalogue call is authorised, and the device identity travels in cookie + headers.
     const catalogueCall = http.calls.find((c) => c.url.includes("action=get_all_channels"))!;
     expect(catalogueCall.headers["Authorization"]).toBe("Bearer T1");
-    expect(catalogueCall.headers["Cookie"]).toContain("mac=00%3A1A%3A79%3AEE%3A03%3A9F");
+    // ACCOUNT carries the pre-migration pair, which the app upgrades before use. The
+    // configured values are the *legacy* ones, so the live identity is what goes out.
+    expect(catalogueCall.headers["Cookie"]).toContain(
+      `mac=${encodeURIComponent("00:1A:79:BA:DF:D7")}`,
+    );
+    expect(catalogueCall.headers["Cookie"]).toContain("timezone=Asia/Kolkata");
     expect(catalogueCall.headers["User-Agent"]).toContain("MAG200");
   });
 
