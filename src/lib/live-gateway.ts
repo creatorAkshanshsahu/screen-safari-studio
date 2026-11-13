@@ -210,8 +210,16 @@ interface StalkerAccount {
   deviceId: string;
 }
 
-const STALKER_DEFAULT_PORTAL = "http://new.maxtv.be/stalker_portal/c/";
-const STALKER_DEFAULT_MAC = "00:1A:79:EE:03:9F";
+// The active maxTV identity. The Android app's own note reads "Auto-upgrades stale default
+// maxTV portal/MAC (00:1A:79:EE:03:9F) to the active new.maxtv.be/c/ identity" -- we had
+// shipped exactly the stale pair it upgrades away from, so the portal we talked to was the
+// abandoned one while the app talked to the live one.
+const STALKER_DEFAULT_PORTAL = "http://new.maxtv.be/c/";
+const STALKER_DEFAULT_MAC = "00:1A:79:BA:DF:D7";
+
+/** The pre-migration pair. Refused by the live portal; kept only as a rescue attempt. */
+const STALKER_LEGACY_PORTAL = "http://new.maxtv.be/stalker_portal/c/";
+const STALKER_LEGACY_MAC = "00:1A:79:EE:03:9F";
 const STALKER_DEFAULT_SERIAL = "92180365D21FE";
 const STALKER_DEFAULT_DEVICE = "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070";
 
@@ -428,20 +436,63 @@ const stalkerSession: {
   endpoint: string | null;
   token: string | null;
   profiled: boolean;
-} = { endpoint: null, token: null, profiled: false };
+  /** The identity that last answered; pinned so later calls keep the same MAC and portal. */
+  account: StalkerAccount | null;
+} = { endpoint: null, token: null, profiled: false, account: null };
 
-function stalkerAccount(cfg: GatewayConfig): StalkerAccount {
+/**
+ * The identity the app would use for this configuration.
+ *
+ * The app upgrades a stale legacy MAC and portal to the active pair before anything else
+ * happens, so a device that once stored the old values keeps working without the viewer
+ * touching settings. We ship those old values as defaults, so the same upgrade has to run
+ * here or the web gateway permanently asks the abandoned portal.
+ */
+function migrateStalkerAccount(cfg: GatewayConfig): StalkerAccount {
+  const legacyMac = cfg.maxtvMac.trim().toUpperCase() === STALKER_LEGACY_MAC.toUpperCase();
+  const legacyPortal = cfg.maxtvPortal.trim().replace(/\/+$/, "") === STALKER_LEGACY_PORTAL.replace(/\/+$/, "");
   return {
-    portal: cfg.maxtvPortal,
-    mac: cfg.maxtvMac,
+    // An explicit, non-legacy value is the viewer's own choice and is kept.
+    portal: legacyPortal ? STALKER_DEFAULT_PORTAL : cfg.maxtvPortal,
+    mac: legacyMac ? STALKER_DEFAULT_MAC : cfg.maxtvMac,
     serial: cfg.maxtvSerial,
     deviceId: cfg.maxtvDeviceId,
   };
 }
 
+/**
+ * The identities worth trying, primary first. The migrated one is the live portal; the
+ * legacy pair is only reached if the primary is refused outright, so it costs a failing
+ * portal nothing and rescues one that still honours the old account.
+ */
+function stalkerAccountCandidates(cfg: GatewayConfig): StalkerAccount[] {
+  const primary = migrateStalkerAccount(cfg);
+  const out = [primary];
+  const legacy: StalkerAccount = {
+    portal: STALKER_LEGACY_PORTAL,
+    mac: STALKER_LEGACY_MAC,
+    serial: primary.serial,
+    deviceId: primary.deviceId,
+  };
+  if (!stalkerSameAccount(primary, legacy)) out.push(legacy);
+  return out;
+}
+
+function stalkerSameAccount(a: StalkerAccount, b: StalkerAccount): boolean {
+  return (
+    a.mac.trim().toUpperCase() === b.mac.trim().toUpperCase() &&
+    a.portal.trim().replace(/\/+$/, "") === b.portal.trim().replace(/\/+$/, "")
+  );
+}
+
+/** The account in force: whichever identity last proved it works, else the migrated one. */
+function stalkerAccount(cfg: GatewayConfig): StalkerAccount {
+  return stalkerSession.account ?? migrateStalkerAccount(cfg);
+}
+
 function stalkerHeaders(cfg: GatewayConfig, account: StalkerAccount, auth: boolean): Record<string, string> {
   const h: Record<string, string> = {
-    Cookie: `mac=${encodeURIComponent(account.mac)}; stb_lang=en; timezone=Europe/London`,
+    Cookie: `mac=${encodeURIComponent(account.mac)}; stb_lang=en; timezone=Asia/Kolkata`,
     "User-Agent": MAG_USER_AGENT,
     "X-User-Agent": MAG_DEVICE_UA,
     Accept: "*/*",
@@ -501,29 +552,32 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
   let spoken: string | null = null;
   let lastErr: unknown = null;
 
-  for (const candidate of stalkerCandidates(cfg.maxtvPortal)) {
-    try {
-      const body = await stalkerRaw(cfg, account, candidate, "stb", "handshake", { token: "", prehash: "0" }, false);
-      const issued = stalkerToken(body);
-      if (!issued) {
-        const detail = stalkerError(body);
-        if (detail && !spoken) spoken = detail;
-        failures.push(`${candidate} no token`);
-        continue;
-      }
-      stalkerSession.endpoint = candidate;
-      stalkerSession.token = issued;
-      stalkerSession.profiled = false;
-      sourceBackoff.maxtvUntil = 0;
-      sourceBackoff.maxtvReason = null;
-      return issued;
-    } catch (e) {
-      lastErr = e;
-      if (e instanceof StalkerError) {
-        if (e.status === null && e.detail && !spoken) spoken = e.detail;
-        failures.push(`${candidate} ${e.status !== null ? `HTTP ${e.status}` : "no token"}`);
-      } else {
-        failures.push(`${candidate} ${e instanceof Error ? e.message : String(e)}`);
+  for (const identity of stalkerAccountCandidates(cfg)) {
+    for (const candidate of stalkerCandidates(identity.portal)) {
+      try {
+        const body = await stalkerRaw(cfg, identity, candidate, "stb", "handshake", { token: "", prehash: "0" }, false);
+        const issued = stalkerToken(body);
+        if (!issued) {
+          const detail = stalkerError(body);
+          if (detail && !spoken) spoken = detail;
+          failures.push(`${candidate} no token`);
+          continue;
+        }
+        stalkerSession.endpoint = candidate;
+        stalkerSession.account = identity;
+        stalkerSession.token = issued;
+        stalkerSession.profiled = false;
+        sourceBackoff.maxtvUntil = 0;
+        sourceBackoff.maxtvReason = null;
+        return issued;
+      } catch (e) {
+        lastErr = e;
+        if (e instanceof StalkerError) {
+          if (e.status === null && e.detail && !spoken) spoken = e.detail;
+          failures.push(`${candidate} ${e.status !== null ? `HTTP ${e.status}` : "no token"}`);
+        } else {
+          failures.push(`${candidate} ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
     }
   }
@@ -936,11 +990,73 @@ async function jioKeysFor(entry: ParsedM3uEntry, siteHost: string): Promise<Clea
 
 let jioPlaylistShape = 0;
 
+/** The numbered playlist file that last answered, asked before the shipped one. */
+let jioPlaylistWinner: string | null = null;
+
+/**
+ * The playlist is a numbered file the site rebuilds from time to time -- the app's note
+ * records `jtv33` becoming `jtv39`, with the old file simply ceasing to exist. We shipped
+ * one number as a constant, so the day it moved, the whole backup tab became an empty
+ * section and every stream fell through to a seed entry that answers 503.
+ *
+ * Ask the address that last worked, then the shipped one, then its neighbours (forward
+ * first, since the file has only ever moved forward).
+ */
+function jioPlaylistCandidates(cfg: GatewayConfig): string[] {
+  const shipped = cfg.jioPlaylistUrl;
+  const out: string[] = [];
+  if (jioPlaylistWinner) out.push(jioPlaylistWinner);
+  out.push(shipped);
+
+  const numbered = /jtv(\d{1,3})\.m3u8$/i.exec(shipped);
+  const number = numbered?.[1] ? Number.parseInt(numbered[1], 10) : null;
+  if (number !== null && numbered) {
+    const base = shipped.slice(0, shipped.length - numbered[0].length);
+    for (let step = 1; step <= 3; step++) out.push(`${base}jtv${number + step}.m3u8`);
+    for (let step = 1; step <= 2; step++) out.push(`${base}jtv${number - step}.m3u8`);
+  }
+  // Only this site's own numbered files are ever followed.
+  return [...new Set(out.filter((u) => /jtv\d{1,3}\.m3u8$/i.test(u) || u === shipped))];
+}
+
 const jioCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | null } = {
   items: [],
   fetchedAt: 0,
   error: null,
 };
+
+/**
+ * The statuses Jio's CDN uses to say "your token is not valid for this": 450 and 451 are
+ * its own codes and appear in the app's notes as exactly that, with 403 for the same
+ * meaning. They are not about the channel, so the answer is a fresher token.
+ */
+function isJioRefusal(status: number): boolean {
+  return status === 450 || status === 451 || status === 403 || status === 401;
+}
+
+/**
+ * Re-read the playlist and return this channel as it is advertised *now*.
+ *
+ * Rate-limited: one refresh per few seconds, no matter how many players ask at once. A
+ * room full of viewers hitting an aged-out token must not turn into a room full of
+ * playlist fetches, and the catalogue reload is not cheap.
+ */
+let jioRefreshAt = 0;
+
+async function refreshJioChannel(
+  cfg: GatewayConfig,
+  channel: LiveChannelItem,
+): Promise<LiveChannelItem | null> {
+  if (Date.now() - jioRefreshAt < 5_000) return null;
+  jioRefreshAt = Date.now();
+  try {
+    const fresh = await getChannelsBySource(cfg, "jio", true);
+    return fresh.find((c) => c.id === channel.id || c.rawId === channel.rawId) ?? null;
+  } catch {
+    // A refresh that fails leaves the old entry in place; the caller reports the refusal.
+    return null;
+  }
+}
 
 async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
   // The front door refuses a scriptless client (HTTP 415) when the request looks like a
@@ -962,21 +1078,28 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
   let text = "";
   let status = 0;
   let networkError = "";
+  let usedUrl = cfg.jioPlaylistUrl;
   const order = [jioPlaylistShape, ...shapes.map((_, i) => i)];
-  for (const idx of order) {
-    try {
-      const res = await fetch(cfg.jioPlaylistUrl, { headers: shapes[idx]! });
-      if (!res.ok) {
-        status = res.status;
-        continue;
+  search: for (const candidate of jioPlaylistCandidates(cfg)) {
+    for (const idx of order) {
+      try {
+        const res = await fetch(candidate, { headers: shapes[idx]! });
+        if (!res.ok) {
+          status = res.status;
+          // A 404 is the numbered file having moved on; stop trying shapes for it.
+          if (res.status === 404) break;
+          continue;
+        }
+        const body = await res.text();
+        if (!body.trimStart().startsWith("#EXTM3U")) continue;
+        text = body;
+        usedUrl = candidate;
+        jioPlaylistShape = idx!;
+        jioPlaylistWinner = candidate;
+        break search;
+      } catch (e) {
+        networkError = e instanceof Error ? e.message : String(e);
       }
-      const body = await res.text();
-      if (!body.trimStart().startsWith("#EXTM3U")) continue;
-      text = body;
-      jioPlaylistShape = idx!;
-      break;
-    } catch (e) {
-      networkError = e instanceof Error ? e.message : String(e);
     }
   }
 
@@ -985,12 +1108,12 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
     throw new Error(`Backup playlist unreachable (${networkError || "no response"})`);
   }
 
-  const entries = parseM3u(text, cfg.jioPlaylistUrl);
+  const entries = parseM3u(text, usedUrl);
   if (entries.length === 0) throw new Error("Backup playlist listed no channels");
 
   const siteHost = (() => {
     try {
-      return new URL(cfg.jioPlaylistUrl).hostname;
+      return new URL(usedUrl).hostname;
     } catch {
       return "allinonereborn2.online";
     }
@@ -2071,6 +2194,59 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
    */
   if (path === "/api/live/diagnose") {
     const id = url.searchParams.get("id") || "";
+
+    // A maxTV question is about the portal, not about segments. Answer it in terms of the
+    // portal chain: which identity we present, which address answered, what the token is,
+    // what create_link returned, and whether that link plays.
+    if (url.searchParams.get("source") === "maxtv" || id.startsWith("st:")) {
+      const candidates = stalkerAccountCandidates(cfg).map((a) => ({
+        portal: a.portal,
+        mac: a.mac,
+        addresses: stalkerCandidates(a.portal),
+      }));
+      const report: Record<string, unknown> = {
+        ok: true,
+        kind: "maxtv",
+        configured: { portal: cfg.maxtvPortal, mac: cfg.maxtvMac },
+        identities: candidates,
+        migrated:
+          candidates[0]!.mac !== cfg.maxtvMac || candidates[0]!.portal !== cfg.maxtvPortal,
+      };
+      try {
+        const token = await stalkerHandshake(cfg);
+        report['handshake'] = { ok: true, endpoint: stalkerSession.endpoint, token };
+        const account = stalkerAccount(cfg);
+        report['identityInUse'] = { portal: account.portal, mac: account.mac };
+      } catch (e) {
+        report['handshake'] = { ok: false, error: e instanceof Error ? e.message : String(e) };
+        report['hint'] =
+          "The portal refused us. Compare identityInUse/identities with the app: an expired " +
+          "MAC answers in its own words, and the migrated identity is the live one.";
+        return jsonResponse(200, report);
+      }
+
+      const pool = await getChannelsBySource(cfg, "maxtv", false).catch(() => []);
+      report['catalogue'] = { channels: pool.length };
+      const ch = pool.find((c) => c.id === id || c.rawId === id);
+      if (ch?.cmd && !ch.cmd.startsWith("seed://")) {
+        try {
+          const resolved = await resolveMaxtvLink(cfg, ch.cmd);
+          const probe = await fetch(resolved, {
+            headers: stalkerHeaders(cfg, stalkerAccount(cfg), false),
+            redirect: "manual",
+          }).catch(() => null);
+          report['stream'] = { channel: ch.name, url: resolved, status: probe ? probe.status : 0 };
+          report['hint'] =
+            probe && probe.ok
+              ? "The portal and the media both answered."
+              : "create_link produced a URL the media host refused; the status above is its answer.";
+        } catch (e) {
+          report['stream'] = { channel: ch.name, error: e instanceof Error ? e.message : String(e) };
+        }
+      }
+      return jsonResponse(200, report);
+    }
+
     const pool = await getChannelsBySource(cfg, "all", false);
     const ch = pool.find((c) => c.id === id || c.rawId === id);
     if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
@@ -2178,11 +2354,35 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     // JioTV backup entries carry their own media URL, so they need no portal round-trip.
     if (ch.source === "jio") {
       if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This backup channel has no stream URL" });
-      try {
-        const opened = await fetchJioMedia(ch.cmd, { userAgent: ch.userAgent, cookie: ch.cookie });
-        if (!opened) {
-          return jsonResponse(502, { ok: false, error: "The JioTV CDN did not answer this channel" });
+
+      /**
+       * A refusal here is not usually about this channel: the cookie in the playlist block
+       * is a coarse site-wide token with a lifetime, and the catalogue is cached. Once it
+       * ages out, every header shape answers 450 and replaying them just repeats the
+       * refusal. Re-read the playlist so a fresh token is picked up, then try once more.
+       */
+      let current = ch;
+      let opened = await fetchJioMedia(current.cmd!, { userAgent: current.userAgent, cookie: current.cookie })
+        .catch(() => null);
+      if (opened && isJioRefusal(opened.res.status)) {
+        const refreshed = await refreshJioChannel(cfg, current);
+        if (refreshed) {
+          current = refreshed;
+          opened = await fetchJioMedia(current.cmd!, {
+            userAgent: current.userAgent,
+            cookie: current.cookie,
+          }).catch(() => null);
         }
+      }
+
+      if (!opened) return jsonResponse(502, { ok: false, error: "The JioTV CDN did not answer this channel" });
+      if (isJioRefusal(opened.res.status)) {
+        return jsonResponse(502, {
+          ok: false,
+          error: `The JioTV CDN refused this channel (HTTP ${opened.res.status}) even after re-reading the playlist for a fresh token.`,
+        });
+      }
+      try {
         // Hand the *final* address to the proxy: it is the one carrying the token the
         // redirector just minted for this channel, so segments and the manifest agree.
         return await proxyMediaStream(
@@ -2191,10 +2391,10 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
           publicOrigin,
           cfg.proxySecret,
           {
-            "User-Agent": ch.userAgent || JIO_UA_OVERRIDE,
-            ...(ch.cookie ? { Cookie: ch.cookie } : {}),
+            "User-Agent": current.userAgent || JIO_UA_OVERRIDE,
+            ...(current.cookie ? { Cookie: current.cookie } : {}),
           },
-          ch.drm?.keys,
+          current.drm?.keys,
         );
       } catch (e) {
         return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Backup stream failed" });
