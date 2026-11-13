@@ -14,7 +14,13 @@ export default defineConfig({
   },
   vite: {
     server: {
+      // The preview proxy uses a per-session hostname, so an explicit allowlist breaks it.
       allowedHosts: true,
+      // Keep a stable port: the preview link points at one specific port, and letting
+      // Vite drift to 5173/8081 when 8080 is briefly busy leaves the panel on a dead one.
+      host: true,
+      port: 8080,
+      strictPort: true,
     },
   },
 });
