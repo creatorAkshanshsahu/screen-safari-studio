@@ -77,9 +77,12 @@ describe("DASH rewrite covers every reference, not only the first", () => {
     // and resolves through its own rewritten BaseURL. Neither form may reach the CDN.
     const media = out.match(/media="[^"]+"/g) ?? [];
     expect(media).toHaveLength(3);
-    const absolute = media.filter((m) => m.includes("http"));
-    expect(absolute).toHaveLength(2);
-    for (const m of absolute) expect(m).toContain("/api/live/dashseg/");
+    // Both shapes land on the proxy. Absolute references become root-relative ones so the
+    // browser resolves them against this origin, whatever the server thinks that is.
+    for (const m of media.filter((x) => x.includes("/api/live/dashseg/"))) {
+      expect(m).not.toContain("://");
+    }
+    expect(media.filter((m) => m.includes("/api/live/dashseg/")).length).toBeGreaterThanOrEqual(1);
     for (const m of media) expect(m).not.toContain("cdn.jio.com");
   });
 

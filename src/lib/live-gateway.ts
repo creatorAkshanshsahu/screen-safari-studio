@@ -1410,7 +1410,12 @@ async function rewriteHlsManifestWeb(
       return ref;
     }
     const tok = await signSegmentToken(abs, mode, secret, headers);
-    return `${publicOrigin}/api/live/segment?t=${encodeURIComponent(tok)}`;
+    // Root-relative on purpose. The player fetches this manifest from *this* origin, so a
+    // relative reference resolves correctly with no guessing, in every environment and
+    // inside an embed. An absolute URL built from the server's idea of its own address is
+    // wrong behind a proxy, and a wrong segment origin looks exactly like a dead stream:
+    // the manifest loads, then nothing plays.
+    return `/api/live/segment?t=${encodeURIComponent(tok)}`;
   };
 
   for (const line of lines) {
@@ -1434,17 +1439,50 @@ async function rewriteHlsManifestWeb(
   return out.join("\n");
 }
 
-function overrideHeadersFromToken(v: VerifiedSegmentToken): Record<string, string> | undefined {
-  if (!v.ua) return undefined;
-  return { "User-Agent": v.ua, ...(v.ck ? { Cookie: v.ck } : {}) };
+function overrideHeadersFromToken(
+  v: VerifiedSegmentToken,
+  targetUrl?: string,
+): Record<string, string> | undefined {
+  // The decision belongs here, at the moment we know the exact URL: a segment that carries
+  // its own `__hdnea__` token must not also be sent the playlist's coarse cookie, or the CDN
+  // is asked to honour two credentials and answers 450.
+  const keepCookie = Boolean(v.ck) && !(targetUrl && carriesOwnToken(targetUrl));
+  if (!v.ua && !keepCookie) return undefined;
+  const out: Record<string, string> = {};
+  if (v.ua) out["User-Agent"] = v.ua;
+  if (keepCookie && v.ck) out["Cookie"] = v.ck;
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** The UA/cookie pair to seal into child tokens, derived from the upstream request. */
-function tokenHeadersFrom(overrideHeaders?: Record<string, string>): { ua?: string; ck?: string } | undefined {
+/**
+ * A CDN address that already carries its own `__hdnea__` token must not be handed the
+ * playlist's cookie as well.
+ *
+ * This is the CDN's two credentials disagreeing, and the app names it outright: the
+ * playlist's `#EXTHTTP` cookie is a coarse token minted for the whole site, while the URL
+ * behind the redirect carries a token minted for one channel and one path. Sending the
+ * coarse one alongside a URL that already carries the specific one is asking the CDN to
+ * choose between two answers, and it declines with 450 -- which is what "the JioTV CDN
+ * refused this channel (HTTP 450)" was.
+ */
+function carriesOwnToken(url: string): boolean {
+  return url.includes("__hdnea__");
+}
+
+function tokenHeadersFrom(
+  overrideHeaders?: Record<string, string>,
+  targetUrl?: string,
+): { ua?: string; ck?: string } | undefined {
   const ua = overrideHeaders?.["User-Agent"];
-  if (!ua) return undefined;
   const ck = overrideHeaders?.["Cookie"];
-  return ck ? { ua, ck } : { ua };
+  // Keep the user agent, drop the conflicting credential.
+  const keepCookie = Boolean(ck) && !(targetUrl && carriesOwnToken(targetUrl));
+  if (!ua && !keepCookie) return undefined;
+  const out: { ua?: string; ck?: string } = {};
+  if (ua) out.ua = ua;
+  if (keepCookie && ck) out.ck = ck;
+  return out;
 }
 
 /**
@@ -1476,7 +1514,10 @@ async function rewriteDashManifestWeb(
   /** An absolute directory -> a proxied directory whose token carries its UA/cookie. */
   const proxyDir = async (dirUrl: string): Promise<string> => {
     const tok = await signSegmentToken(dirUrl, mode, secret, headers);
-    return `${publicOrigin}/api/live/dashseg/${tok}/`;
+    // Root-relative: see the note in rewriteHlsManifestWeb. A manifest that points the
+    // player at an origin the browser cannot reach is indistinguishable from a stream
+    // with no video in it.
+    return `/api/live/dashseg/${tok}/`;
   };
 
   /** An absolute file reference -> proxied path, keeping template tokens and query. */
@@ -1527,8 +1568,11 @@ async function rewriteDashManifestWeb(
       // A BaseURL without a trailing slash is a file-name *prefix*, not a directory.
       const isDir = resolved.pathname.endsWith("/");
       const cut = resolved.pathname.lastIndexOf("/");
-      const suffix = isDir ? "" : resolved.pathname.slice(cut + 1);
-      const dir = `${resolved.origin}${resolved.pathname.slice(0, cut + 1)}`;
+      // The query is part of the credential, not decoration. Jio signs the directory --
+      // `.../143/?__hdnea__=...` -- and dropping it here left every segment fetch unsigned,
+      // which the CDN answers with 450.
+      const suffix = isDir ? "" : `${resolved.pathname.slice(cut + 1)}${resolved.search}`;
+      const dir = `${resolved.origin}${resolved.pathname.slice(0, cut + 1)}${isDir ? resolved.search : ""}`;
       proxied.set(raw, `${await proxyDir(dir)}${suffix}`);
     }
     out = out.replace(/(<BaseURL>)\s*([\s\S]*?)\s*(<\/BaseURL>)/gi, (whole, open, raw) => {
@@ -1580,27 +1624,46 @@ function jsonResponse(status: number, body: unknown): Response {
  * wrong one. The app therefore sends both and lets the CDN choose; a single attempt is
  * what made every channel fail here with "Upstream stream returned HTTP 450".
  */
+/**
+ * Open a JioTV channel the way the app opens it, and hand back the address that answered.
+ *
+ * The app does this in two stages and the distinction matters:
+ *
+ *  1. Ask the playlist's own address once. It redirects and mints a token for this channel.
+ *  2. Now hold that minted address fixed and vary only the credentials, because the two
+ *     credentials it can carry disagree by design. The playlist's `#EXTHTTP` cookie is a
+ *     coarse site-wide token; the minted URL carries a token for one channel and path.
+ *     A URL that already carries its own token, sent with the coarse cookie as well, is
+ *     asked to honour two different credentials -- and the CDN answers 450.
+ *
+ * Our previous ladder restarted at the *advertised* address for every shape, so it never
+ * tried the combination the CDN actually wants: the minted address, bare.
+ */
 async function fetchJioMedia(
   url: string,
-  entry: { userAgent?: string | undefined; cookie?: string | undefined },
+  entry: {
+    userAgent?: string | undefined;
+    cookie?: string | undefined;
+    preferHls?: boolean | undefined;
+  },
 ): Promise<{ res: Response; finalUrl: string } | null> {
   const ua = entry.userAgent || JIO_UA_OVERRIDE;
-  const attempts: Array<Record<string, string>> = [
-    // What an IPTV player sends, and the only shape that gets past the redirector.
-    { "User-Agent": ua, ...(entry.cookie ? { Cookie: entry.cookie } : {}) },
-    // The CDN may mint a fresh token on each redirect and reject the coarse one.
-    { "User-Agent": ua },
-    // Last: the playlist's browser-style identity, for a host that wants it.
-    { "User-Agent": ua, ...(entry.cookie ? { Cookie: entry.cookie } : {}), Origin: JIO_SITE, Referer: `${JIO_SITE}/` },
-  ];
+  const browserUa =
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
+  // A probe must not become the delay; the app budgets eight seconds for the whole ladder.
+  const deadline = Date.now() + 8_000;
   let last: { res: Response; finalUrl: string } | null = null;
-  for (const headers of attempts) {
-    let currentUrl = url;
+
+  /** Follow the redirect chain by hand so the minted address survives. */
+  const walk = async (
+    from: string,
+    headers: Record<string, string>,
+  ): Promise<{ res: Response; finalUrl: string } | null> => {
+    let currentUrl = from;
     try {
-      // Follow the redirect chain by hand so the signed CDN address is kept: the
-      // redirector re-mints the __hdnea__ token, and the bare URL is a stale one.
       for (let hop = 0; hop < 6; hop++) {
+        if (Date.now() > deadline) return null;
         const res = await fetch(currentUrl, { headers: { Accept: "*/*", ...headers }, redirect: "manual" });
         if (res.status >= 300 && res.status < 400) {
           const loc = res.headers.get("location");
@@ -1608,15 +1671,98 @@ async function fetchJioMedia(
           currentUrl = new URL(loc, currentUrl).toString();
           continue;
         }
-        if (res.ok) return { res, finalUrl: currentUrl };
-        last = { res, finalUrl: currentUrl };
-        break;
+        return { res, finalUrl: currentUrl };
       }
     } catch {
-      // Network-level failure: try the next shape.
+      return null;
     }
+    return null;
+  };
+
+  const cookie = entry.cookie ? { Cookie: entry.cookie } : {};
+
+  // Stage 1: the playlist address, opened as an IPTV player opens it. Origin and Referer
+  // are deliberately absent -- the app records that the redirector refuses a request
+  // carrying them before it ever redirects.
+  const opened =
+    (await walk(url, { "User-Agent": ua, ...cookie })) ?? (await walk(url, { "User-Agent": ua }));
+  if (!opened) return null;
+  if (opened.res.ok) return opened;
+  last = opened;
+
+  // Stage 2: the minted address, credentials varied. Bare first when it carries its own
+  // token -- that is the combination the coarse cookie was breaking.
+  const signed = carriesOwnToken(opened.finalUrl);
+  const shapes: Array<Record<string, string>> = signed
+    ? [
+        { "User-Agent": ua },
+        { "User-Agent": ua, ...cookie },
+        { "User-Agent": ua, ...cookie, Origin: JIO_SITE, Referer: `${JIO_SITE}/` },
+        { "User-Agent": browserUa },
+      ]
+    : [
+        { "User-Agent": ua, ...cookie },
+        { "User-Agent": ua },
+        { "User-Agent": ua, ...cookie, Origin: JIO_SITE, Referer: `${JIO_SITE}/` },
+        { "User-Agent": browserUa },
+      ];
+
+  for (const headers of shapes) {
+    if (Date.now() > deadline) break;
+    const attempt = await walk(opened.finalUrl, headers);
+    if (attempt?.res.ok) return attempt;
+    if (attempt) last = attempt;
   }
+
+  // Stage 3: back to the redirector, which re-mints. Last because it costs a redirect.
+  if (opened.finalUrl !== url) {
+    const remint = await walk(url, { "User-Agent": ua, ...cookie });
+    if (remint?.res.ok) return remint;
+    if (remint) last = remint;
+  }
+
   return last;
+}
+
+/**
+ * The last few upstream answers per source, newest first.
+ *
+ * "The stream started but no video arrived" is what a viewer sees; the thing worth knowing
+ * is the status the CDN returned for the segment the player asked for. Without a record of
+ * that, every diagnosis is a guess about somebody else's server. Bounded so a busy process
+ * cannot grow without limit.
+ */
+interface SegmentAttempt {
+  at: number;
+  url: string;
+  status: number;
+  bytes: number;
+  range: string | null;
+}
+
+const segmentLog = new Map<string, SegmentAttempt[]>();
+const SEGMENT_LOG_LIMIT = 24;
+
+function recordSegment(key: string, attempt: SegmentAttempt): void {
+  const list = segmentLog.get(key) ?? [];
+  list.unshift(attempt);
+  if (list.length > SEGMENT_LOG_LIMIT) list.length = SEGMENT_LOG_LIMIT;
+  segmentLog.set(key, list);
+  if (segmentLog.size > 200) {
+    // Oldest key out; the map only ever holds recently played channels.
+    const oldest = segmentLog.keys().next().value;
+    if (oldest !== undefined && oldest !== key) segmentLog.delete(oldest);
+  }
+}
+
+/** Strip the signed query so a token never ends up in a diagnostic, but keep the shape. */
+function diagnosticUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}${u.search ? "?…" : ""}`;
+  } catch {
+    return raw.split("?")[0]!;
+  }
 }
 
 async function proxyMediaStream(
@@ -1642,7 +1788,14 @@ async function proxyMediaStream(
   let currentUrl = upstreamUrl;
   let upRes: Response | null = null;
   for (let hop = 0; hop < 6; hop++) {
-    const res = await fetch(currentUrl, { headers, redirect: "manual" });
+    // Applied per hop, and after any redirect, because the address that carries its own
+    // `__hdnea__` is usually the one at the *end* of a redirect chain. Sending the
+    // playlist's coarse cookie alongside it asks the CDN to honour two credentials at
+    // once, and Jio answers 450 rather than choosing. This belongs here rather than in
+    // each caller so no path can forget it.
+    const hopHeaders = { ...headers };
+    if (carriesOwnToken(currentUrl)) delete hopHeaders["Cookie"];
+    const res = await fetch(currentUrl, { headers: hopHeaders, redirect: "manual" });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (loc) {
@@ -1655,6 +1808,14 @@ async function proxyMediaStream(
   }
 
   if (!upRes || !upRes.ok || !upRes.body) {
+    // The refusal is the useful fact, so keep it where a diagnostic can find it.
+    recordSegment(mode, {
+      at: Date.now(),
+      url: diagnosticUrl(currentUrl),
+      status: upRes?.status ?? 0,
+      bytes: 0,
+      range: range ?? null,
+    });
     return jsonResponse(upRes?.status === 404 ? 404 : 502, {
       ok: false,
       error: `Upstream stream returned HTTP ${upRes?.status ?? 502}`,
@@ -1706,7 +1867,7 @@ async function proxyMediaStream(
       mode,
       publicOrigin,
       secret,
-      tokenHeadersFrom(overrideHeaders),
+      tokenHeadersFrom(overrideHeaders, currentUrl),
     );
     return new Response(rewritten, {
       status: 200,
@@ -1741,7 +1902,7 @@ async function proxyMediaStream(
       mode,
       publicOrigin,
       secret,
-      tokenHeadersFrom(overrideHeaders),
+      tokenHeadersFrom(overrideHeaders, currentUrl),
     );
     return new Response(rewritten, {
       status: 200,
@@ -1752,6 +1913,14 @@ async function proxyMediaStream(
       }),
     });
   }
+
+  recordSegment(mode, {
+    at: Date.now(),
+    url: diagnosticUrl(currentUrl),
+    status: upRes.status,
+    bytes: first.value.byteLength,
+    range: range ?? null,
+  });
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -2017,6 +2186,48 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
   };
 }
 
+/** A host the browser can never reach, so it must never appear in a URL we hand out. */
+function isUnreachableHost(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return (
+    h === "localhost" ||
+    h === "0.0.0.0" ||
+    h === "127.0.0.1" ||
+    h === "::1" ||
+    h.endsWith(".internal") ||
+    h.endsWith(".local")
+  );
+}
+
+/**
+ * The origin the *browser* used, which is not always the origin this function was called
+ * with. A server behind a proxy frequently sees its own internal address -- `localhost`,
+ * a container IP, `0.0.0.0` -- while the viewer is on a public domain.
+ *
+ * This matters because embed URLs, playlist entries and M3U exports are handed to other
+ * machines. Getting it wrong produces links to a host only the server can reach.
+ */
+function publicOriginFor(request: Request, url: URL): string {
+  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const hostHeader = request.headers.get("host")?.trim();
+
+  const candidate = forwardedHost || hostHeader || url.host;
+  const hostname = candidate.replace(/:\d+$/, "");
+
+  // Keep the received origin when the header names a host the browser cannot reach and
+  // the received one is reachable.
+  const chosen = isUnreachableHost(hostname) && !isUnreachableHost(url.hostname.replace(/:\d+$/, ""))
+    ? url.host
+    : candidate;
+
+  const proto =
+    forwardedProto ||
+    (url.protocol === "https:" ? "https" : isUnreachableHost(hostname) ? "http" : "https");
+
+  return `${proto}://${chosen}`;
+}
+
 // ---------- Entry Point Called from src/server.ts ----------
 
 export async function maybeHandleLiveRequest(request: Request, env: unknown): Promise<Response | null> {
@@ -2035,9 +2246,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   }
 
   const cfg = getConfig(env);
-  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
-  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
-  const publicOrigin = forwardedHost ? `${forwardedProto || url.protocol.replace(":", "")}://${forwardedHost}` : url.origin;
+  const publicOrigin = publicOriginFor(request, url);
 
   if (path === "/embed-sdk.js") {
     return new Response(renderWidgetSdkJs(), {
@@ -2178,7 +2387,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       verified.m,
       publicOrigin,
       cfg.proxySecret,
-      overrideHeadersFromToken(verified),
+      overrideHeadersFromToken(verified, verified.u),
       undefined,
       request.headers.get("range"),
     );
@@ -2300,6 +2509,19 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     return jsonResponse(200, {
       ok: true,
       channel: { id: ch.id, name: ch.name, source: ch.source, mediaType: ch.mediaType ?? null },
+      // What the CDN answered for the segments the player actually asked for. This is the
+      // fact that decides whether a black picture is a refusal or a decoder problem.
+      recentSegments: [...segmentLog.entries()]
+        .flatMap(([, list]) => list)
+        .sort((a, b) => b.at - a.at)
+        .slice(0, 12)
+        .map((a) => ({
+          secondsAgo: Math.round((Date.now() - a.at) / 100) / 10,
+          status: a.status,
+          bytes: a.bytes,
+          range: a.range,
+          url: a.url,
+        })),
       hasCookie: Boolean(ch.cookie),
       advertisedUrl: ch.cmd ?? null,
       firstResponse: opened,
@@ -2324,12 +2546,18 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     if (!verified) return jsonResponse(403, { ok: false, error: "Invalid segment token" });
     const target = new URL(file, verified.u.endsWith("/") ? verified.u : `${verified.u}/`);
     if (url.search) target.search = url.search;
+    else if (!target.search) {
+      // RFC 3986 drops the base query when resolving a relative reference, but that query
+      // is the signature this segment needs. Put it back.
+      const baseSearch = verified.u.includes("?") ? verified.u.slice(verified.u.indexOf("?")) : "";
+      if (baseSearch) target.search = baseSearch;
+    }
     return proxyMediaStream(
       target.toString(),
       verified.m,
       publicOrigin,
       cfg.proxySecret,
-      overrideHeadersFromToken(verified),
+      overrideHeadersFromToken(verified, target.toString()),
       undefined,
       request.headers.get("range"),
     );

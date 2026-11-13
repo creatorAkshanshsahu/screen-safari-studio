@@ -80,7 +80,7 @@ describe("DASH manifest is rewritten onto the segment proxy", () => {
 
     const mpd = await res.text();
     expect(mpd).not.toContain("https://cdn.jio.example");
-    expect(mpd).toContain("<BaseURL>http://localhost/api/live/dashseg/");
+    expect(mpd).toContain("<BaseURL>/api/live/dashseg/");
   });
 
   it("keeps SegmentTemplate tokens intact so the player can expand them", async () => {
@@ -98,7 +98,9 @@ describe("DASH manifest is rewritten onto the segment proxy", () => {
     const mpd = await (await get("/api/live/stream/jio%3A143.mpd")).text();
 
     const dir = /<BaseURL>([^<]+)<\/BaseURL>/.exec(mpd)![1]!;
-    const path = new URL(dir).pathname;
+    // Root-relative on purpose; the browser resolves it against the manifest's origin.
+    expect(dir.startsWith("/")).toBe(true);
+    const path = dir;
     // The player expands $Number$ itself; we simulate its request for segment 7.
     const seg = await get(`${path}v1-7.m4s`);
 
@@ -110,7 +112,7 @@ describe("DASH manifest is rewritten onto the segment proxy", () => {
   it("carries the playlist's User-Agent and cookie to the segment request", async () => {
     const calls = stubFetch();
     const mpd = await (await get("/api/live/stream/jio%3A143.mpd")).text();
-    const seg = await get(`${new URL(/<BaseURL>([^<]+)<\/BaseURL>/.exec(mpd)![1]!).pathname}init-v1.mp4`);
+    const seg = await get(`${/<BaseURL>([^<]+)<\/BaseURL>/.exec(mpd)![1]!}init-v1.mp4`);
     expect(seg.status).toBe(200);
 
     // These are the headers the CDN needs. Without them it answers 451, which is what
@@ -129,7 +131,7 @@ describe("DASH manifest is rewritten onto the segment proxy", () => {
     const noBase = MPD.replace(/<BaseURL>[^<]*<\/BaseURL>/, "");
     stubFetch(noBase);
     const mpd = await (await get("/api/live/stream/jio%3A143.mpd")).text();
-    expect(mpd).toContain("<BaseURL>http://localhost/api/live/dashseg/");
+    expect(mpd).toContain("<BaseURL>/api/live/dashseg/");
   });
 
   it("refuses a segment request with a forged token", async () => {
