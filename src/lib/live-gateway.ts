@@ -72,6 +72,9 @@ const PREVIEW_SEED_CHANNELS: LiveChannelItem[] = [
 type GatewayConfig = {
   maxtvPortal: string;
   maxtvMac: string;
+  /** True when the value came from configuration rather than from our defaults. */
+  maxtvMacExplicit: boolean;
+  maxtvPortalExplicit: boolean;
   maxtvSerial: string;
   maxtvDeviceId: string;
   starshareServer: string;
@@ -93,9 +96,23 @@ function readEnv(env: unknown, key: string, fallback = ""): string {
 }
 
 function getConfig(env: unknown): GatewayConfig {
+  // `readEnv` cannot tell "configured to this value" from "fell back to it", and the
+  // difference decides whether a legacy identity may be migrated. Ask separately.
+  const explicit = (key: string): boolean => {
+    const rec = env && typeof env === "object" ? (env as Record<string, unknown>) : {};
+    const fromEnv = typeof rec[key] === "string" && (rec[key] as string).trim() !== "";
+    const proc =
+      typeof globalThis !== "undefined" && "process" in globalThis
+        ? (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+        : undefined;
+    return fromEnv || Boolean(proc?.[key]?.trim());
+  };
+
   return {
-    maxtvPortal: readEnv(env, "MAXTV_PORTAL", "http://new.maxtv.be/stalker_portal/c/"),
-    maxtvMac: readEnv(env, "MAXTV_MAC", "00:1A:79:EE:03:9F"),
+    maxtvPortal: readEnv(env, "MAXTV_PORTAL", STALKER_DEFAULT_PORTAL),
+    maxtvMac: readEnv(env, "MAXTV_MAC", STALKER_DEFAULT_MAC),
+    maxtvMacExplicit: explicit("MAXTV_MAC"),
+    maxtvPortalExplicit: explicit("MAXTV_PORTAL"),
     maxtvSerial: readEnv(env, "MAXTV_SERIAL", "92180365D21FE"),
     maxtvDeviceId: readEnv(
       env,
@@ -450,11 +467,19 @@ const stalkerSession: {
  */
 function migrateStalkerAccount(cfg: GatewayConfig): StalkerAccount {
   const legacyMac = cfg.maxtvMac.trim().toUpperCase() === STALKER_LEGACY_MAC.toUpperCase();
-  const legacyPortal = cfg.maxtvPortal.trim().replace(/\/+$/, "") === STALKER_LEGACY_PORTAL.replace(/\/+$/, "");
+  const legacyPortal =
+    cfg.maxtvPortal.trim().replace(/\/+$/, "") === STALKER_LEGACY_PORTAL.replace(/\/+$/, "");
+
+  // Only a *shipped default* is migrated. The app migrates a stored preference because it
+  // wrote that preference itself as a default; an operator who configured an account has
+  // chosen it, and silently swapping their MAC for another is how a working portal becomes
+  // "maxTV is failing" with no explanation.
+  const migrateMac = legacyMac && !cfg.maxtvMacExplicit;
+  const migratePortal = legacyPortal && !cfg.maxtvPortalExplicit;
+
   return {
-    // An explicit, non-legacy value is the viewer's own choice and is kept.
-    portal: legacyPortal ? STALKER_DEFAULT_PORTAL : cfg.maxtvPortal,
-    mac: legacyMac ? STALKER_DEFAULT_MAC : cfg.maxtvMac,
+    portal: migratePortal ? STALKER_DEFAULT_PORTAL : cfg.maxtvPortal,
+    mac: migrateMac ? STALKER_DEFAULT_MAC : cfg.maxtvMac,
     serial: cfg.maxtvSerial,
     deviceId: cfg.maxtvDeviceId,
   };
@@ -467,15 +492,14 @@ function migrateStalkerAccount(cfg: GatewayConfig): StalkerAccount {
  */
 function stalkerAccountCandidates(cfg: GatewayConfig): StalkerAccount[] {
   const primary = migrateStalkerAccount(cfg);
-  const out = [primary];
-  const legacy: StalkerAccount = {
-    portal: STALKER_LEGACY_PORTAL,
-    mac: STALKER_LEGACY_MAC,
-    serial: primary.serial,
-    deviceId: primary.deviceId,
-  };
-  if (!stalkerSameAccount(primary, legacy)) out.push(legacy);
-  return out;
+  // The configured identity is always tried first. The other published identity is tried
+  // second, whichever one that is: a portal that still honours the old account is rescued,
+  // and one that has moved on is not asked twice.
+  const alternate: StalkerAccount =
+    primary.mac.trim().toUpperCase() === STALKER_DEFAULT_MAC.toUpperCase()
+      ? { portal: STALKER_LEGACY_PORTAL, mac: STALKER_LEGACY_MAC, serial: primary.serial, deviceId: primary.deviceId }
+      : { portal: STALKER_DEFAULT_PORTAL, mac: STALKER_DEFAULT_MAC, serial: primary.serial, deviceId: primary.deviceId };
+  return stalkerSameAccount(primary, alternate) ? [primary] : [primary, alternate];
 }
 
 function stalkerSameAccount(a: StalkerAccount, b: StalkerAccount): boolean {
@@ -2743,7 +2767,15 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
           status: t.status,
           said: t.said,
         })),
-        configured: { portal: cfg.maxtvPortal, mac: cfg.maxtvMac },
+        configured: {
+          portal: cfg.maxtvPortal,
+          mac: cfg.maxtvMac,
+          // Whether these came from configuration or from our defaults. It decides whether
+          // an identity may be migrated, and it explains a mismatch that otherwise looks
+          // like the portal disagreeing with what was set.
+          fromEnv: { portal: cfg.maxtvPortalExplicit, mac: cfg.maxtvMacExplicit },
+          envVars: ["MAXTV_PORTAL", "MAXTV_MAC", "MAXTV_SERIAL", "MAXTV_DEVICE_ID"],
+        },
         identities: candidates,
         migrated:
           candidates[0]!.mac !== cfg.maxtvMac || candidates[0]!.portal !== cfg.maxtvPortal,
