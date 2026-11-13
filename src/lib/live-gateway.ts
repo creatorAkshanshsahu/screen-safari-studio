@@ -1410,7 +1410,12 @@ async function rewriteHlsManifestWeb(
       return ref;
     }
     const tok = await signSegmentToken(abs, mode, secret, headers);
-    return `${publicOrigin}/api/live/segment?t=${encodeURIComponent(tok)}`;
+    // Root-relative on purpose. The player fetches this manifest from *this* origin, so a
+    // relative reference resolves correctly with no guessing, in every environment and
+    // inside an embed. An absolute URL built from the server's idea of its own address is
+    // wrong behind a proxy, and a wrong segment origin looks exactly like a dead stream:
+    // the manifest loads, then nothing plays.
+    return `/api/live/segment?t=${encodeURIComponent(tok)}`;
   };
 
   for (const line of lines) {
@@ -1476,7 +1481,10 @@ async function rewriteDashManifestWeb(
   /** An absolute directory -> a proxied directory whose token carries its UA/cookie. */
   const proxyDir = async (dirUrl: string): Promise<string> => {
     const tok = await signSegmentToken(dirUrl, mode, secret, headers);
-    return `${publicOrigin}/api/live/dashseg/${tok}/`;
+    // Root-relative: see the note in rewriteHlsManifestWeb. A manifest that points the
+    // player at an origin the browser cannot reach is indistinguishable from a stream
+    // with no video in it.
+    return `/api/live/dashseg/${tok}/`;
   };
 
   /** An absolute file reference -> proxied path, keeping template tokens and query. */
@@ -1619,6 +1627,47 @@ async function fetchJioMedia(
   return last;
 }
 
+/**
+ * The last few upstream answers per source, newest first.
+ *
+ * "The stream started but no video arrived" is what a viewer sees; the thing worth knowing
+ * is the status the CDN returned for the segment the player asked for. Without a record of
+ * that, every diagnosis is a guess about somebody else's server. Bounded so a busy process
+ * cannot grow without limit.
+ */
+interface SegmentAttempt {
+  at: number;
+  url: string;
+  status: number;
+  bytes: number;
+  range: string | null;
+}
+
+const segmentLog = new Map<string, SegmentAttempt[]>();
+const SEGMENT_LOG_LIMIT = 24;
+
+function recordSegment(key: string, attempt: SegmentAttempt): void {
+  const list = segmentLog.get(key) ?? [];
+  list.unshift(attempt);
+  if (list.length > SEGMENT_LOG_LIMIT) list.length = SEGMENT_LOG_LIMIT;
+  segmentLog.set(key, list);
+  if (segmentLog.size > 200) {
+    // Oldest key out; the map only ever holds recently played channels.
+    const oldest = segmentLog.keys().next().value;
+    if (oldest !== undefined && oldest !== key) segmentLog.delete(oldest);
+  }
+}
+
+/** Strip the signed query so a token never ends up in a diagnostic, but keep the shape. */
+function diagnosticUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}${u.search ? "?…" : ""}`;
+  } catch {
+    return raw.split("?")[0]!;
+  }
+}
+
 async function proxyMediaStream(
   upstreamUrl: string,
   mode: "mag" | "xtream",
@@ -1655,6 +1704,14 @@ async function proxyMediaStream(
   }
 
   if (!upRes || !upRes.ok || !upRes.body) {
+    // The refusal is the useful fact, so keep it where a diagnostic can find it.
+    recordSegment(mode, {
+      at: Date.now(),
+      url: diagnosticUrl(currentUrl),
+      status: upRes?.status ?? 0,
+      bytes: 0,
+      range: range ?? null,
+    });
     return jsonResponse(upRes?.status === 404 ? 404 : 502, {
       ok: false,
       error: `Upstream stream returned HTTP ${upRes?.status ?? 502}`,
@@ -1752,6 +1809,14 @@ async function proxyMediaStream(
       }),
     });
   }
+
+  recordSegment(mode, {
+    at: Date.now(),
+    url: diagnosticUrl(currentUrl),
+    status: upRes.status,
+    bytes: first.value.byteLength,
+    range: range ?? null,
+  });
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -2017,6 +2082,48 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
   };
 }
 
+/** A host the browser can never reach, so it must never appear in a URL we hand out. */
+function isUnreachableHost(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return (
+    h === "localhost" ||
+    h === "0.0.0.0" ||
+    h === "127.0.0.1" ||
+    h === "::1" ||
+    h.endsWith(".internal") ||
+    h.endsWith(".local")
+  );
+}
+
+/**
+ * The origin the *browser* used, which is not always the origin this function was called
+ * with. A server behind a proxy frequently sees its own internal address -- `localhost`,
+ * a container IP, `0.0.0.0` -- while the viewer is on a public domain.
+ *
+ * This matters because embed URLs, playlist entries and M3U exports are handed to other
+ * machines. Getting it wrong produces links to a host only the server can reach.
+ */
+function publicOriginFor(request: Request, url: URL): string {
+  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const hostHeader = request.headers.get("host")?.trim();
+
+  const candidate = forwardedHost || hostHeader || url.host;
+  const hostname = candidate.replace(/:\d+$/, "");
+
+  // Keep the received origin when the header names a host the browser cannot reach and
+  // the received one is reachable.
+  const chosen = isUnreachableHost(hostname) && !isUnreachableHost(url.hostname.replace(/:\d+$/, ""))
+    ? url.host
+    : candidate;
+
+  const proto =
+    forwardedProto ||
+    (url.protocol === "https:" ? "https" : isUnreachableHost(hostname) ? "http" : "https");
+
+  return `${proto}://${chosen}`;
+}
+
 // ---------- Entry Point Called from src/server.ts ----------
 
 export async function maybeHandleLiveRequest(request: Request, env: unknown): Promise<Response | null> {
@@ -2035,9 +2142,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   }
 
   const cfg = getConfig(env);
-  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
-  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
-  const publicOrigin = forwardedHost ? `${forwardedProto || url.protocol.replace(":", "")}://${forwardedHost}` : url.origin;
+  const publicOrigin = publicOriginFor(request, url);
 
   if (path === "/embed-sdk.js") {
     return new Response(renderWidgetSdkJs(), {
@@ -2300,6 +2405,19 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     return jsonResponse(200, {
       ok: true,
       channel: { id: ch.id, name: ch.name, source: ch.source, mediaType: ch.mediaType ?? null },
+      // What the CDN answered for the segments the player actually asked for. This is the
+      // fact that decides whether a black picture is a refusal or a decoder problem.
+      recentSegments: [...segmentLog.entries()]
+        .flatMap(([, list]) => list)
+        .sort((a, b) => b.at - a.at)
+        .slice(0, 12)
+        .map((a) => ({
+          secondsAgo: Math.round((Date.now() - a.at) / 100) / 10,
+          status: a.status,
+          bytes: a.bytes,
+          range: a.range,
+          url: a.url,
+        })),
       hasCookie: Boolean(ch.cookie),
       advertisedUrl: ch.cmd ?? null,
       firstResponse: opened,

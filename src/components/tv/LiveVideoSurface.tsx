@@ -191,9 +191,44 @@ export function LiveVideoSurface({
       if (settled) return;
       if (el.videoWidth === 0 || el.videoHeight === 0) {
         setHasError(true);
-        setStatusMsg(
-          "The stream started but no video arrived. The channel's segments were refused or the format is unsupported.",
-        );
+        settled = true;
+        clearInterval(poll);
+        // Ask the gateway what the CDN actually answered for the segments the player
+        // requested. Without that, "no video arrived" is six different faults wearing one
+        // message, and every round trip becomes a guess.
+        const asked = `/api/live/diagnose?id=${encodeURIComponent(channelId)}`;
+        void fetch(asked)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((report: unknown) => {
+            const segs = (report as { recentSegments?: Array<{ status?: number; bytes?: number }> } | null)
+              ?.recentSegments;
+            if (!segs || segs.length === 0) {
+              setStatusMsg(
+                "The player requested no segments at all, so the manifest it received could not be used.",
+              );
+              return;
+            }
+            const refused = segs.filter((x) => (x.status ?? 0) >= 400);
+            if (refused.length) {
+              const codes = [...new Set(refused.map((x) => x.status))].join(", ");
+              setStatusMsg(
+                `The CDN refused this channel's segments (HTTP ${codes}). Retry once; if it repeats, the source has rotated its token.`,
+              );
+              return;
+            }
+            const bytes = segs.reduce((n, x) => n + (x.bytes ?? 0), 0);
+            setStatusMsg(
+              bytes > 0
+                ? "Segments arrived but produced no picture. The key or the codec is wrong for this channel, not the network."
+                : "Segments were requested and answered without data.",
+            );
+          })
+          .catch(() => {
+            setStatusMsg(
+              "The stream started but no video arrived. The channel's segments were refused or the format is unsupported.",
+            );
+          });
+        return;
       }
       settled = true;
       clearInterval(poll);
