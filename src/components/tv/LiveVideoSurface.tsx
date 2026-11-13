@@ -30,6 +30,8 @@ interface LiveVideoSurfaceProps {
   drm?: ChannelDrm | null | undefined;
   /** Stated by the catalogue: "dash" | "hls". */
   container?: string | undefined;
+  /** Which catalogue the channel came from, so errors name the right provider. */
+  activeSource?: string | undefined;
   muted: boolean;
   reloadNonce: number;
   selectedAudioTrack: number;
@@ -105,6 +107,20 @@ function toHexKeyId(value: string): string | null {
   }
 }
 
+/** `kid:key,kid:key` from the proxy's X-Clear-Keys header. */
+function parseKeyHeader(value: string | null): Array<{ kid: string; k: string }> {
+  if (!value) return [];
+  const out: Array<{ kid: string; k: string }> = [];
+  for (const token of value.split(",")) {
+    const i = token.indexOf(":");
+    if (i <= 0) continue;
+    const kid = token.slice(0, i).trim();
+    const k = token.slice(i + 1).trim();
+    if (kid && k) out.push({ kid, k });
+  }
+  return out;
+}
+
 let scriptsPromise: Promise<void> | null = null;
 
 function ensurePlayerEnginesLoaded(): Promise<void> {
@@ -139,6 +155,7 @@ export function LiveVideoSurface({
   channelName,
   drm,
   container,
+  activeSource,
   muted,
   reloadNonce,
   selectedAudioTrack,
@@ -151,6 +168,44 @@ export function LiveVideoSurface({
   const [statusMsg, setStatusMsg] = useState<string | null>("Connecting to live stream…");
   const [hasError, setHasError] = useState(false);
   const [localRetry, setLocalRetry] = useState(0);
+
+  // A "playing" event only means the element started; it does not prove a frame was
+  // decoded. Shaka reports playing for a stream whose segments never arrive, and the
+  // overlay used to be hidden at that point, leaving a silent black rectangle.
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    let settled = false;
+
+    const check = () => {
+      if (settled) return;
+      if (el.videoWidth > 0 && el.videoHeight > 0) {
+        settled = true;
+        clearInterval(poll);
+        clearTimeout(deadline);
+      }
+    };
+
+    const poll = setInterval(check, 500);
+    const deadline = setTimeout(() => {
+      if (settled) return;
+      if (el.videoWidth === 0 || el.videoHeight === 0) {
+        setHasError(true);
+        setStatusMsg(
+          "The stream started but no video arrived. The channel's segments were refused or the format is unsupported.",
+        );
+      }
+      settled = true;
+      clearInterval(poll);
+    }, 15000);
+
+    check();
+    return () => {
+      settled = true;
+      clearInterval(poll);
+      clearTimeout(deadline);
+    };
+  }, [channelId, reloadNonce, localRetry]);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.muted = muted;
@@ -202,7 +257,7 @@ export function LiveVideoSurface({
     // *unpadded* 22-char base64url; a 32-char base64url string (which is what a
     // default_KID produces) is silently misread as hex, so normalise both forms
     // to hex and let Shaka encode them itself.
-    const startDash = (url: string) => {
+    const startDash = (url: string, matched?: Array<{ kid: string; k: string }>) => {
       if (cancelled || !videoRef.current) return;
       cleanup();
       const shaka = window.shaka;
@@ -224,7 +279,8 @@ export function LiveVideoSurface({
         shakaRef.current = player;
 
         const clearKeys: Record<string, string> = {};
-        for (const pair of drm?.keys ?? []) {
+        const source = matched && matched.length > 0 ? matched : (drm?.keys ?? []);
+        for (const pair of source) {
           const kid = toHexKeyId(pair.kid);
           const key = toHexKeyId(pair.k);
           if (kid && key) clearKeys[kid] = key;
@@ -316,7 +372,13 @@ export function LiveVideoSurface({
           const d = data as { fatal?: boolean } | undefined;
           if (d?.fatal && !cancelled) {
             setHasError(true);
-            setStatusMsg("Live HLS stream interrupted. Click Retry for a fresh maxTV token.");
+            // Name the source honestly: this message used to promise a "fresh maxTV
+            // token" even for a JioTV channel, where no maxTV token is involved.
+            setStatusMsg(
+              activeSource === "jio"
+                ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
+                : "Live HLS stream interrupted. Press Retry to request a fresh maxTV token.",
+            );
           }
         });
       } else if (videoRef.current.canPlayType("application/vnd.apple.mpegurl")) {
@@ -378,8 +440,12 @@ export function LiveVideoSurface({
           return;
         }
         const kind = (res.headers.get("x-stream-container") || "").toLowerCase();
+        // The server reconciles the key document with the manifest's own key ids, which
+        // is the difference between a picture and a silent black screen. Prefer its
+        // answer to the ids the catalogue handed us.
+        const matched = parseKeyHeader(res.headers.get("x-clear-keys"));
         probeCtrl.abort();
-        if (kind === "dash") startDash(streamUrl(".mpd"));
+        if (kind === "dash") startDash(streamUrl(".mpd"), matched);
         else if (kind === "hls") startHls(streamUrl(".m3u8"));
         else startMpegTs(streamUrl(".ts"), true);
       } catch {
@@ -394,7 +460,7 @@ export function LiveVideoSurface({
       cancelled = true;
       cleanup();
     };
-  }, [channelId, channelName, drm, container, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected]);
+  }, [channelId, channelName, drm, container, activeSource, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected]);
 
   return (
     <div className="absolute inset-0 bg-black">
@@ -404,8 +470,13 @@ export function LiveVideoSurface({
         autoPlay
         muted={muted}
         onPlaying={() => {
-          setStatusMsg(null);
-          setHasError(false);
+          // Clear the overlay only once the element actually has picture; otherwise
+          // leave the message up so a dead stream is never mistaken for a paused one.
+          const el = videoRef.current;
+          if (el && el.videoWidth > 0 && el.videoHeight > 0) {
+            setStatusMsg(null);
+            setHasError(false);
+          }
         }}
         onWaiting={() => setStatusMsg("Buffering live broadcast…")}
         className="h-full w-full object-contain"

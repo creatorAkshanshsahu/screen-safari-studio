@@ -414,6 +414,16 @@ async function fetchTextTimeout(url: string, headers: Record<string, string>, ti
   }
 }
 
+/**
+ * Remember a source that recently failed outright, so the catalogue does not spend
+ * eight 20-second timeouts on every page load while the host is unreachable.
+ */
+const sourceBackoff: { maxtvUntil: number; maxtvReason: string | null } = {
+  maxtvUntil: 0,
+  maxtvReason: null,
+};
+const SOURCE_BACKOFF_MS = 30_000;
+
 const stalkerSession: {
   endpoint: string | null;
   token: string | null;
@@ -460,7 +470,9 @@ async function stalkerRaw(
   params: Record<string, string>,
   auth: boolean,
 ): Promise<string> {
-  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 20000);
+  // 8 candidates x 20s was up to ~160s of blank page when the host is a black hole.
+  // A reachable portal answers a handshake well inside this.
+  const body = await fetchTextTimeout(buildStalkerUrl(base, type, action, params), stalkerHeaders(cfg, account, auth), 7000);
   return body;
 }
 
@@ -480,6 +492,11 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
     return issued;
   }
 
+  if (Date.now() < sourceBackoff.maxtvUntil) {
+    // Recently proven dead: fail fast with the reason we already know.
+    throw new StalkerError(null, sourceBackoff.maxtvReason ?? "no portal at this address");
+  }
+
   const failures: string[] = [];
   let spoken: string | null = null;
   let lastErr: unknown = null;
@@ -497,6 +514,8 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
       stalkerSession.endpoint = candidate;
       stalkerSession.token = issued;
       stalkerSession.profiled = false;
+      sourceBackoff.maxtvUntil = 0;
+      sourceBackoff.maxtvReason = null;
       return issued;
     } catch (e) {
       lastErr = e;
@@ -513,6 +532,8 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
   stalkerSession.token = null;
   const tried = failures.slice(0, 4).join(", ") + (failures.length > 4 ? " …" : "");
   const detail = spoken ?? (failures.length ? `no portal at this address (tried ${tried})` : "no portal at this address");
+  sourceBackoff.maxtvUntil = Date.now() + SOURCE_BACKOFF_MS;
+  sourceBackoff.maxtvReason = detail;
   if (lastErr instanceof StalkerError) throw new StalkerError(lastErr.status, lastErr.detail || detail);
   throw new StalkerError(null, detail);
 }
@@ -822,6 +843,21 @@ function parseClearKeys(body: string): ClearKeyPair[] {
 }
 
 /** `cenc:default_KID` values from an MPD, normalised to base64url (the form ClearKey uses). */
+/**
+ * Reconcile a key document with the manifest's declared key ids.
+ *
+ * If none of the advertised ids appear in the manifest and there is exactly one key, the
+ * key is relabelled onto each id the manifest declares. Fewer than one, or several
+ * disagreeing keys, are left alone: guessing there would decrypt the wrong track.
+ */
+function matchClearKeys(keys: ClearKeyPair[], kids: string[]): ClearKeyPair[] {
+  if (keys.length === 0 || kids.length === 0) return keys;
+  if (keys.some((k) => kids.includes(k.kid))) return keys;
+  if (keys.length !== 1) return keys;
+  const only = keys[0]!.k;
+  return kids.map((kid) => ({ kid, k: only }));
+}
+
 function defaultKids(mpd: string): string[] {
   const out = new Set<string>();
   const re = /cenc:default_KID\s*=\s*["']([0-9a-fA-F-]{32,36})["']/g;
@@ -870,16 +906,27 @@ async function jioKeysFor(entry: ParsedM3uEntry, siteHost: string): Promise<Clea
   if (cached && cached.until > Date.now()) return [...inline, ...cached.keys];
 
   try {
-    const res = await fetch(url, {
-      headers: {
-        Origin: JIO_SITE,
-        Referer: `${JIO_SITE}/`,
-        Accept: "application/json",
-        "User-Agent": JIO_UA_OVERRIDE,
-      },
-    });
-    if (!res.ok) return inline;
-    const keys = parseClearKeys(await res.text());
+    // Bounded: a key document that never answers used to stall the entire playlist
+    // build, leaving the guide on "Loading…" with no way out.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4000);
+    let body = "";
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Origin: JIO_SITE,
+          Referer: `${JIO_SITE}/`,
+          Accept: "application/json",
+          "User-Agent": JIO_UA_OVERRIDE,
+        },
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return inline;
+      body = await res.text();
+    } finally {
+      clearTimeout(timer);
+    }
+    const keys = parseClearKeys(body);
     if (keys.length) jioKeyCache.set(url, { keys, until: Date.now() + 10 * 60 * 1000 });
     return [...inline, ...keys];
   } catch {
@@ -949,14 +996,38 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
     }
   })();
 
+  // Key documents are fetched concurrently. Doing this one channel at a time meant the
+  // catalogue took as long as the sum of every key round-trip -- measured at 6s for 60
+  // channels, so a real playlist of a few hundred sat on "Loading…" for half a minute.
+  const wantsDrm = (e: ParsedM3uEntry) => Boolean(e.licenseType.toLowerCase() === "clearkey" || e.licenseKey);
+
+  const keyStore = new Map<number, ClearKeyPair[]>();
+  const drmIndexes = entries.map((e, i) => (wantsDrm(e) ? i : -1)).filter((i) => i >= 0);
+  const CONCURRENCY = 8;
+  for (let start = 0; start < drmIndexes.length; start += CONCURRENCY) {
+    const batch = drmIndexes.slice(start, start + CONCURRENCY);
+    const settled = await Promise.all(
+      batch.map(async (i) => {
+        try {
+          return [i, await jioKeysFor(entries[i]!, siteHost)] as const;
+        } catch {
+          // A single unreachable key document must not take the playlist down with it.
+          return [i, [] as ClearKeyPair[]] as const;
+        }
+      }),
+    );
+    for (const [i, keys] of settled) keyStore.set(i, keys);
+  }
+
   const items: LiveChannelItem[] = [];
   for (const [i, e] of entries.entries()) {
     const mediaType = jioMediaType(e.url);
     // Only DRM-protected entries need a key round-trip; plain HLS does not.
     let drm: LiveChannelItem["drm"];
-    if (e.licenseType.toLowerCase() === "clearkey" || e.licenseKey) {
-      const keys = await jioKeysFor(e, siteHost);
+    if (wantsDrm(e)) {
+      const keys = keyStore.get(i) ?? [];
       const licenseUrl = jioLicenseUrl(e, siteHost) ?? undefined;
+      // Kept even with zero keys: the player can pull the MPD's default_KID itself.
       drm = { type: "clearkey", keys, ...(licenseUrl ? { licenseUrl } : {}) };
     }
     items.push({
@@ -1338,7 +1409,7 @@ function corsEmbedHeaders(extra: Record<string, string> = {}): Record<string, st
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Range, Content-Type, Accept, Origin",
-    "Access-Control-Expose-Headers": "Content-Type, X-Stream-Container",
+    "Access-Control-Expose-Headers": "Content-Type, X-Stream-Container, X-Clear-Keys",
     "Content-Security-Policy": "frame-ancestors *;",
     ...extra,
   };
@@ -1354,12 +1425,61 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
+/**
+ * Open a JioTV media URL the way the v.4.9 app does, trying each header shape in turn.
+ *
+ * The playlist's `#EXTHTTP` cookie is a *coarse* token minted for the whole site, while
+ * the address behind the redirect carries one minted for that single channel and path.
+ * The CDN disagrees about which it wants per channel, and answers 450/451/403 to the
+ * wrong one. The app therefore sends both and lets the CDN choose; a single attempt is
+ * what made every channel fail here with "Upstream stream returned HTTP 450".
+ */
+async function fetchJioMedia(
+  url: string,
+  entry: { userAgent?: string | undefined; cookie?: string | undefined },
+): Promise<{ res: Response; finalUrl: string } | null> {
+  const ua = entry.userAgent || JIO_UA_OVERRIDE;
+  const attempts: Array<Record<string, string>> = [
+    // What an IPTV player sends, and the only shape that gets past the redirector.
+    { "User-Agent": ua, ...(entry.cookie ? { Cookie: entry.cookie } : {}) },
+    // The CDN may mint a fresh token on each redirect and reject the coarse one.
+    { "User-Agent": ua },
+    // Last: the playlist's browser-style identity, for a host that wants it.
+    { "User-Agent": ua, ...(entry.cookie ? { Cookie: entry.cookie } : {}), Origin: JIO_SITE, Referer: `${JIO_SITE}/` },
+  ];
+
+  let last: { res: Response; finalUrl: string } | null = null;
+  for (const headers of attempts) {
+    let currentUrl = url;
+    try {
+      // Follow the redirect chain by hand so the signed CDN address is kept: the
+      // redirector re-mints the __hdnea__ token, and the bare URL is a stale one.
+      for (let hop = 0; hop < 6; hop++) {
+        const res = await fetch(currentUrl, { headers: { Accept: "*/*", ...headers }, redirect: "manual" });
+        if (res.status >= 300 && res.status < 400) {
+          const loc = res.headers.get("location");
+          if (!loc) return { res, finalUrl: currentUrl };
+          currentUrl = new URL(loc, currentUrl).toString();
+          continue;
+        }
+        if (res.ok) return { res, finalUrl: currentUrl };
+        last = { res, finalUrl: currentUrl };
+        break;
+      }
+    } catch {
+      // Network-level failure: try the next shape.
+    }
+  }
+  return last;
+}
+
 async function proxyMediaStream(
   upstreamUrl: string,
   mode: "mag" | "xtream",
   publicOrigin: string,
   secret: string,
   overrideHeaders?: Record<string, string>,
+  clearKeys?: ClearKeyPair[],
 ): Promise<Response> {
   const headers: Record<string, string> = overrideHeaders
     ? { Accept: "*/*", ...overrideHeaders }
@@ -1418,6 +1538,14 @@ async function proxyMediaStream(
       offset += c.byteLength;
     }
     const mpdText = new TextDecoder().decode(merged);
+    // A ClearKey licence must name the key id the manifest actually uses. When the key
+    // document and the MPD disagree, the session decrypts nothing and the viewer sees a
+    // black screen with no error at all. A single advertised key is therefore relabelled
+    // onto the manifest's key id rather than dropped, exactly as the v.4.9 app does.
+    const matched = matchClearKeys(clearKeys ?? [], defaultKids(mpdText));
+    const keyHeader = matched.length
+      ? { "X-Clear-Keys": matched.map((k) => `${k.kid}:${k.k}`).join(",") }
+      : {};
     // Hand over a manifest whose every reference points back at us. Untouched, the
     // player would walk straight out to the CDN and lose the UA that keeps it alive.
     const rewritten = await rewriteDashManifestWeb(
@@ -1434,6 +1562,7 @@ async function proxyMediaStream(
         "Content-Type": "application/dash+xml; charset=utf-8",
         "Cache-Control": "no-store",
         "X-Stream-Container": "dash",
+        ...keyHeader,
       }),
     });
   }
@@ -1646,6 +1775,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     }
     async function boot() {
       clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
+      armWatchdog();
       // Ask for the container the catalogue advertised. Probing ".ts" unconditionally
       // made every DASH channel look like MPEG-TS, so the embed could never play one.
       const wantDash = String(ch.container || "").toLowerCase() === "dash";
@@ -1660,7 +1790,21 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         else startTs(sUrl(".ts"), true);
       } catch { clearTimeout(tm); if (wantDash) startDash(sUrl(".mpd")); else startTs(sUrl(".ts"), true); }
     }
-    v.onplaying = () => { ov.classList.add("hide"); pl.textContent = "Pause"; };
+    // Only hide the overlay once a frame exists. An element can report "playing" with
+    // videoWidth 0 when every segment is refused, which shows a silent black box.
+    v.onplaying = () => {
+      pl.textContent = "Pause";
+      if (v.videoWidth > 0 && v.videoHeight > 0) ov.classList.add("hide");
+    };
+    let deadTimer = null;
+    function armWatchdog() {
+      clearTimeout(deadTimer);
+      deadTimer = setTimeout(() => {
+        if (v.videoWidth > 0 && v.videoHeight > 0) return;
+        st.textContent = "The stream started but no video arrived. Segments were refused or the format is unsupported.";
+        rt.style.display = "inline-block"; ov.classList.remove("hide");
+      }, 15000);
+    }
     v.onpause = () => { pl.textContent = "Play"; };
     pl.onclick = () => v.paused ? v.play() : v.pause();
     mu.onclick = () => { v.muted = !v.muted; mu.textContent = v.muted ? "Unmute" : "Mute"; };
@@ -1916,10 +2060,23 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     if (ch.source === "jio") {
       if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This backup channel has no stream URL" });
       try {
-        // The playlist's own UA, and never Origin/Referer: the CDN answers 451 to those.
-        const headers: Record<string, string> = { "User-Agent": ch.userAgent || JIO_UA_OVERRIDE };
-        if (ch.cookie) headers["Cookie"] = ch.cookie;
-        return await proxyMediaStream(ch.cmd, "xtream", publicOrigin, cfg.proxySecret, headers);
+        const opened = await fetchJioMedia(ch.cmd, { userAgent: ch.userAgent, cookie: ch.cookie });
+        if (!opened) {
+          return jsonResponse(502, { ok: false, error: "The JioTV CDN did not answer this channel" });
+        }
+        // Hand the *final* address to the proxy: it is the one carrying the token the
+        // redirector just minted for this channel, so segments and the manifest agree.
+        return await proxyMediaStream(
+          opened.finalUrl,
+          "xtream",
+          publicOrigin,
+          cfg.proxySecret,
+          {
+            "User-Agent": ch.userAgent || JIO_UA_OVERRIDE,
+            ...(ch.cookie ? { Cookie: ch.cookie } : {}),
+          },
+          ch.drm?.keys,
+        );
       } catch (e) {
         return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Backup stream failed" });
       }
