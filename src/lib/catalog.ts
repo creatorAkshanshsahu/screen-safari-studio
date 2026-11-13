@@ -24,5 +24,17 @@ export const channels = [
   { no: 106, name: "Tune TV", now: "Top 40 Countdown", next: "Unplugged", hue: 350, pct: 10 },
 ];
 
-export const poster = (hue: number) =>
-  `linear-gradient(160deg, oklch(0.55 0.15 ${hue}) 0%, oklch(0.25 0.08 ${hue + 30}) 60%, oklch(0.12 0.02 ${hue}) 100%)`;
+/**
+ * Poster gradient confined to the v.4.9 crimson band (340..360, 0..20).
+ * Any input hue is mapped into crimson -> rose -> warm wine so a wall of
+ * tiles reads as one brand instead of a rainbow. See docs/v49/ui-crimson-4.9.45.md.
+ */
+export const crimsonHue = (hue: number) => {
+  const t = (((hue % 360) + 360) % 360) / 360;
+  return 340 + t * 40; // 340..380 wraps through 360 into 0..20
+};
+
+export const poster = (hue: number) => {
+  const h = crimsonHue(hue);
+  return `linear-gradient(160deg, oklch(0.55 0.15 ${h}) 0%, oklch(0.25 0.08 ${h + 10}) 60%, oklch(0.12 0.02 ${h}) 100%)`;
+};
