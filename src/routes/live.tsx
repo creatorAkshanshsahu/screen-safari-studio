@@ -144,6 +144,7 @@ export function LivePlayerContent() {
           channelName={activeChannel.name}
           drm={activeChannel.drm ?? null}
           container={activeChannel.container}
+          activeSource={activeChannel.source}
           muted={muted}
           reloadNonce={reloadNonce}
           selectedAudioTrack={activeAudio}
