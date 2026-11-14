@@ -1324,7 +1324,10 @@ const jioCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | n
  * meaning. They are not about the channel, so the answer is a fresher token.
  */
 function isJioRefusal(status: number): boolean {
-  return status === 450 || status === 451 || status === 403 || status === 401;
+  // 450/451 are Jio's own codes; 475 shows up on the reshared "Premium" playlists, which point
+  // at the same CDNs. All four mean "this address may not have this stream", which for a worker
+  // means the viewer's browser has to ask instead.
+  return status === 450 || status === 451 || status === 475 || status === 403 || status === 401;
 }
 
 /**
@@ -1674,7 +1677,7 @@ const GIOTV_STAR_COOKIES_URL = "https://giotv-6op.pages.dev/cookie.json";
 const TG_LIVE_SITE = "https://livetgtv.lovable.app";
 const TG_INITIAL_SERVER_FN = "211ba18c9fcbaf4e68e5bb262905070b60b7ed4ffe802d16fbbed00150f1c024";
 
-interface GioTvChannelRecord {
+export interface GioTvChannelRecord {
   id: string;
   name: string;
   category: string;
@@ -2215,7 +2218,7 @@ async function resolveTgRpcCandidates(numericId: string, force = false): Promise
   return result;
 }
 
-function normalizeChannelMatchTokens(rawName: string): { base: string; noQuality: string; numbers: string[]; tokens: string[] } {
+export function normalizeChannelMatchTokens(rawName: string): { base: string; noQuality: string; numbers: string[]; tokens: string[] } {
   let s = rawName
     .toLowerCase()
     .replace(/^[|\[(\{\s]*(?:in|ind|india|indian|vip|hindi|uk|us)[|\])\}\s:\-–—]+/gi, "")
@@ -2223,6 +2226,10 @@ function normalizeChannelMatchTokens(rawName: string): { base: string; noQuality
     .replace(/\b(?:sony\s+set)\b/g, "set")
     .replace(/\b(?:star\s+sports\s+hd\s*(\d+))\b/g, "star sports $1 hd")
     .replace(/&/g, " and ")
+    // `Nick HD+` and `Nick Plus HD` are the same channel. Stripping `+` as punctuation left
+    // the first as the single token `nick`, which scored 0.50 against the second and was
+    // rejected -- so a maxTV 403 could not be rescued by a GioTV stream that was right there.
+    .replace(/\+/g, " plus ")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
   s = s.replace(/\s+/g, " ");
@@ -2232,7 +2239,7 @@ function normalizeChannelMatchTokens(rawName: string): { base: string; noQuality
   return { base: s, noQuality, numbers, tokens };
 }
 
-function findBestGioTvMatch(records: GioTvChannelRecord[], rawId: string, channelName: string): GioTvChannelRecord | null {
+export function findBestGioTvMatch(records: GioTvChannelRecord[], rawId: string, channelName: string): GioTvChannelRecord | null {
   const numericId = rawId.replace(/^(?:jio|tg|st|xt):/i, "").trim();
   // Direct numeric V1/Jio ID match ONLY when the channel actually came from jio/tgtv (not st:1001 maxTV IDs!)
   if (/^(?:jio|tg):/i.test(rawId) || (!rawId.includes(":") && /^\d+$/.test(rawId))) {
@@ -2659,22 +2666,22 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
       },
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`TG TV playlist returned HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`AK TV playlist returned HTTP ${res.status}`);
     body = await res.text();
   } finally {
     clearTimeout(timer);
   }
   if (!body.trimStart().startsWith("#EXTM3U")) {
-    throw new Error("TG TV playlist did not return valid M3U");
+    throw new Error("AK TV playlist did not return valid M3U");
   }
   const entries = parseM3u(body, cfg.tgtvPlaylistUrl);
-  if (entries.length === 0) throw new Error("TG TV playlist listed no channels");
+  if (entries.length === 0) throw new Error("AK TV playlist listed no channels");
   return entries.map((e, i) => ({
     id: `tg:${e.tvgId || i}`,
     rawId: e.tvgId || String(i),
     source: "tgtv" as const,
     name: e.name,
-    category: e.group || "TG TV",
+    category: e.group || "AK TV",
     logo: e.logo,
     cmd: e.url,
     mediaType: jioMediaType(e.url),
@@ -2711,7 +2718,7 @@ async function fetchTgTvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]
       rawId: g.id,
       source: "tgtv" as const,
       name: g.name,
-      category: g.category || "TG TV",
+      category: g.category || "AK TV",
       logo: g.logo,
       cmd: g.urls[0]!,
       mediaType: jioMediaType(g.urls[0]!),
@@ -3462,6 +3469,12 @@ async function proxyMediaStream(
   clearKeys?: ClearKeyPair[],
   range?: string | null,
   probeOpts?: { isProbe?: boolean; handoffId?: string },
+  /**
+   * What the browser could play if this request is refused. Any upstream 4xx refusal becomes
+   * that recipe instead of a bare status: the refusal is about *this* address, and the browser
+   * has a different one.
+   */
+  refusalRecipe?: DirectPlayCandidate,
 ): Promise<Response> {
   const headers: Record<string, string> = overrideHeaders
     ? { Accept: "*/*", ...overrideHeaders }
@@ -3505,9 +3518,17 @@ async function proxyMediaStream(
       bytes: 0,
       range: range ?? null,
     });
-    return jsonResponse(upRes?.status === 404 ? 404 : 502, {
+    const status = upRes?.status ?? 502;
+    if (refusalRecipe && (isJioRefusal(status) || status >= 400)) {
+      return jsonResponse(502, {
+        ok: false,
+        error: `The stream host refused this server's address (HTTP ${status}). Playing it directly from your browser instead.`,
+        directPlay: refusalRecipe,
+      });
+    }
+    return jsonResponse(status === 404 ? 404 : 502, {
       ok: false,
-      error: `Upstream stream returned HTTP ${upRes?.status ?? 502}`,
+      error: `Upstream stream returned HTTP ${status}`,
     });
   }
 
@@ -3768,6 +3789,22 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     function sameHost(a, b) {
       try { return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase(); } catch (e) { return false; }
     }
+    // Same provider, not necessarily the same host: reshared playlists serve the manifest from
+    // one CDN edge and the segments from a sibling, and a strict comparison leaves every
+    // segment unsigned -- which the CDN answers with 450/475.
+    function sameScope(a, b) {
+      if (sameHost(a, b)) return true;
+      var ha, hb;
+      try { ha = new URL(a).hostname.toLowerCase(); hb = new URL(b).hostname.toLowerCase(); } catch (e) { return false; }
+      if (!ha || !hb) return false;
+      function reg(h) {
+        var parts = h.split(".");
+        var two = /^(?:co|com|org|net|gov|ac|edu)\.[a-z]{2}$/.test(parts.slice(-2).join("."));
+        return parts.slice(two ? -3 : -2).join(".");
+      }
+      var ra = reg(ha);
+      return ra === reg(hb) && ra.indexOf(".") >= 0;
+    }
     function startHls(url, tok, host) {
       clean();
       if (window.Hls && Hls.isSupported()) {
@@ -3923,7 +3960,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
               net.registerRequestFilter(function (type, req) {
                 if ((type !== 0 && type !== 1) || !req.uris || !req.uris[0]) return;
                 const u = req.uris[0];
-                if (u.includes("allinonereborn") || !sameHost(u, cand.url)) return;
+                if (u.includes("allinonereborn") || !sameScope(u, cand.url)) return;
                 if (!activeTok) return;
                 req.uris[0] = withTok(u, activeTok, false);
               });
@@ -3932,7 +3969,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
               net.registerResponseFilter(function (type, resp) {
                 if (type === 0 && resp.uri) {
                   try {
-                    if (!resp.uri.includes("allinonereborn") && sameHost(resp.uri, cand.url)) {
+                    if (!resp.uri.includes("allinonereborn") && sameScope(resp.uri, cand.url)) {
                       const learned = hdneaOf(resp.uri);
                       if (learned) activeTok = learned;
                     }
@@ -4667,16 +4704,17 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     }
 
     if (ch.source === "tgtv") {
-      if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This TG TV channel has no stream URL" });
+      if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This AK TV channel has no stream URL" });
       // Some TG playlist entries are not on TG's host at all: they point at a Jio CDN address,
       // which answers the worker's egress with 450/451 and the viewer's browser with 200 and
       // `Access-Control-Allow-Origin: *`. Proxying one can only fail, so say so immediately and
       // hand over the recipe instead of spending a round trip to be refused.
+      const recipe = directRecipeFor(ch, "AK TV playlist · browser-direct");
       if (isJioCdnHost(ch.cmd)) {
         return jsonResponse(502, {
           ok: false,
           error: `This channel streams from the Jio CDN, which refuses the server's address (HTTP 450). It is being played directly from your browser instead.`,
-          directPlay: directRecipeFor(ch, "TG playlist · browser-direct"),
+          directPlay: recipe,
         });
       }
       return proxyMediaStream(
@@ -4691,6 +4729,9 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         undefined,
         request.headers.get("range"),
         { isProbe, handoffId: ch.id },
+        // Any other host can refuse this address just as well -- the "Premium" reshares are
+        // not on Jio's CDN at all and answer 475. Guess the hostname and the next one breaks.
+        recipe,
       );
     }
 
@@ -4770,7 +4811,10 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
 
   if (path.startsWith("/embed/")) {
     const rawId = decodeURIComponent(path.slice("/embed/".length));
-    const pool = await getChannelsBySource(cfg, "all", false);
+    // An embed is loaded by a third-party page, so it must answer promptly and it must not
+    // depend on a source it does not use: the id prefix names the catalogue, and a budget
+    // keeps a slow one from holding the frame open on someone else's site.
+    const pool = await withBudget(loadCatalogueForId(cfg, rawId, false), STREAM_CATALOGUE_BUDGET_MS, []);
     const ch = pool.find((c) => c.id === rawId || c.rawId === rawId);
     const dto = ch
       ? toDto(ch, publicOrigin)

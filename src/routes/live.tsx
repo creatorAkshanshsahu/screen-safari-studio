@@ -34,7 +34,7 @@ export const Route = createFileRoute("/live")({
 });
 
 export function LivePlayerContent() {
-  // maxTV leads, with JioTV and TG TV available both as first-class sources and automatic fallbacks.
+  // maxTV leads, with JioTV and AK TV available both as first-class sources and automatic fallbacks.
   const [source, setSource] = useState<"maxtv" | "jio" | "tgtv" | "all">("maxtv");
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("hindi");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
@@ -203,7 +203,7 @@ export function LivePlayerContent() {
               [
                 ["maxtv", "maxTV"],
                 ["jio", "JioTV"],
-                ["tgtv", "TG TV"],
+                ["tgtv", "AK TV"],
                 ["all", "Both"],
               ] as const
             ).map(([val, label]) => (
@@ -254,7 +254,7 @@ export function LivePlayerContent() {
             <p className="font-bold text-accent">maxTV unreachable — playing the JioTV backup playlist ({visibleChannels.length} channels).</p>
           )}
           {servedBy === "tgtv" && source === "maxtv" && (
-            <p className="font-bold text-accent">maxTV &amp; JioTV unreachable — playing the TG TV live playlist ({visibleChannels.length} channels).</p>
+            <p className="font-bold text-accent">maxTV &amp; JioTV unreachable — playing the AK TV live playlist ({visibleChannels.length} channels).</p>
           )}
           {portalError && (
             <p className="font-bold text-accent">No live source reachable — these {visibleChannels.length} sample channels will not play.</p>
