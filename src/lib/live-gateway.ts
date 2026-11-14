@@ -3844,6 +3844,11 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     .bot { position: absolute; bottom: 0; inset-inline: 0; padding: 12px 16px; display: flex; justify-content: space-between; gap: 8px; background: linear-gradient(0deg, rgba(0,0,0,.85), transparent); }
     button, select { background: rgba(16,14,30,.85); color: #fff; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
     button:hover, select:hover { border-color: #00ecf7; }
+    /* The way back to the site. Small, always visible, and a real link: the whole point of
+       being embedded on someone else's page is that their viewers can find us. */
+    .brand { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; pointer-events: auto; transition: border-color .15s ease, background .15s ease; }
+    .brand:hover, .brand:focus-visible { border-color: #00ecf7; background: rgba(8,7,17,.94); outline: none; }
+    .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
     .ov { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: rgba(5,4,11,.74); text-align: center; padding: 20px; }
     .ov.hide { display: none; }
   </style>
@@ -3853,7 +3858,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     <video id="v" playsinline autoplay></video>
     <div class="top">
       <div><span class="live">LIVE</span><strong id="nm"></strong></div>
-      <span style="font-size:11px;opacity:.7;letter-spacing:.12em;">STREAMR · maxTV</span>
+      <a class="brand" href="/" target="_top" rel="noopener" title="Watch more live TV on STREAMR"><img src="/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
     </div>
     <div class="ov" id="ov"><div id="st" style="font-size:13px;color:#b4bbd0;">Connecting to live stream…</div><button id="rt" style="display:none;">Reload Stream</button></div>
     <div class="bot">
@@ -4180,7 +4185,7 @@ function renderWidgetSdkJs(): string {
   const source = s.getAttribute("data-source") || "maxtv";
   const filter = s.getAttribute("data-filter") || "hindi";
   if (!mount) return;
-  mount.innerHTML = '<div style="background:#080711;border:1px solid rgba(255,255,255,.1);border-radius:16px;overflow:hidden;color:#fff;font-family:system-ui,sans-serif;"><div style="aspect-ratio:16/9;background:#000;"><iframe id="sr-f" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen style="width:100%;height:100%;border:0;"></iframe></div><div style="padding:14px;"><input id="sr-q" type="search" placeholder="Search Live TV…" style="width:100%;margin-bottom:10px;background:#121022;border:1px solid rgba(255,255,255,.15);color:#fff;padding:8px 14px;border-radius:999px;font-size:13px;"/><div id="sr-g" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;max-height:260px;overflow:auto;"></div></div></div>';
+  mount.innerHTML = '<div style="background:#080711;border:1px solid rgba(255,255,255,.1);border-radius:16px;overflow:hidden;color:#fff;font-family:system-ui,sans-serif;"><div style="aspect-ratio:16/9;background:#000;"><iframe id="sr-f" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen style="width:100%;height:100%;border:0;"></iframe></div><div style="padding:14px;"><input id="sr-q" type="search" placeholder="Search Live TV…" style="width:100%;margin-bottom:10px;background:#121022;border:1px solid rgba(255,255,255,.15);color:#fff;padding:8px 14px;border-radius:999px;font-size:13px;"/><div id="sr-g" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;max-height:260px;overflow:auto;"></div><a href="' + origin + '/" target="_top" rel="noopener" style="display:inline-flex;align-items:center;gap:6px;margin-top:12px;color:rgba(255,255,255,.62);text-decoration:none;font-size:10px;font-weight:800;letter-spacing:.14em;"><img src="' + origin + '/favicon.png" alt="" width="16" height="16" style="border-radius:4px;display:block;" /><span>STREAMR</span></a></div></div>';
   const f = mount.querySelector("#sr-f"), q = mount.querySelector("#sr-q"), g = mount.querySelector("#sr-g");
   let all = [], cur = "";
   function pick(c) { cur = c.id; f.src = origin + "/embed/" + encodeURIComponent(c.id); draw(q.value); }
