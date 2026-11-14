@@ -2568,7 +2568,6 @@ async function resolveDirectPlayCandidates(
   const playlistBudgeted = (async (): Promise<{ cookie: string; entry: LiveChannelItem | null; mint: PlaylistMint | null }> => {
     const empty = { cookie: "", entry: null, mint: null };
     if (!v1NumericId || !matchedGio) return empty;
-    const budget = new Promise<typeof empty>((resolve) => setTimeout(() => resolve(empty), 5000));
     const work = (async () => {
       let hit: LiveChannelItem | null = null;
       try {
@@ -2591,6 +2590,7 @@ async function resolveDirectPlayCandidates(
       }
       return { cookie, entry: hit, mint };
     })();
+    const budget = new Promise<typeof empty>((resolve) => setTimeout(() => resolve(empty), 5000));
     return Promise.race([work, budget]);
   })();
   const [tgCandidates, regularCookie, starCookie, playlist] = await Promise.all([
@@ -2868,6 +2868,17 @@ async function loadCatalogueForId(
 const STREAM_CATALOGUE_BUDGET_MS = 8_000;
 
 /**
+ * The same budget for a container probe, which is a much cheaper question.
+ *
+ * A probe only has to say "this is DASH / HLS / MPEG-TS" so the player can pick a library; the
+ * media request that follows still has the longer budget. Letting the probe sit for eight
+ * seconds is how a cold start became a 503 from the platform proxy: the browser had sent
+ * `/api/live/stream/jio%3A559.mpd?probe=1`, nothing had answered, and the proxy gave up before
+ * our handler produced anything at all.
+ */
+const STREAM_PROBE_BUDGET_MS = 3_500;
+
+/**
  * Resolve with `work`, or with the fallback once `ms` has passed — whichever is first.
  *
  * A route handler that outlives the platform proxy is answered with a 502 that never reaches
@@ -2875,7 +2886,10 @@ const STREAM_CATALOGUE_BUDGET_MS = 8_000;
  * with a status we chose, keeps the failure legible. The work is not cancelled: it still
  * populates the cache, so a retry is fast.
  */
-async function withBudget<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+export async function withBudget<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  // `Promise.race` attaches handlers to every input, so a work leg that rejects *after* the
+  // timer won is observed by the race and cannot become an unhandled rejection. Measured, not
+  // assumed: a test that drops the racer's rejection still reports nothing to Node.
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
@@ -4754,15 +4768,21 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       return new Response(handoff.body, { status: 200, headers: handoff.headers });
     }
 
-    const pool = await withBudget(loadCatalogueForId(cfg, rawId, false), STREAM_CATALOGUE_BUDGET_MS, []);
+    const pool = await withBudget(
+      loadCatalogueForId(cfg, rawId, false),
+      isProbe ? STREAM_PROBE_BUDGET_MS : STREAM_CATALOGUE_BUDGET_MS,
+      [],
+    );
     const ch = pool.find((c) => c.id === rawId || c.rawId === rawId);
     if (!ch) {
       // An empty pool means the catalogue never arrived, which is a different problem from an
-      // id that is genuinely absent — and the player should be told which. 503 rather than 502:
-      // this response came from us, so it is retryable and it names the source.
+      // id that is genuinely absent — and the player should be told which. 504 rather than 503:
+      // this response came from us and carries our JSON, whereas a 503 with an empty body comes
+      // from the platform's dev proxy before any handler ran. Two very different fixes, and the
+      // status is the only thing that tells them apart from the browser console.
       if (pool.length === 0) {
         const source = /^(jio|tg|st|xt):/i.exec(rawId)?.[1]?.toLowerCase() ?? "live";
-        return jsonResponse(503, {
+        return jsonResponse(504, {
           ok: false,
           error: `The ${source} catalogue did not load in time, so this channel could not be resolved. Press Retry — the catalogue keeps loading in the background.`,
         });

@@ -60,12 +60,14 @@ describe("stream route source scoping", () => {
     expect(portalCalls).toEqual([]);
   });
 
-  it("answers 503 with a retryable message when the catalogue cannot load", async () => {
+  it("answers 504 with a retryable message when the catalogue cannot load", async () => {
     // Nothing answers: the playlist is refused and the GioTV fallback is refused too.
     stubNetwork([]);
 
     const res = await openStream("jio:204");
-    expect(res.status).toBe(503);
+    // 504, not 503: a 503 with an empty body is the platform's dev proxy giving up before any
+    // handler ran, and the two need completely different fixes. This one came from us.
+    expect(res.status).toBe(504);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("jio");
     expect(body.error).toContain("Press Retry");
