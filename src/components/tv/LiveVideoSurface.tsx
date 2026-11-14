@@ -57,9 +57,9 @@ interface LiveVideoSurfaceProps {
   muted: boolean;
   reloadNonce: number;
   selectedAudioTrack: number;
-  onAudioTracksChange?: (tracks: AudioTrackOption[], activeIndex: number) => void;
-  onContainerDetected?: (kind: string) => void;
-  onAutoMuted?: () => void;
+  onAudioTracksChange?: ((tracks: AudioTrackOption[], activeIndex: number) => void) | undefined;
+  onContainerDetected?: ((kind: string) => void) | undefined;
+  onAutoMuted?: (() => void) | undefined;
   /**
    * The media element itself, handed to whoever draws the chrome.
    *
@@ -176,34 +176,66 @@ function ensureNoReferrerMeta(): void {
   if (meta.content !== "no-referrer") meta.content = "no-referrer";
 }
 
-let scriptsPromise: Promise<void> | null = null;
+/**
+ * The vendor engines, loaded **one at a time and only when the stream needs one**.
+ *
+ * They used to arrive as a trio before anything else happened: 414 KB of hls.js, 218 KB of mpegts
+ * and 680 KB of Shaka, all before the player even asked the relay what the channel was. That is
+ * 1.3 MB of download in front of the first frame -- and on a cold phone it is the difference
+ * between a player that starts and one that looks broken.
+ *
+ * An AK TV channel is HLS. It needs hls.js and nothing else. Shaka is only for DASH, mpegts.js only
+ * for raw MPEG-TS, so each waits for the moment the probe actually says it is needed.
+ */
+type EngineName = "hls" | "shaka" | "mpegts";
 
+const ENGINE_SRC: Record<EngineName, string> = {
+  hls: "/vendor/hls.min.js",
+  shaka: "/vendor/shaka-player.compiled.js",
+  mpegts: "/vendor/mpegts.js",
+};
+
+const enginePromises = new Map<EngineName, Promise<void>>();
+
+function engineReady(name: EngineName): boolean {
+  if (typeof window === "undefined") return false;
+  if (name === "hls") return Boolean(window.Hls);
+  if (name === "shaka") return Boolean(window.shaka);
+  return Boolean(window.mpegts);
+}
+
+function loadScript(src: string): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (document.querySelector(`script[src="${src}"]`)) {
+      resolve();
+      return;
+    }
+    const el = document.createElement("script");
+    el.src = src;
+    el.async = true;
+    el.onload = () => resolve();
+    el.onerror = () => resolve();
+    document.head.appendChild(el);
+  });
+}
+
+function ensureEngine(name: EngineName): Promise<void> {
+  if (typeof window === "undefined") return Promise.resolve();
+  ensureNoReferrerMeta();
+  if (engineReady(name)) return Promise.resolve();
+  const existing = enginePromises.get(name);
+  if (existing) return existing;
+  const promise = loadScript(ENGINE_SRC[name]).then(() => undefined);
+  enginePromises.set(name, promise);
+  return promise;
+}
+
+/** HLS is the only engine every AK TV channel needs, so it is the only one waited on up front. */
 function ensurePlayerEnginesLoaded(): Promise<void> {
   if (typeof window === "undefined") return Promise.resolve();
   ensureNoReferrerMeta();
-  if (window.mpegts && window.Hls && window.shaka) return Promise.resolve();
-  if (scriptsPromise) return scriptsPromise;
-
-  const loadScript = (src: string) =>
-    new Promise<void>((resolve) => {
-      if (document.querySelector(`script[src="${src}"]`)) {
-        resolve();
-        return;
-      }
-      const el = document.createElement("script");
-      el.src = src;
-      el.async = true;
-      el.onload = () => resolve();
-      el.onerror = () => resolve();
-      document.head.appendChild(el);
-    });
-
-  scriptsPromise = Promise.all([
-    loadScript("/vendor/mpegts.js"),
-    loadScript("/vendor/hls.min.js"),
-    loadScript("/vendor/shaka-player.compiled.js"),
-  ]).then(() => undefined);
-  return scriptsPromise;
+  if (window.Hls) return Promise.resolve();
+  return ensureEngine("hls");
 }
 
 export function LiveVideoSurface({
@@ -924,7 +956,11 @@ export function LiveVideoSurface({
       directModeRef.current = false;
       const shaka = window.shaka;
       if (!shaka) {
-        reportError("DASH playback engine did not load.");
+        // Called before the DASH engine was needed: fetch it, then come back. `cleanup()` above has
+        // already torn the previous player down, so this is the only attempt in flight.
+        void ensureEngine("shaka").then(() => {
+          if (!cancelled) startDash(url, matched);
+        });
         return;
       }
       onContainerDetected?.("DASH");
@@ -1063,7 +1099,13 @@ export function LiveVideoSurface({
       cleanup();
       directModeRef.current = false;
       onAudioTracksChange?.([], -1);
-      if (!window.mpegts || !window.mpegts.isSupported()) {
+      if (!window.mpegts) {
+        void ensureEngine("mpegts").then(() => {
+          if (!cancelled) startMpegTs(url, fallbackToHls);
+        });
+        return;
+      }
+      if (!window.mpegts.isSupported()) {
         startHls(streamUrl(".m3u8"));
         return;
       }
@@ -1096,7 +1138,15 @@ export function LiveVideoSurface({
       directModeRef.current = false;
       setHasError(false);
       setStatusMsg(`Connecting to ${channelName}…`);
-      await ensurePlayerEnginesLoaded();
+      /*
+       * Download the engine *while* the relay is being asked about the channel, not before it.
+       *
+       * These used to be strictly sequential: 414 KB of hls.js, then the probe, then the manifest.
+       * On a cold phone that is a visible extra second of black, for two things that have no
+       * reason to wait for each other. The script is only needed when a player is actually
+       * attached, so every path below awaits `enginesReady` exactly at that point.
+       */
+      const enginesReady = ensurePlayerEnginesLoaded();
       if (cancelled) return;
 
       const forceRefresh = localRetry > 0 || reloadNonce > 0;
@@ -1114,6 +1164,8 @@ export function LiveVideoSurface({
       let directAttempted = false;
       if (preferDirectFirst) {
         directAttempted = true;
+        await enginesReady;
+        if (cancelled) return;
         const startedDirect = await tryBrowserDirect(forceRefresh);
         if (startedDirect || cancelled) return;
       }
@@ -1123,7 +1175,10 @@ export function LiveVideoSurface({
       const wantDash = (container || "").toLowerCase() === "dash";
       const probeExt = wantDash ? ".mpd" : ".ts";
       try {
-        const res = await fetch(streamUrl(probeExt, true), { signal: probeCtrl.signal });
+        // Both at once: the probe over the network, the engine over the wire. Whichever is slower
+        // decides, and neither waits for the other.
+        const [res] = await Promise.all([fetch(streamUrl(probeExt, true), { signal: probeCtrl.signal }), enginesReady]);
+        if (cancelled) return;
         clearTimeout(timer);
         if (!res.ok) {
           const j = (await res.json().catch(() => ({}))) as {
@@ -1164,7 +1219,9 @@ export function LiveVideoSurface({
         else startMpegTs(streamUrl(".ts"), true);
       } catch {
         clearTimeout(timer);
-        if (!cancelled && !directAttempted) {
+        await enginesReady;
+        if (cancelled) return;
+        if (!directAttempted) {
           directAttempted = true;
           const rescued = await tryBrowserDirect(forceRefresh);
           if (rescued || cancelled) return;

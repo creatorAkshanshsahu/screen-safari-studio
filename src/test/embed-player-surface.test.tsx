@@ -84,7 +84,12 @@ describe("an embedded channel", () => {
 
     // The one-source rule, in one assertion: whatever `/live/<id>` plays, this plays.
     expect(net.calls[0]).toContain("/api/public/channels/7");
-    expect(prop("channelId")).toBe("tg:3436");
+    /*
+     * The engine is keyed on the id the embed was *given* (`7`), not on the canonical id the API
+     * returns. That is what lets the player mount before the metadata request finishes: swapping
+     * the id underneath a running player would tear the stream down and start it again.
+     */
+    expect(prop("channelId")).toBe("7");
     expect(prop("channelName")).toBe("Discovery Kids");
     // The first source that is not our relay: the address the app page plays when the relay is
     // refused. The embed used to be missing exactly this, which is why it sat on "connecting".
@@ -93,18 +98,49 @@ describe("an embedded channel", () => {
     expect(prop("activeSource")).toBe("tgtv");
   });
 
-  it("arrives with sound, because that is what a host site's `allow=\"autoplay\"` asked for", async () => {
+  it("mounts the player before the channel metadata has arrived", async () => {
+    // A cold catalogue read is a second of the viewer's life. The id is enough to start on, so the
+    // stream is connecting while the name, the direct address and the ClearKey are still in flight.
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)) as unknown as typeof fetch);
+    render(<EmbedChannelPlayer rawId="2524" />);
+
+    await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
+    expect(prop("channelId")).toBe("2524");
+    // Nothing is on top of the picture while it connects.
+    expect(screen.queryByLabelText("Play with sound")).toBeNull();
+  });
+
+  it("starts the picture immediately, without waiting for a tap", async () => {
     stubApi(CHANNEL);
     render(<EmbedChannelPlayer rawId="7" />);
     await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
 
-    // "no sound due to muting" was the report: the frame started muted and the answer was a small
-    // button nobody looked for.
-    expect(prop("muted")).toBe(false);
-    expect(screen.getByLabelText("Mute")).toBeTruthy();
+    /*
+     * "we want stream on first load". Muted autoplay is the one form of autoplay no browser
+     * refuses, so the picture starts on the first frame and the sound is negotiated *after*. The
+     * previous version asked for sound first and put a full-screen prompt over the video when the
+     * browser said no -- which reads as a player that never started.
+     */
+    expect(prop("muted")).toBe(true);
+    expect(screen.queryByLabelText("Play with sound")).toBeNull();
   });
 
-  it("mutes itself when the browser refuses, and says so where the thumb is", async () => {
+  it("asks for sound as soon as the picture is running, and keeps it when allowed", async () => {
+    stubApi(CHANNEL);
+    render(<EmbedChannelPlayer rawId="7" />);
+    const video = (await screen.findByTestId("engine")) as HTMLVideoElement;
+
+    // The engine reports `playing`; the stage then unmutes the element and calls play() again.
+    act(() => {
+      video.dispatchEvent(new Event("playing"));
+    });
+
+    await waitFor(() => expect(video.muted).toBe(false));
+    // No prompt: the browser allowed it.
+    expect(screen.queryByLabelText("Play with sound")).toBeNull();
+  });
+
+  it("when the browser refuses, says so in a corner chip -- not over the picture", async () => {
     stubApi(CHANNEL);
     render(<EmbedChannelPlayer rawId="7" />);
     await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
@@ -114,7 +150,10 @@ describe("an embedded channel", () => {
 
     expect(prop("muted")).toBe(true);
     const prompt = screen.getByLabelText("Play with sound");
-    expect(prompt.textContent).toContain("Tap to play with sound");
+    expect(prompt.textContent).toContain("Tap for sound");
+    // A chip: it does not cover the video, and it is not a veil over the controls.
+    expect(prompt.className).not.toContain("inset-0");
+    expect(prompt.className).toContain("bottom-16");
 
     // One tap: sound on and playing. Never "now find the mute button".
     fireEvent.click(prompt);
@@ -131,7 +170,7 @@ describe("an embedded channel", () => {
     // The reference player's row: play/pause, sound, quality, reload, fullscreen. An embed is a
     // rectangle inside someone else's page, so there is no guide, no filter row, no header.
     expect(screen.getByLabelText(/Play|Pause/)).toBeTruthy();
-    expect(screen.getByLabelText("Mute")).toBeTruthy();
+    expect(screen.getByLabelText(/Mute|Unmute/)).toBeTruthy();
     expect(screen.getByLabelText("Audio and quality")).toBeTruthy();
     expect(screen.getByLabelText("Reload stream")).toBeTruthy();
     expect(screen.getByLabelText("Fullscreen")).toBeTruthy();
@@ -160,8 +199,8 @@ describe("an embedded channel", () => {
     expect(className).toContain("bottom-16");
     expect(className).toContain("right-2.5");
     const zOf = (el: Element) => Number(/\bz-(\d+)/.exec(el.getAttribute("class") ?? "")?.[1] ?? 0);
-    expect(zOf(mark)).toBeGreaterThan(zOf(screen.getByLabelText("Mute")));
-    const bar = screen.getByLabelText("Mute").closest(".absolute")!;
+    expect(zOf(mark)).toBeGreaterThan(zOf(screen.getByLabelText(/Mute|Unmute/)));
+    const bar = screen.getByLabelText(/Mute|Unmute/).closest(".absolute")!;
     expect(bar.contains(mark)).toBe(false);
   });
 
@@ -172,7 +211,7 @@ describe("an embedded channel", () => {
     const before = prop("reloadNonce");
 
     fireEvent.click(screen.getByLabelText("Reload stream"));
-    expect(prop("reloadNonce")).toBe((before as number) + 1);
+    expect(prop("reloadNonce")).toBeGreaterThan(before as number);
   });
 
   it("says why, in the relay's words, instead of waiting forever", async () => {

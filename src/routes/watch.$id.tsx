@@ -4,23 +4,62 @@ import { Button } from "@/components/ui/button";
 import { ArrowLeft, Play, Pause, RotateCcw, RotateCw, SkipForward, Subtitles, Maximize, ListVideo, Server, RefreshCw, Info, Repeat } from "lucide-react";
 import hero from "@/assets/hero.jpg";
 import { titles, poster } from "@/lib/catalog";
+import { LivePlayerContent } from "@/routes/live";
+
+/**
+ * `/watch/<something>` is two things in this product.
+ *
+ * It is the reference site's name for a **live channel** (`/watch/143`), and it is where the movie
+ * and series rails have always sent people (`/watch/dune`). Both used to be declared as routes on
+ * the same path -- `watch.$id.tsx` and `watch_.$channel.tsx` -- and TanStack resolved the collision
+ * silently in favour of the film player. So `/watch/2524` opened a movie, and every shared channel
+ * link, every embed's STREAMR mark and every snippet this app prints pointed at the wrong page.
+ *
+ * A path cannot be two routes, so it is one route that decides from the id: a channel is named by a
+ * number (`2524`) or a prefixed key (`tg:0-9-pictures`), a title by a slug. Same rule the catalogue
+ * follows, and checkable without a network request.
+ */
+export function looksLikeLiveChannel(id: string): boolean {
+  return /^\d+$/.test(id) || /^(tg|st|jio|xt):/i.test(id);
+}
 
 export const Route = createFileRoute("/watch/$id")({
-  head: () => ({
-    meta: [
-      { title: "Now Watching — Streamr" },
-      { name: "description", content: "Movie and series player with episodes and controls." },
-      { property: "og:title", content: "Now Watching — Streamr" },
-      { property: "og:description", content: "Movie and series player with episodes and controls." },
-      { property: "og:type", content: "website" },
-      { name: "twitter:card", content: "summary_large_image" },
-    ],
-  }),
-  component: Player,
+  head: ({ params }) => {
+    const id = decodeURIComponent(params.id);
+    return looksLikeLiveChannel(id)
+      ? {
+          meta: [
+            { title: `Watch live — ${id} · Streamr` },
+            { name: "referrer", content: "no-referrer" },
+            { name: "description", content: "Watch this AK TV channel live." },
+            { property: "og:title", content: "Watch live — Streamr" },
+            { property: "og:description", content: "Watch this AK TV channel live." },
+            { property: "og:type", content: "video.other" },
+            { name: "twitter:card", content: "summary_large_image" },
+          ],
+        }
+      : {
+          meta: [
+            { title: "Now Watching — Streamr" },
+            { name: "description", content: "Movie and series player with episodes and controls." },
+            { property: "og:title", content: "Now Watching — Streamr" },
+            { property: "og:description", content: "Movie and series player with episodes and controls." },
+            { property: "og:type", content: "website" },
+            { name: "twitter:card", content: "summary_large_image" },
+          ],
+        };
+  },
+  component: WatchRoute,
 });
 
-function Player() {
+function WatchRoute() {
   const { id } = Route.useParams();
+  const decoded = decodeURIComponent(id);
+  if (looksLikeLiveChannel(decoded)) return <LivePlayerContent initialChannelId={decoded} />;
+  return <Player id={decoded} />;
+}
+
+function Player({ id }: { id: string }) {
   const t = titles.find((x) => x.id === id) ?? titles[0];
   const [playing, setPlaying] = useState(true);
   const [eps, setEps] = useState(false);
