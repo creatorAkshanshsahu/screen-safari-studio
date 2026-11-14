@@ -436,7 +436,10 @@ export function LiveVideoSurface({
      *   2. Shaka's `registerRequestFilter` appends `?__hdnea__=<token>` to MANIFEST & SEGMENT URIs,
      *   3. ClearKey hex pairs are normalized and bound to the MPD's `cenc:default_KID`.
      */
-    const tryBrowserDirect = async (forceRefresh: boolean): Promise<boolean> => {
+    const tryBrowserDirect = async (
+      forceRefresh: boolean,
+      seed?: DirectPlayCandidate,
+    ): Promise<boolean> => {
       if (cancelled || !videoRef.current) return false;
       ensureNoReferrerMeta();
 
@@ -803,6 +806,11 @@ export function LiveVideoSurface({
         return false;
       };
 
+      // A route that knows the exact URL, token and keys for this channel hands them over
+      // rather than describing the problem; try that before asking for candidates again.
+      if (seed && (await attemptAll([seed]))) return true;
+      if (cancelled) return false;
+
       if (await attemptAll(await fetchCandidates(forceRefresh))) return true;
       if (cancelled) return false;
       if (!forceRefresh) {
@@ -1030,8 +1038,19 @@ export function LiveVideoSurface({
         const res = await fetch(streamUrl(probeExt, true), { signal: probeCtrl.signal });
         clearTimeout(timer);
         if (!res.ok) {
-          const j = (await res.json().catch(() => ({}))) as { error?: string };
+          const j = (await res.json().catch(() => ({}))) as {
+            error?: string;
+            directPlay?: DirectPlayCandidate;
+          };
           probeCtrl.abort();
+          // Some channels cannot be proxied at all — their stream lives on a CDN that refuses
+          // the server's address. The route answers with the exact recipe (URL, token, keys) it
+          // could not use, so play that directly rather than asking for a second opinion.
+          if (j.directPlay && !cancelled) {
+            directAttempted = true;
+            if (await tryBrowserDirect(forceRefresh, j.directPlay)) return;
+            if (cancelled) return;
+          }
           // When maxTV/Cloudflare Worker proxy gets HTTP 403/502, rescue the channel immediately
           // via Browser-Direct CDN playback matched by channel name/ID!
           if (!cancelled && !directAttempted) {

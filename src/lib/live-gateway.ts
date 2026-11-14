@@ -1163,6 +1163,48 @@ export function defaultKids(mpd: string): string[] {
   return [...out];
 }
 
+/**
+ * ClearKey material carried *inside* the playlist, needing no request.
+ *
+ * Two shapes appear in the wild, often in the same file:
+ *   `#KODIPROP:…license_key={"keys":[{"kty":"oct","kid":"aa…","k":"00…"}]}`
+ *   `#KODIPROP:…license_key=kid:key,kid:key`
+ *
+ * The JSON form used to be fed to the `kid:key` splitter, which produced a pair whose key id was
+ * the literal text `{"keys":[{"kty"` — discarded downstream as unparseable, so a channel that
+ * declared its keys perfectly clearly ended up with none at all.
+ */
+function inlineClearKeys(licenseKey: string | undefined): ClearKeyPair[] {
+  const raw = (licenseKey || "").trim();
+  if (!raw || /^https?:\/\//i.test(raw)) return [];
+  if (raw.startsWith("{") || raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      const list = Array.isArray(parsed)
+        ? parsed
+        : ((parsed as { keys?: unknown }).keys as unknown[] | undefined) ?? [];
+      if (!Array.isArray(list)) return [];
+      const out: ClearKeyPair[] = [];
+      for (const item of list) {
+        if (!item || typeof item !== "object") continue;
+        const rec = item as Record<string, unknown>;
+        const kid = String(rec["kid"] ?? rec["keyId"] ?? "").trim();
+        const k = String(rec["k"] ?? rec["key"] ?? "").trim();
+        if (kid && k) out.push({ kid, k });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+  const out: ClearKeyPair[] = [];
+  for (const pair of raw.split(",")) {
+    const i = pair.indexOf(":");
+    if (i > 0) out.push({ kid: pair.slice(0, i).trim(), k: pair.slice(i + 1).trim() });
+  }
+  return out;
+}
+
 /** The key endpoint the playlist advertises, when it is HTTPS on the playlist's own host. */
 function jioLicenseUrl(entry: ParsedM3uEntry, siteHost: string): string | null {
   const raw = (entry.licenseKey || "").trim();
@@ -1183,14 +1225,8 @@ const jioKeyCache = new Map<string, { keys: ClearKeyPair[]; until: number }>();
 
 /** Reads the provider's key document. Keys stay in memory and are never written to disk. */
 async function jioKeysFor(entry: ParsedM3uEntry, siteHost: string): Promise<ClearKeyPair[]> {
-  // Inline `kid:key` needs no request.
-  const inline: ClearKeyPair[] = [];
-  if (entry.licenseKey && !/^https?:\/\//i.test(entry.licenseKey)) {
-    for (const pair of entry.licenseKey.split(",")) {
-      const i = pair.indexOf(":");
-      if (i > 0) inline.push({ kid: pair.slice(0, i).trim(), k: pair.slice(i + 1).trim() });
-    }
-  }
+  // Inline keys need no request, in either the JSON or the `kid:key` shape.
+  const inline: ClearKeyPair[] = inlineClearKeys(entry.licenseKey);
   const url = jioLicenseUrl(entry, siteHost);
   if (!url) return inline;
 
@@ -2350,6 +2386,43 @@ async function walkPlaylistRedirector(
   return { finalUrl: "", redirectHops: hops, lastStatus, ok: false };
 }
 
+/** A Jio CDN address: CORS-open to a viewer's browser, and refused to a worker's address. */
+function isJioCdnHost(url: string): boolean {
+  try {
+    return new URL(url).hostname.toLowerCase().endsWith(".cdn.jio.com");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The channel's own playlist entry, if the id names one. Cheap: both catalogues are cached,
+ * and an id carries its source in its prefix.
+ */
+async function loadOwnEntry(cfg: GatewayConfig, rawId: string): Promise<LiveChannelItem | null> {
+  const id = rawId.toLowerCase();
+  if (!id.startsWith("tg:") && !id.startsWith("jio:")) return null;
+  const pool = id.startsWith("tg:") ? await loadTgTvCached(cfg, false) : await loadJioCached(cfg, false);
+  return pool.find((c) => c.id === rawId || c.rawId === rawId) ?? null;
+}
+
+/**
+ * A channel entry expressed as something the browser can play by itself.
+ *
+ * The token is carried as the entry's own `__hdnea__` value rather than the whole cookie: the
+ * player appends it to each request with replace-kept semantics, so every other query
+ * parameter survives and an already-signed URL is left alone.
+ */
+function directRecipeFor(ch: LiveChannelItem, label: string): DirectPlayCandidate {
+  return {
+    label,
+    url: ch.cmd!,
+    cookie: extractHdneaToken(ch.cookie),
+    clearKeys: ch.drm?.keys ? pairsToHexRecord(ch.drm.keys) : {},
+    container: ch.mediaType === "hls" ? "hls" : "dash",
+  };
+}
+
 async function resolveDirectPlayCandidates(
   cfg: GatewayConfig,
   rawId: string,
@@ -2511,23 +2584,17 @@ async function resolveDirectPlayCandidates(
     : [...tgList, ...redirectList, ...jioList];
   for (const c of ordered) pushCandidate(c);
 
-  // 3. Also include direct HTTPS M3U entry if `tg:` or `jio:` came from a custom M3U playlist.
-  if (candidates.length === 0) {
-    const pool = rawId.startsWith("tg:")
-      ? await loadTgTvCached(cfg, false)
-      : rawId.startsWith("jio:")
-        ? await loadJioCached(cfg, false)
-        : [];
-    const ch = pool.find((c) => c.id === rawId || c.rawId === rawId);
-    if (ch?.cmd && /^https:\/\//i.test(ch.cmd) && !ch.cmd.includes("allinonereborn")) {
-      pushCandidate({
-        label: "Playlist Direct",
-        url: ch.cmd,
-        cookie: extractHdneaToken(ch.cookie),
-        clearKeys: ch.drm?.keys ? pairsToHexRecord(ch.drm.keys) : {},
-        container: ch.mediaType === "hls" ? "hls" : "dash",
-      });
-    }
+  // 3. The channel's own playlist entry, when the playlist is where the id came from.
+  //
+  // This used to run only if nothing else had produced a candidate, which kept the one entry
+  // we know is right for *this* id out of the list whenever GioTV or the TG RPC had anything
+  // to say. A `tg:` kids channel is the case that matters: its playlist entry points straight
+  // at a Jio CDN address with its own ClearKeys, and the CDN sends `Access-Control-Allow-Origin:
+  // *` to a residential browser while refusing the worker's address with 450. That entry is
+  // the channel's best candidate, so it is always included.
+  const ownEntry = await loadOwnEntry(cfg, rawId);
+  if (ownEntry?.cmd && /^https:\/\//i.test(ownEntry.cmd) && !ownEntry.cmd.includes("allinonereborn")) {
+    pushCandidate(directRecipeFor(ownEntry, "Playlist Direct"));
   }
 
   // 4. Never waste player time on a provably-expired token when the same URL also has a
@@ -2613,6 +2680,11 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
     mediaType: jioMediaType(e.url),
     ...(e.userAgent ? { userAgent: e.userAgent } : {}),
     ...(e.cookie ? { cookie: e.cookie } : {}),
+    // A TG playlist entry that declares ClearKeys is usually a Jio CDN channel wearing a TG
+    // id. Without its keys it can only ever show a black frame, however well it connects.
+    ...(inlineClearKeys(e.licenseKey).length
+      ? { drm: { type: "clearkey" as const, keys: inlineClearKeys(e.licenseKey) } }
+      : {}),
   }));
 }
 
@@ -4596,6 +4668,17 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
 
     if (ch.source === "tgtv") {
       if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This TG TV channel has no stream URL" });
+      // Some TG playlist entries are not on TG's host at all: they point at a Jio CDN address,
+      // which answers the worker's egress with 450/451 and the viewer's browser with 200 and
+      // `Access-Control-Allow-Origin: *`. Proxying one can only fail, so say so immediately and
+      // hand over the recipe instead of spending a round trip to be refused.
+      if (isJioCdnHost(ch.cmd)) {
+        return jsonResponse(502, {
+          ok: false,
+          error: `This channel streams from the Jio CDN, which refuses the server's address (HTTP 450). It is being played directly from your browser instead.`,
+          directPlay: directRecipeFor(ch, "TG playlist · browser-direct"),
+        });
+      }
       return proxyMediaStream(
         ch.cmd,
         "xtream",
