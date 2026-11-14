@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { DirectPlayCandidate } from "@/lib/live-gateway";
-import { extractHdneaParam, isHlsPlaylistUrl, sameUrlHost, withHdneaToken } from "@/lib/direct-token";
+import { extractHdneaParam, isHlsPlaylistUrl, sameTokenScope, withHdneaToken } from "@/lib/direct-token";
 
 export interface AudioTrackOption {
   index: number;
@@ -550,7 +550,7 @@ export function LiveVideoSurface({
               const u = request.uris[0];
               // App's target==origin rule: the token never leaves its own host (and never
               // touches relay queries). A URL that already carries a token keeps it.
-              if (u.includes("allinonereborn") || !sameUrlHost(u, cand.url)) return;
+              if (u.includes("allinonereborn") || !sameTokenScope(u, cand.url)) return;
               if (!activeToken) return;
               request.uris[0] = withHdneaToken(u, activeToken, false);
             });
@@ -562,7 +562,7 @@ export function LiveVideoSurface({
               // exactly like StreamRequestPolicy.observed(). Segments never overwrite session auth.
               if (type === manifestType && response.uri) {
                 try {
-                  if (!response.uri.includes("allinonereborn") && sameUrlHost(response.uri, cand.url)) {
+                  if (!response.uri.includes("allinonereborn") && sameTokenScope(response.uri, cand.url)) {
                     const learned = extractHdneaParam(response.uri);
                     if (learned) activeToken = learned;
                   }
@@ -688,7 +688,7 @@ export function LiveVideoSurface({
                 xhr.addEventListener("load", () => {
                   try {
                     const finalUrl = xhr.responseURL || "";
-                    if (finalUrl && isHlsPlaylistUrl(url) && sameUrlHost(finalUrl, cand.url)) {
+                    if (finalUrl && isHlsPlaylistUrl(url) && sameTokenScope(finalUrl, cand.url)) {
                       const learned = extractHdneaParam(finalUrl);
                       if (learned) activeToken = learned;
                     }
@@ -696,7 +696,7 @@ export function LiveVideoSurface({
                     // keep current token
                   }
                 });
-                if (!activeToken || url.includes("allinonereborn") || !sameUrlHost(url, cand.url)) return;
+                if (!activeToken || url.includes("allinonereborn") || !sameTokenScope(url, cand.url)) return;
                 const signed = withHdneaToken(url, activeToken, false);
                 if (signed !== url) xhr.open("GET", signed, true);
               } catch {
@@ -748,7 +748,7 @@ export function LiveVideoSurface({
                 activeSource === "jio"
                   ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
                   : activeSource === "tgtv"
-                    ? "This TG TV stream was interrupted. Press Retry to reconnect."
+                    ? "This AK TV stream was interrupted. Press Retry to reconnect."
                     : "Live HLS stream interrupted. Press Retry to request a fresh stream token.",
               );
             }
@@ -948,7 +948,7 @@ export function LiveVideoSurface({
                     activeSource === "jio"
                       ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
                       : activeSource === "tgtv"
-                        ? "This TG TV stream was interrupted. Press Retry to reconnect."
+                        ? "This AK TV stream was interrupted. Press Retry to reconnect."
                         : "Live HLS stream interrupted. Press Retry to request a fresh stream token.",
                   );
                 }
@@ -959,7 +959,7 @@ export function LiveVideoSurface({
               activeSource === "jio"
                 ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
                 : activeSource === "tgtv"
-                  ? "This TG TV stream was interrupted. Press Retry to reconnect."
+                  ? "This AK TV stream was interrupted. Press Retry to reconnect."
                   : "Live HLS stream interrupted. Press Retry to request a fresh stream token.",
             );
           }
@@ -1019,7 +1019,7 @@ export function LiveVideoSurface({
         activeSource === "tgtv" ||
         /^(?:jio|tg):/i.test(channelId);
 
-      // JioTV and TG TV streams must play directly from the viewer's browser IP because
+      // JioTV and AK TV streams must play directly from the viewer's browser IP because
       // Cloudflare Worker datacenter egress IPs receive HTTP 450/451 from cdn.jio.com.
       // tryBrowserDirect already spends one cached-token pass plus one fresh-token pass,
       // so a failed direct attempt is never repeated after the proxy probe.

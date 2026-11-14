@@ -64,6 +64,40 @@ export function sameUrlHost(a: string, b: string): boolean {
   }
 }
 
+/**
+ * The `target == origin` rule, widened to the provider rather than the single hostname.
+ *
+ * The Android app compares hostnames, which works because it requests the same host it was
+ * given. A browser on a *reshared* playlist does not: those put the manifest on one CDN host
+ * and the segments on a sibling (`jiotvmblive.cdn.jio.com` → `jiotvpllive.cdn.jio.com`), and a
+ * strict hostname comparison then leaves every segment unsigned. The CDN answers 450/475 and
+ * HLS reports a fatal interruption after fetching a perfectly good manifest.
+ *
+ * Same registrable domain is the same provider, which is what the rule is protecting against:
+ * a token must never travel to an unrelated third party. It still refuses that.
+ */
+export function sameTokenScope(a: string, b: string): boolean {
+  let ha = "";
+  let hb = "";
+  try {
+    ha = new URL(a).hostname.toLowerCase();
+    hb = new URL(b).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!ha || !hb) return false;
+  if (ha === hb) return true;
+  const registered = (host: string): string => {
+    const parts = host.split(".");
+    // `example.co.uk` needs three labels; treating it as two would let `a.co.uk` sign for
+    // `b.co.uk`, which are unrelated sites. Anything shorter is treated as unscopeable.
+    const twoPartSuffix = /^(?:co|com|org|net|gov|ac|edu)\.[a-z]{2}$/.test(parts.slice(-2).join("."));
+    return parts.slice(twoPartSuffix ? -3 : -2).join(".");
+  };
+  const ra = registered(ha);
+  return ra === registered(hb) && ra.includes(".");
+}
+
 /** True for an HLS playlist URL (manifest/level/audio), as opposed to a media fragment. */
 export function isHlsPlaylistUrl(url: string): boolean {
   return /\.m3u8(?:[?#]|$)/i.test(url);

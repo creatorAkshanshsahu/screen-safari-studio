@@ -74,6 +74,30 @@ describe("a TG channel that lives on the Jio CDN", () => {
     expect(calls.urls.some((u) => u.includes("cdn.jio.com"))).toBe(false);
   });
 
+  it("hands over the recipe when any host refuses, not only a known Jio one", async () => {
+    // "Sonic Digital By Premium PlugX" answered 475 from a host that is not Jio's CDN. Guessing
+    // hostnames means the next reshare breaks the same way, so the refusal itself is the signal.
+    vi.stubGlobal("fetch", async (url: string) => {
+      const u = String(url);
+      if (u.includes("livetgtv.lovable.app")) {
+        return new Response(
+          `#EXTM3U\n#EXTINF:-1 tvg-id="9" group-title="Kids",Sonic Digital By Premium PlugX\nhttps://edge.premiumplugx.example/kids/sonic.mpd\n`,
+          { status: 200 },
+        );
+      }
+      return new Response("", { status: 475 });
+    });
+
+    const res = await open("tg:9");
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as {
+      error: string;
+      directPlay?: { url: string };
+    };
+    expect(body.error).toContain("475");
+    expect(body.directPlay?.url).toBe("https://edge.premiumplugx.example/kids/sonic.mpd");
+  });
+
   it("still proxies a TG channel that is on TG's own host", async () => {
     const calls = stubNetwork();
     // `cdn.tgtv.example` is not a Jio CDN, so the worker path is still correct for it.
