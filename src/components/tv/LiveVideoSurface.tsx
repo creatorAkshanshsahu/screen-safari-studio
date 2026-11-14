@@ -61,6 +61,15 @@ interface LiveVideoSurfaceProps {
   onContainerDetected?: (kind: string) => void;
   onAutoMuted?: () => void;
   /**
+   * The media element itself, handed to whoever draws the chrome.
+   *
+   * Play/pause, volume and "is it actually playing" live on the element, not on React state, and
+   * the element is owned here because the engine is the only thing allowed to attach hls.js, Shaka
+   * or mpegts to it. A caller that wants transport controls gets a handle instead of a second
+   * player -- the same reason the embed shares this component in the first place.
+   */
+  onMediaElement?: ((el: HTMLVideoElement | null) => void) | undefined;
+  /**
    * The ways out of a dead channel. The product rule is that a blank screen is the worst outcome,
    * so a refused stream must offer the next channel and the same channel on another host, not
    * only Retry -- retrying a host that just refused us is the least likely thing to work.
@@ -210,6 +219,7 @@ export function LiveVideoSurface({
   onAudioTracksChange,
   onContainerDetected,
   onAutoMuted,
+  onMediaElement,
   onNextChannel,
   onSwitchChannel,
 }: LiveVideoSurfaceProps) {
@@ -414,6 +424,12 @@ export function LiveVideoSurface({
     if (videoRef.current) videoRef.current.muted = muted;
   }, [muted]);
 
+  // Hand the element up once, and take it back on unmount. The callback is expected to be stable.
+  useEffect(() => {
+    onMediaElement?.(videoRef.current);
+    return () => onMediaElement?.(null);
+  }, [onMediaElement]);
+
   useEffect(() => {
     if (hlsRef.current && selectedAudioTrack >= 0) {
       hlsRef.current.audioTrack = selectedAudioTrack;
@@ -461,9 +477,18 @@ export function LiveVideoSurface({
       if (!el) return;
       try {
         await el.play();
-      } catch {
-        // Browsers block unmuted autoplay on initial page load with NotAllowedError.
-        // Fall back to muted playback and notify parent so the stream plays immediately.
+      } catch (e) {
+        /*
+         * Only a *policy* refusal is about the sound. Browsers block unmuted autoplay on a cold
+         * load with NotAllowedError; the answer there is to mute so the picture starts, and to tell
+         * the caller so it can offer one tap back to sound.
+         *
+         * Every other rejection -- an AbortError from a reload, a NotSupportedError from an element
+         * that is gone -- is a real fault that muting does not fix. Reporting those as "tap to play
+         * with sound" would hand the viewer a remedy for the wrong problem.
+         */
+        const name = (e as { name?: string } | null)?.name;
+        if (name !== "NotAllowedError") return;
         el.muted = true;
         onAutoMuted?.();
         await el.play().catch(() => undefined);

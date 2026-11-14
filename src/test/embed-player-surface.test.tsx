@@ -1,4 +1,5 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useEffect, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmbedChannelPlayer } from "@/components/tv/EmbedChannelPlayer";
 
@@ -7,12 +8,12 @@ import { EmbedChannelPlayer } from "@/components/tv/EmbedChannelPlayer";
  *
  * `EmbedChannelPlayer` is not a player of its own: it resolves the channel and hands the app's own
  * `LiveVideoSurface` exactly what the app's own page hands it. These tests pin both halves of that
- * -- the props crossing into the engine, and the small amount of chrome that is allowed around it
- * (a name strip, three controls, and the STREAMR mark that goes back to the channel's page).
+ * -- the props crossing into the engine, and the chrome that is allowed around it: the name strip,
+ * the reference player's transport bar, the tap-to-play-with-sound prompt, and the STREAMR mark
+ * that goes back to the channel's own page.
  *
- * The engine is stubbed: it needs a media element, hls.js and a real network. Its own wiring is
- * covered where it can be -- failure-remedies.test.ts canaries the parts that only a browser can
- * exercise.
+ * The engine is stubbed: it needs hls.js and a real network. The stub hands back a real `<video>`
+ * through `onMediaElement`, which is the same door the embed's transport controls use.
  */
 
 const ENGINE = vi.hoisted(() => ({ props: [] as Array<Record<string, unknown>> }));
@@ -23,7 +24,13 @@ const prop = (name: string) => ENGINE.props.at(-1)?.[name];
 vi.mock("@/components/tv/LiveVideoSurface", () => ({
   LiveVideoSurface: (props: Record<string, unknown>) => {
     ENGINE.props.push(props);
-    return <video data-testid="engine" />;
+    const ref = useRef<HTMLVideoElement | null>(null);
+    const bind = props["onMediaElement"] as ((el: HTMLVideoElement | null) => void) | undefined;
+    useEffect(() => {
+      bind?.(ref.current);
+      return () => bind?.(null);
+    }, [bind]);
+    return <video data-testid="engine" ref={ref} />;
   },
 }));
 
@@ -58,10 +65,14 @@ function atAddress(path: string) {
 beforeEach(() => {
   ENGINE.props.length = 0;
   atAddress("/embed/7");
+  // jsdom does not implement media playback; the embed only needs the promise and the flag.
+  vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("an embedded channel", () => {
@@ -75,24 +86,58 @@ describe("an embedded channel", () => {
     expect(net.calls[0]).toContain("/api/public/channels/7");
     expect(prop("channelId")).toBe("tg:3436");
     expect(prop("channelName")).toBe("Discovery Kids");
-    // `sources[1]` is the resolved direct address -- the one the embed used to be missing, which
-    // is why the app played and the embed sat on "connecting".
+    // The first source that is not our relay: the address the app page plays when the relay is
+    // refused. The embed used to be missing exactly this, which is why it sat on "connecting".
     expect(prop("directUrl")).toBe(CHANNEL.sources[1]);
     expect(prop("container")).toBe("hls");
     expect(prop("activeSource")).toBe("tgtv");
-    // Never unmuted on arrival: a host site did not ask to make noise.
-    expect(prop("muted")).toBe(true);
   });
 
-  it("is a player and nothing else -- no header, no guide, no filter row", async () => {
+  it("arrives with sound, because that is what a host site's `allow=\"autoplay\"` asked for", async () => {
+    stubApi(CHANNEL);
+    render(<EmbedChannelPlayer rawId="7" />);
+    await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
+
+    // "no sound due to muting" was the report: the frame started muted and the answer was a small
+    // button nobody looked for.
+    expect(prop("muted")).toBe(false);
+    expect(screen.getByLabelText("Mute")).toBeTruthy();
+  });
+
+  it("mutes itself when the browser refuses, and says so where the thumb is", async () => {
+    stubApi(CHANNEL);
+    render(<EmbedChannelPlayer rawId="7" />);
+    await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
+
+    // What the engine reports after a NotAllowedError: the picture started, the sound did not.
+    act(() => (ENGINE.props.at(-1)!["onAutoMuted"] as () => void)());
+
+    expect(prop("muted")).toBe(true);
+    const prompt = screen.getByLabelText("Play with sound");
+    expect(prompt.textContent).toContain("Tap to play with sound");
+
+    // One tap: sound on and playing. Never "now find the mute button".
+    fireEvent.click(prompt);
+    expect(prop("muted")).toBe(false);
+    expect(screen.queryByLabelText("Play with sound")).toBeNull();
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+  });
+
+  it("carries a transport bar, not a page of chrome", async () => {
     stubApi(CHANNEL);
     const { container } = render(<EmbedChannelPlayer rawId="7" />);
     await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
 
+    // The reference player's row: play/pause, sound, quality, reload, fullscreen. An embed is a
+    // rectangle inside someone else's page, so there is no guide, no filter row, no header.
+    expect(screen.getByLabelText(/Play|Pause/)).toBeTruthy();
+    expect(screen.getByLabelText("Mute")).toBeTruthy();
+    expect(screen.getByLabelText("Audio and quality")).toBeTruthy();
+    expect(screen.getByLabelText("Reload stream")).toBeTruthy();
+    expect(screen.getByLabelText("Fullscreen")).toBeTruthy();
+    expect(container.querySelectorAll("button")).toHaveLength(5);
     expect(screen.queryByText(/channel guide/i)).toBeNull();
     expect(screen.queryByText(/All channels/i)).toBeNull();
-    // Three controls, and no more: an embed is a rectangle inside someone else's page.
-    expect(container.querySelectorAll("button")).toHaveLength(3);
   });
 
   it("carries the STREAMR mark to the channel's own page, in the corner, on top", async () => {
@@ -109,18 +154,25 @@ describe("an embedded channel", () => {
     expect(mark.getAttribute("rel")).toContain("noopener");
     expect(mark.textContent).toContain("STREAMR");
 
-    // Bottom-right, and *not* inside the control row: an absolute child of a parent without a
-    // z-index wins against the player's overlay, while a row with one would cover it.
+    // Over the picture's corner, above the transport bar rather than behind it: an absolute child
+    // of a parent with no z-index compares directly against the player's own layers.
     const className = mark.getAttribute("class") ?? "";
-    expect(className).toContain("bottom-2.5");
+    expect(className).toContain("bottom-16");
     expect(className).toContain("right-2.5");
-    expect(className).toMatch(/\bz-30\b/);
-    const row = screen.getByRole("button", { name: "Unmute" }).parentElement!;
-    expect(row.contains(mark)).toBe(false);
-    // Both are absolute children of a parent with no z-index, so they are compared directly:
-    // the mark's 30 has to beat the row's 20, or the controls cover it again.
     const zOf = (el: Element) => Number(/\bz-(\d+)/.exec(el.getAttribute("class") ?? "")?.[1] ?? 0);
-    expect(zOf(mark)).toBeGreaterThan(zOf(row));
+    expect(zOf(mark)).toBeGreaterThan(zOf(screen.getByLabelText("Mute")));
+    const bar = screen.getByLabelText("Mute").closest(".absolute")!;
+    expect(bar.contains(mark)).toBe(false);
+  });
+
+  it("reloads through the engine, so a fresh token is one tap away", async () => {
+    stubApi(CHANNEL);
+    render(<EmbedChannelPlayer rawId="7" />);
+    await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
+    const before = prop("reloadNonce");
+
+    fireEvent.click(screen.getByLabelText("Reload stream"));
+    expect(prop("reloadNonce")).toBe((before as number) + 1);
   });
 
   it("says why, in the relay's words, instead of waiting forever", async () => {
@@ -149,7 +201,11 @@ describe("an embedded channel", () => {
 
   it("never shows a blank page for an id it cannot find", async () => {
     stubApi(
-      { ok: false, error: 'No channel matches "tg:does-not-exist". The playlist may have been re-sourced; read /api/public/channels for the current list.' },
+      {
+        ok: false,
+        error:
+          'No channel matches "tg:does-not-exist". The playlist may have been re-sourced; read /api/public/channels for the current list.',
+      },
       404,
     );
     render(<EmbedChannelPlayer rawId="tg:does-not-exist" />);
@@ -185,5 +241,25 @@ describe("?colour=", () => {
     // No inline override at all: the stylesheet's default accent stands, rather than a guess.
     const root = container.firstElementChild as HTMLElement;
     expect(root.style.getPropertyValue("--accent")).toBe("");
+  });
+});
+
+describe("the frame a host site draws", () => {
+  it("says it may be framed, instead of relying on nobody adding that header", async () => {
+    const { withEmbedFraming } = await import("@/server");
+
+    const embed = withEmbedFraming(
+      new Request("https://player.example/embed/2524"),
+      new Response("<html></html>", { headers: { "content-type": "text/html" } }),
+    );
+    expect(embed.headers.get("content-security-policy")).toContain("frame-ancestors *");
+    expect(embed.headers.get("access-control-allow-origin")).toBe("*");
+
+    // Everything that is not an embed keeps the app's own policy.
+    const live = withEmbedFraming(
+      new Request("https://player.example/live/2524"),
+      new Response("<html></html>", { headers: { "content-type": "text/html" } }),
+    );
+    expect(live.headers.get("content-security-policy")).toBeNull();
   });
 });

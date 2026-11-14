@@ -206,9 +206,8 @@ https://PLAYER/api/live/playlist.m3u?source=tgtv&filter=all
 ## The STREAMR mark
 
 Every embedded player shows a small STREAMR badge **over the channel itself**, in the
-**bottom-right corner** of the frame — outside the row of transport buttons, so it is never
-competing with Unmute/Reload/Fullscreen for the same tap. The SDK picker shows one under its
-channel grid too.
+**bottom-right corner** of the frame — above the transport bar, so it is never competing with
+sound/reload/fullscreen for the same tap. The SDK picker shows one under its channel grid too.
 
 The badge for a single channel points at **that channel's page on your site**, `/watch/<number>`,
 not at the front page. A viewer who likes what they are watching lands on the channel they were
@@ -228,6 +227,34 @@ already watching.
 
 The one thing it cannot survive is the host cropping the frame with `overflow:hidden` or negative
 margins. If you ever find a site doing that, the fix is commercial, not technical.
+
+## Sound
+
+The player starts **unmuted**. That is deliberate: if you embed it with
+
+```html
+allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+```
+
+you have told the browser the viewer wants to hear it, and starting muted answers that with a mute
+button the viewer has to go looking for.
+
+Browsers still refuse unmuted autoplay often enough that it has to be handled, so it is: the player
+asks for sound, and if the browser says no it mutes itself so the picture still starts, says
+**"Tap to play with sound"** across the picture, and comes back with sound on the first tap. One tap,
+one idea.
+
+## The transport bar
+
+The picture comes with the same bar the reference player uses, because it is the one a viewer
+coming from there already knows: **play/pause · sound · quality/language · reload · fullscreen**.
+Nothing beyond that — an embed is a rectangle inside your page, so there is no guide, no filter row
+and no header to scroll past.
+
+Quality is whatever the source serves; the button doubles as the audio-language picker when the
+stream carries more than one.
+
+---
 
 ## If a channel does not play on the host site
 
