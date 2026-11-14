@@ -2851,7 +2851,7 @@ const tgtvCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | 
 async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
   if (!cfg.tgtvPlaylistUrl) return [];
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 10000);
+  const timer = setTimeout(() => ctrl.abort(), TG_PLAYLIST_TIMEOUT_MS);
   let body = "";
   try {
     const res = await fetch(cfg.tgtvPlaylistUrl, {
@@ -2927,9 +2927,35 @@ async function fetchTgTvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]
   return [];
 }
 
+/** An in-flight catalogue read, so background warming cannot become a stampede. */
+let tgWarmInFlight: Promise<unknown> | null = null;
+
+/**
+ * Fetch the catalogue in the background if this instance does not have it.
+ *
+ * Never awaited and never throws: it exists so that the request after this one does not have to
+ * pay for the playlist. The request that triggers it can still time out, which is why the notice
+ * page retries by itself.
+ */
+async function warmCatalogue(env: unknown, request: Request): Promise<void> {
+  if (tgtvCache.items.length > 0 || tgWarmInFlight) return;
+  const cfg = getConfig(env, request);
+  if (!cfg.tgtvPlaylistUrl) return;
+  tgWarmInFlight = loadTgTvCached(cfg, false).finally(() => {
+    tgWarmInFlight = null;
+  });
+  await tgWarmInFlight.catch(() => undefined);
+}
+
 async function loadTgTvCached(cfg: GatewayConfig, force = false): Promise<LiveChannelItem[]> {
   if (!force && tgtvCache.items.length > 0 && Date.now() - tgtvCache.fetchedAt < CATALOGUE_TTL_MS) {
     return tgtvCache.items;
+  }
+  // Join a read already in flight rather than starting a second one: the background warm and the
+  // request that needs the answer are asking the same question.
+  if (tgWarmInFlight) {
+    await tgWarmInFlight.catch(() => undefined);
+    if (!force && tgtvCache.items.length > 0) return tgtvCache.items;
   }
   try {
     const live = await fetchTgTvCatalogue(cfg);
@@ -3085,8 +3111,22 @@ function akTvOnly<T extends { source: string }>(items: T[]): T[] {
   return items.filter((c) => c.source === "tgtv");
 }
 
-/** How long a channel open may spend learning the catalogue before answering anyway. */
-const STREAM_CATALOGUE_BUDGET_MS = 8_000;
+/** How long one read of the AK TV playlist may spend before it gives up. */
+const TG_PLAYLIST_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a channel open may spend learning the catalogue before answering anyway.
+ *
+ * This must be **greater than `TG_PLAYLIST_TIMEOUT_MS`**, and it was not: the budget was 8s while
+ * the fetch it wraps was allowed 10s. So on a cold instance the budget always expired first, the
+ * catalogue came back empty, and an embedded player rendered "The channel list is still loading"
+ * over a playlist that was arriving fine -- while the same channel on the same site's own page,
+ * which has no budget at all, loaded normally. That is precisely the "it doesn't match" report:
+ * two URLs for one channel, one waiting long enough and one not.
+ *
+ * A budget that is shorter than the work it wraps is not a deadline, it is a guaranteed failure.
+ */
+const STREAM_CATALOGUE_BUDGET_MS = 15_000;
 
 /**
  * The same budget for a container probe, which is a much cheaper question.
@@ -3097,7 +3137,7 @@ const STREAM_CATALOGUE_BUDGET_MS = 8_000;
  * `/api/live/stream/jio%3A559.mpd?probe=1`, nothing had answered, and the proxy gave up before
  * our handler produced anything at all.
  */
-const STREAM_PROBE_BUDGET_MS = 3_500;
+const STREAM_PROBE_BUDGET_MS = 6_000;
 
 /**
  * Resolve with `work`, or with the fallback once `ms` has passed — whichever is first.
@@ -5049,6 +5089,21 @@ function publicOriginFor(request: Request, url: URL): string {
 export async function maybeHandleLiveRequest(request: Request, env: unknown): Promise<Response | null> {
   const url = new URL(request.url);
   const path = url.pathname;
+
+  /*
+   * Start the catalogue read before anything waits on it.
+   *
+   * A cold instance pays the playlist fetch on its first request whatever we do, and a player
+   * makes several requests per channel. Kicking it off in the background means only the very first
+   * one can be slow. Not every path needs it, though: an `/embed/tgtv` section page fetches its own
+   * list from the browser and must paint without touching the catalogue at all.
+   */
+  const needsCatalogue =
+    path.startsWith("/api/live/stream/") ||
+    path === "/api/live/channels" ||
+    path === "/api/public/channels" ||
+    (path.startsWith("/embed/") && !/^\/embed\/(?:tgtv|jio|maxtv)\/?$/i.test(path));
+  if (needsCatalogue) void warmCatalogue(env, request);
 
   const isHandled =
     path.startsWith("/api/live/") ||
