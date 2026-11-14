@@ -26,6 +26,8 @@ export interface LiveChannelItem {
   /** Transport hints the playlist itself declares. */
   userAgent?: string;
   cookie?: string;
+  /** The referrer the playlist says this channel's host expects. */
+  referrer?: string;
   mediaType?: "hls" | "dash" | "mp4";
 }
 
@@ -1046,6 +1048,13 @@ interface ParsedM3uEntry {
   licenseKey: string;
   /** `#EXTVLCOPT:http-user-agent=…` — the playlist's own UA, required by the media host. */
   userAgent: string;
+  /**
+   * `#EXTVLCOPT:http-referrer=…` or `#EXTHTTP:{"referer":…}` — the page these reshares expect
+   * the request to come from. Many of them answer 403 to anything without it, which is the
+   * error this field exists to fix: the playlist was telling us the answer and we were not
+   * reading it.
+   */
+  referrer: string;
   /** `#EXTHTTP:{"cookie":"…"}` — a CDN token, only for the playlist host. */
   cookie: string;
 }
@@ -1065,6 +1074,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
   let preLicenseKey = "";
   let preUserAgent = "";
   let preCookie = "";
+  let preReferrer = "";
 
   const attrValue = (line: string, key: string): string => {
     const m = line.match(new RegExp(`${key}="([^"]*)"`, "i"));
@@ -1076,6 +1086,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
     preLicenseKey = "";
     preUserAgent = "";
     preCookie = "";
+    preReferrer = "";
   };
 
   for (let i = 0; i < lines.length; i++) {
@@ -1096,7 +1107,13 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
           logo: attrs["tvg-logo"] || "",
           group: attrs["group-title"] || "",
         },
-        ...{ licenseType: preLicenseType, licenseKey: preLicenseKey, userAgent: preUserAgent, cookie: preCookie },
+        ...{
+          licenseType: preLicenseType,
+          licenseKey: preLicenseKey,
+          userAgent: preUserAgent,
+          cookie: preCookie,
+          referrer: preReferrer,
+        },
       };
       resetPre();
 
@@ -1110,10 +1127,15 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
         const key = l.match(/^#KODIPROP:inputstream\.adaptive\.license_key=(\S+)/i);
         const ua = l.match(/^#EXTVLCOPT:http-user-agent=(\S+)/i);
         const cookie = l.match(/^#EXTHTTP:\{"cookie":"([^"]*)"\}/i);
+        // VLC's spelling, then the three JSON spellings seen in the wild.
+        const ref =
+          l.match(/^#EXTVLCOPT:http-referr?er=(\S+)/i) ||
+          l.match(/^#EXTHTTP:\{[^}]*"(?:referer|referrer|http-referer)"\s*:\s*"([^"]*)"/i);
         if (type) pending!.licenseType = type[1]!;
         if (key) pending!.licenseKey = key[1]!;
         if (ua) pending!.userAgent = ua[1]!;
         if (cookie) pending!.cookie = cookie[1]!;
+        if (ref) pending!.referrer = ref[1]!;
       }
       i = j - 1;
       continue;
@@ -1608,6 +1630,7 @@ async function fetchJioCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]>
       mediaType,
       userAgent: e.userAgent || JIO_UA_OVERRIDE,
       ...(e.cookie ? { cookie: e.cookie } : {}),
+    ...(e.referrer ? { referrer: e.referrer } : {}),
       ...(drm ? { drm } : {}),
     });
   }
@@ -2805,6 +2828,7 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
     mediaType: jioMediaType(e.url),
     ...(e.userAgent ? { userAgent: e.userAgent } : {}),
     ...(e.cookie ? { cookie: e.cookie } : {}),
+    ...(e.referrer ? { referrer: e.referrer } : {}),
     // A TG playlist entry that declares ClearKeys is usually a Jio CDN channel wearing a TG
     // id. Without its keys it can only ever show a black frame, however well it connects.
     ...(inlineClearKeys(e.licenseKey).length
@@ -3059,13 +3083,21 @@ async function signSegmentToken(
   url: string,
   mode: "mag" | "xtream",
   secret: string,
-  headers?: { ua?: string; ck?: string },
+  headers?: { ua?: string; ck?: string; rf?: string },
 ): Promise<string> {
   const enc = new TextEncoder();
   const signed: Record<string, unknown> = { u: url, m: mode };
   // Child requests (segments, sub-manifests) must keep the playlist's own UA and
   // cookie. Without them the Jio CDN answers 451 to the bare browser request.
-  if (headers?.ua) signed["h"] = { ua: headers.ua, ...(headers.ck ? { ck: headers.ck } : {}) };
+  if (headers?.ua || headers?.rf) {
+    signed["h"] = {
+      ...(headers.ua ? { ua: headers.ua } : {}),
+      ...(headers.ck ? { ck: headers.ck } : {}),
+      // The referrer is not a credential, but it is required by the same hosts, and a
+      // manifest that loads while its segments are refused is the exact failure this prevents.
+      ...(headers.rf ? { rf: headers.rf } : {}),
+    };
+  }
   const payload = toBase64Url(enc.encode(JSON.stringify(signed)));
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sigBuf = await crypto.subtle.sign("HMAC", key, enc.encode(payload));
@@ -3078,6 +3110,7 @@ interface VerifiedSegmentToken {
   m: "mag" | "xtream";
   ua?: string;
   ck?: string;
+  rf?: string;
 }
 
 async function verifySegmentToken(token: string, secret: string): Promise<VerifiedSegmentToken | null> {
@@ -3092,7 +3125,7 @@ async function verifySegmentToken(token: string, secret: string): Promise<Verifi
     const parsed = JSON.parse(new TextDecoder().decode(fromBase64Url(payload))) as {
       u?: string;
       m?: "mag" | "xtream";
-      h?: { ua?: string; ck?: string };
+      h?: { ua?: string; ck?: string; rf?: string };
     };
     if (!parsed?.u || !/^https?:\/\//i.test(parsed.u)) return null;
     return {
@@ -3100,6 +3133,7 @@ async function verifySegmentToken(token: string, secret: string): Promise<Verifi
       m: parsed.m === "xtream" ? "xtream" : "mag",
       ...(parsed.h?.ua ? { ua: parsed.h.ua } : {}),
       ...(parsed.h?.ck ? { ck: parsed.h.ck } : {}),
+      ...(parsed.h?.rf ? { rf: parsed.h.rf } : {}),
     };
   } catch {
     return null;
@@ -3112,7 +3146,7 @@ async function rewriteHlsManifestWeb(
   mode: "mag" | "xtream",
   publicOrigin: string,
   secret: string,
-  headers?: { ua?: string; ck?: string },
+  headers?: { ua?: string; ck?: string; rf?: string },
 ): Promise<string> {
   const lines = manifestText.split(/\r?\n/);
   const out: string[] = [];
@@ -3163,10 +3197,11 @@ function overrideHeadersFromToken(
   // its own `__hdnea__` token must not also be sent the playlist's coarse cookie, or the CDN
   // is asked to honour two credentials and answers 450.
   const keepCookie = Boolean(v.ck) && !(targetUrl && carriesOwnToken(targetUrl));
-  if (!v.ua && !keepCookie) return undefined;
+  if (!v.ua && !keepCookie && !v.rf) return undefined;
   const out: Record<string, string> = {};
   if (v.ua) out["User-Agent"] = v.ua;
   if (keepCookie && v.ck) out["Cookie"] = v.ck;
+  if (v.rf) out["Referer"] = v.rf;
   return Object.keys(out).length ? out : undefined;
 }
 
@@ -3189,15 +3224,17 @@ function carriesOwnToken(url: string): boolean {
 function tokenHeadersFrom(
   overrideHeaders?: Record<string, string>,
   targetUrl?: string,
-): { ua?: string; ck?: string } | undefined {
+): { ua?: string; ck?: string; rf?: string } | undefined {
   const ua = overrideHeaders?.["User-Agent"];
   const ck = overrideHeaders?.["Cookie"];
-  // Keep the user agent, drop the conflicting credential.
+  const rf = overrideHeaders?.["Referer"];
+  // Keep the user agent and the referrer, drop the conflicting credential.
   const keepCookie = Boolean(ck) && !(targetUrl && carriesOwnToken(targetUrl));
-  if (!ua && !keepCookie) return undefined;
-  const out: { ua?: string; ck?: string } = {};
+  if (!ua && !keepCookie && !rf) return undefined;
+  const out: { ua?: string; ck?: string; rf?: string } = {};
   if (ua) out.ua = ua;
   if (keepCookie && ck) out.ck = ck;
+  if (rf) out.rf = rf;
   return out;
 }
 
@@ -4247,7 +4284,9 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       directTried = false;
       clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
       armWatchdog();
-      if (ch.source === "jio" || ch.source === "tgtv" || /^(?:jio|tg):/i.test(String(ch.id || ""))) {
+      // Only the Jio CDN needs the viewer's own address. An AK TV channel that cannot play
+      // through our relay falls back to the browser below, on its own evidence.
+      if (ch.source === "jio" || /^jio:/i.test(String(ch.id || ""))) {
         if (await tryDirectOnce()) return;
       }
       // Ask for the container the catalogue advertised. Probing ".ts" unconditionally
@@ -5274,6 +5313,10 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         {
           "User-Agent": ch.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           ...(ch.cookie ? { Cookie: ch.cookie } : {}),
+          // These reshares commonly gate on the referrer their own player page would send.
+          // The playlist declares it (`#EXTVLCOPT:http-referrer`) and we used to drop it, so a
+          // channel that works in VLC answered 403 here and in the browser.
+          ...(ch.referrer ? { Referer: ch.referrer } : {}),
         },
         undefined,
         request.headers.get("range"),
