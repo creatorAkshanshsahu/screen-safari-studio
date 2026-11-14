@@ -3072,6 +3072,19 @@ async function loadCatalogueForId(
   return loadTgTvCached(cfg, force);
 }
 
+/**
+ * AK TV is the only source this product offers, so no listing may carry another one.
+ *
+ * The sources that were removed are still *reachable* by name -- `source=maxtv`, `source=jio`, and a
+ * `st:` or `jio:` id still resolve and still have their tests -- because retiring a code path and
+ * deleting it are different jobs, and the tests that cover the fallbacks are worth keeping. What
+ * must never happen again is one of them turning up on a surface a viewer or a host site reads:
+ * the channel list, the M3U playlist, the public API. Those go through this.
+ */
+function akTvOnly<T extends { source: string }>(items: T[]): T[] {
+  return items.filter((c) => c.source === "tgtv");
+}
+
 /** How long a channel open may spend learning the catalogue before answering anyway. */
 const STREAM_CATALOGUE_BUDGET_MS = 8_000;
 
@@ -3122,9 +3135,11 @@ async function getChannelsBySource(cfg: GatewayConfig, source: string, force = f
       loadJioCached(cfg, force),
       loadTgTvCached(cfg, force),
     ]);
-    // The seed rows are placeholders that cannot play, so they must never pad out a
-    // combined list: "Both" would otherwise show 24 dead entries above the live ones,
-    // and the top of the guide would be the part that does not work.
+    // Internal lookups pass "all" to mean "any source", and they need every one of them: the
+    // diagnostic resolves a `jio:` id through here. What a *viewer* sees is decided at the two
+    // public listing handlers, which map "all" to AK TV before this is ever called and filter the
+    // result as well. Retiring a source from the product and pretending it does not exist inside
+    // the code are different jobs, and confusing them breaks the diagnostics.
     const live = memCache.maxtv.usingSeed ? [] : m;
     const combined = [...live, ...j, ...t];
     return combined.length > 0 ? combined : m;
@@ -3827,7 +3842,24 @@ async function proxyMediaStream(
     // each caller so no path can forget it.
     const hopHeaders = { ...headers };
     if (carriesOwnToken(currentUrl)) delete hopHeaders["Cookie"];
-    const res = await fetch(currentUrl, { headers: hopHeaders, redirect: "manual" });
+    /*
+     * A bounded wait. Without one, a host that opens the connection and never answers holds this
+     * route open until the platform's own proxy gives up -- which surfaces in the browser as a 502
+     * or 503 claiming "before the app handler ran", a message that names the proxy and blames the
+     * build. It is neither: it is an upstream that never replied. Ten seconds per hop, then the
+     * refusal path takes over and the client is handed the recipe instead of a hung request.
+     */
+    const hopSignal = AbortSignal.timeout(10_000);
+    let res: Response;
+    try {
+      res = await fetch(currentUrl, { headers: hopHeaders, redirect: "manual", signal: hopSignal });
+    } catch {
+      // Timed out or the connection died: that is a refusal like any other, and the caller's
+      // refusal path knows what to hand the browser. Throwing here would be a 500 with no remedy.
+      recordSegment(mode, { at: Date.now(), url: diagnosticUrl(currentUrl), status: 0, bytes: 0, range: range ?? null });
+      upRes = null;
+      break;
+    }
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (loc) {
@@ -5115,7 +5147,9 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const single = path.startsWith("/api/public/channels/")
       ? decodeURIComponent(path.slice("/api/public/channels/".length)).replace(/\/+$/, "")
       : "";
-    const pool = single ? await loadCatalogueForId(cfg, single) : await getChannelsBySource(cfg, "tgtv", false);
+    const pool = akTvOnly(
+      single ? await loadCatalogueForId(cfg, single) : await getChannelsBySource(cfg, "tgtv", false),
+    );
 
     // The identity in a URL is the number when there is one: it is what the site shows on screen,
     // and unlike a raw id it cannot name two channels.
@@ -5204,7 +5238,11 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     const force = url.searchParams.get("refresh") === "1";
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 1500), 1), 10000);
 
-    const raw = await getChannelsBySource(cfg, source, force);
+    // "All" is the line-up a viewer reads, and AK TV is all there is. Asking for a retired source
+    // by name still answers -- it is a code path with tests, not a button anyone presses -- but the
+    // combined list can no longer contain rows this product does not offer.
+    const listed = await getChannelsBySource(cfg, source === "all" ? "tgtv" : source, force);
+    const raw = source === "all" ? akTvOnly(listed) : listed;
     let filtered = raw.filter((c) => keepsByFilter(c.name, c.category, filter));
     if (filtered.length === 0 && filter !== "all") filtered = raw;
 
@@ -5270,7 +5308,11 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   if (path === "/api/live/playlist.m3u") {
     const source = url.searchParams.get("source") || "tgtv";
     const filter = url.searchParams.get("filter") || "all";
-    const raw = await getChannelsBySource(cfg, source, false);
+    // A playlist is loaded into a player and read as a channel line-up, so it gets the same rule:
+    // AK TV only. A `source=all` line-up used to carry JioTV and maxTV entries that this product
+    // does not offer, and a viewer cannot tell which of them are supposed to work.
+    const listed = await getChannelsBySource(cfg, source === "all" ? "tgtv" : source, false);
+    const raw = source === "all" ? akTvOnly(listed) : listed;
     let filtered = raw.filter((c) => keepsByFilter(c.name, c.category, filter));
     if (filtered.length === 0 && filter !== "all") filtered = raw;
     filtered.sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.name.localeCompare(b.name));
@@ -5651,6 +5693,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       [],
     );
     const ch = findChannelByAnyId(pool, rawId);
+
     if (!ch) {
       // An empty pool means the catalogue never arrived, which is a different problem from an
       // id that is genuinely absent — and the player should be told which. 504 rather than 503:
