@@ -126,6 +126,8 @@ type GatewayConfig = {
   starsharePass: string;
   jioPlaylistUrl: string;
   tgtvPlaylistUrl: string;
+  /** True when `TGTV_PLAYLIST_URL` was set, rather than falling back to our default. */
+  tgtvPlaylistFromEnv: boolean;
   proxySecret: string;
 };
 
@@ -179,6 +181,9 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
     starsharePass: readEnv(env, "STARSHARE_PASS", "", request),
     jioPlaylistUrl: readEnv(env, "JIO_PLAYLIST_URL", "https://allinonereborn2.online/jiotv-m3u/jtv39.m3u8", request),
     tgtvPlaylistUrl: readEnv(env, "TGTV_PLAYLIST_URL", "https://livetgtv.lovable.app/api/public/playlist.m3u", request),
+    // Whether that address came from configuration or from our default. It decides which one to
+    // change when the playlist will not load, and the diagnostic is where that is asked.
+    tgtvPlaylistFromEnv: explicit("TGTV_PLAYLIST_URL"),
     proxySecret: readEnv(env, "LIVE_PROXY_SECRET", "streamr-maxtv-live-gateway-v1", request),
   };
 }
@@ -2848,21 +2853,105 @@ const tgtvCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | 
  * plays it untouched, with no proxy in the path and no token to reconstruct. Nothing about it
  * depends on the worker's egress address.
  */
+/**
+ * What the last playlist read actually got back.
+ *
+ * Every failed read is the same sentence by the time it reaches the page ("the playlist did not
+ * load"), and the three things worth knowing -- the status, the content type, and the first line
+ * of whatever came back -- are all discarded on the way. They are what distinguishes a blocked
+ * request from a rate-limited one from a host serving an HTML challenge, and the difference decides
+ * whether the fix is a header, a retry, or a different URL. Kept for `/api/live/diagnose?playlist=1`.
+ */
+type PlaylistProbe = {
+  at: number;
+  url: string;
+  ok: boolean;
+  status: number | null;
+  contentType: string | null;
+  bytes: number;
+  firstLine: string | null;
+  finalUrl: string | null;
+  redirected: boolean;
+  channels: number;
+  error: string | null;
+  ms: number;
+};
+
+let lastPlaylistProbe: PlaylistProbe | null = null;
+
+/** The request a browser would send to that host. Ours sent a UA and nothing else. */
+function tgPlaylistHeaders(url: string): Record<string, string> {
+  let referer = "";
+  try {
+    referer = new URL(url).origin + "/";
+  } catch {
+    // A malformed URL is reported by `fetch` itself; the headers are not the interesting part.
+  }
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    Accept: "text/plain,application/vnd.apple.mpegurl,audio/x-mpegurl,audio/mpegurl,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    ...(referer ? { Referer: referer } : {}),
+    // A playlist is the one thing that must not be answered from a cache. The list changes when
+    // channels are added or re-sourced, and a stale copy is a guide full of dead entries.
+    "Cache-Control": "no-cache",
+  };
+}
+
 async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
   if (!cfg.tgtvPlaylistUrl) return [];
+  const started = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TG_PLAYLIST_TIMEOUT_MS);
   let body = "";
+  let probe: PlaylistProbe = {
+    at: Date.now(),
+    url: cfg.tgtvPlaylistUrl,
+    ok: false,
+    status: null,
+    contentType: null,
+    bytes: 0,
+    firstLine: null,
+    finalUrl: null,
+    redirected: false,
+    channels: 0,
+    error: null,
+    ms: 0,
+  };
   try {
     const res = await fetch(cfg.tgtvPlaylistUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Accept: "*/*",
-      },
+      headers: tgPlaylistHeaders(cfg.tgtvPlaylistUrl),
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`AK TV playlist returned HTTP ${res.status}`);
     body = await res.text();
+    probe = {
+      ...probe,
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      bytes: body.length,
+      finalUrl: res.url || cfg.tgtvPlaylistUrl,
+      redirected: Boolean(res.url) && res.url !== cfg.tgtvPlaylistUrl,
+      firstLine: body.trimStart().split("\n")[0]?.slice(0, 120) ?? null,
+    };
+    /*
+     * Say what came back, not just that it was not an M3U. "HTTP 200, text/html, starts with
+     * `<`" is a challenge page or a portal redirect; "HTTP 200, 0 bytes" is a host that answered
+     * nothing; "HTTP 403" is a refusal. Three different problems, one message before this.
+     */
+    if (!res.ok) {
+      const kind = probe.contentType ? ` (${probe.contentType})` : "";
+      throw new Error(`AK TV playlist returned HTTP ${res.status}${kind}`);
+    }
+    if (!body.trimStart().startsWith("#EXTM3U")) {
+      const kind = probe.contentType ? `${probe.contentType}, ` : "";
+      const head = probe.firstLine ? ` starts with ${JSON.stringify(probe.firstLine.slice(0, 40))}` : "";
+      throw new Error(`AK TV playlist did not return an M3U: ${kind}${body.length} bytes${head}`);
+    }
+  } catch (e) {
+    probe = { ...probe, error: e instanceof Error ? e.message : String(e), ms: Date.now() - started };
+    lastPlaylistProbe = probe;
+    throw e;
   } finally {
     clearTimeout(timer);
   }
@@ -2871,6 +2960,7 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
   }
   const entries = parseM3u(body, cfg.tgtvPlaylistUrl);
   if (entries.length === 0) throw new Error("AK TV playlist listed no channels");
+  lastPlaylistProbe = { ...probe, ok: true, channels: entries.length, error: null, ms: Date.now() - started };
   return entries.map((e, i) => ({
     id: `tg:${e.tvgId || i}`,
     rawId: e.tvgId || String(i),
@@ -2898,33 +2988,21 @@ async function fetchTgTvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]
   // streams and served jio CDN channels instead. Those are blocked at the worker's address and
   // need per-request signing in the browser, which is why the tab broke while TG's own
   // playlist had been working. A tab named after a source should use that source.
-  let playlistError: unknown = null;
-  try {
-    const fromPlaylist = await fetchTgPlaylistCatalogue(cfg);
-    if (fromPlaylist.length > 0) return fromPlaylist;
-  } catch (err) {
-    playlistError = err;
-  }
-
-  // Fallback: GioTV's 1,176-channel JSON catalogue (ClearKeys included). Same channel numbering
-  // as JioTV, so it is a usable second choice when the playlist is unreachable.
-  const gio = await loadGioTvRawCached(false).catch(() => []);
-  if (gio.length > 0) {
-    return gio.map((g) => ({
-      id: `tg:${g.id}`,
-      rawId: g.id,
-      source: "tgtv" as const,
-      name: g.name,
-      category: g.category || "AK TV",
-      logo: g.logo,
-      cmd: g.urls[0]!,
-      mediaType: jioMediaType(g.urls[0]!),
-      ...(g.keys.length ? { drm: { type: "clearkey" as const, keys: g.keys } } : {}),
-    }));
-  }
-
-  if (playlistError) throw playlistError;
-  return [];
+  /*
+   * The playlist, or nothing.
+   *
+   * There used to be a second step here: when the playlist could not be read, the guide was filled
+   * from GioTV's 1,176-channel JSON catalogue and those entries were relabelled `source: "tgtv"`.
+   * It looked like resilience and it was the opposite. The list was Jio CDN channels wearing AK TV
+   * ids, so the one thing a viewer could see when the playlist was down was a guide full of
+   * channels this product does not offer -- and no indication that anything had failed, because
+   * "the list is not empty" was being used as the definition of success.
+   *
+   * An empty guide that says why is worth more than a full one that lies. The page retries by
+   * itself, the relay reports the reason, and `/api/live/diagnose?playlist=1` says exactly what
+   * the host answered.
+   */
+  return fetchTgPlaylistCatalogue(cfg);
 }
 
 /**
@@ -5147,6 +5225,36 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
 
   if (path === "/api/live/diagnose") {
     const id = url.searchParams.get("id") || "";
+
+    /*
+     * "The playlist does not load" is four different faults wearing one sentence. This answers
+     * which: what address we ask, what the host answers *this server* right now, what came back
+     * (status, content type, size, first line), and what the cache last managed to keep.
+     *
+     * It asks again rather than reporting a cached failure, because the interesting question is
+     * whether it works from here at all -- a host can refuse a datacentre address and welcome a
+     * browser, and no amount of retrying on the page changes that.
+     */
+    if (url.searchParams.get("playlist") === "1") {
+      const attempt = await fetchTgPlaylistCatalogue(cfg).then(
+        (items) => ({ parsed: items.length, error: null as string | null }),
+        (e: unknown) => ({ parsed: 0, error: e instanceof Error ? e.message : String(e) }),
+      );
+      return jsonResponse(200, {
+        ok: attempt.error === null,
+        kind: "tgtv-playlist",
+        configuredUrl: cfg.tgtvPlaylistUrl || null,
+        configuredFromEnv: cfg.tgtvPlaylistFromEnv,
+        probe: lastPlaylistProbe,
+        attempt,
+        cache: {
+          channels: tgtvCache.items.length,
+          fetchedAt: tgtvCache.fetchedAt ? new Date(tgtvCache.fetchedAt).toISOString() : null,
+          ageSeconds: tgtvCache.fetchedAt ? Math.round((Date.now() - tgtvCache.fetchedAt) / 1000) : null,
+          error: tgtvCache.error,
+        },
+      });
+    }
 
     // A maxTV question is about the portal, not about segments. Answer it in terms of the
     // portal chain: which identity we present, which address answered, what the token is,
