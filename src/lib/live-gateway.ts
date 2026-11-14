@@ -2070,7 +2070,10 @@ async function resolveTgRpcCandidates(numericId: string, force = false): Promise
 
   let result = await callFn(tgVerifiedFnId);
   if (result.length === 0) {
-    const discovered = await discoverTgServerFn(true);
+    // Reuse the 10-minute discovery cache on normal plays; only a forced refresh pays for
+    // full `_serverFn` re-discovery. Either way the caller races this whole resolver so a
+    // hanging TG RPC can never delay the GioTV candidates past the direct-config budget.
+    const discovered = await discoverTgServerFn(force);
     for (const fnId of discovered) {
       if (fnId === tgVerifiedFnId && !force) continue;
       result = await callFn(fnId);
@@ -2169,12 +2172,43 @@ async function resolveDirectPlayCandidates(
   };
 
   // 1. Live TG RPC (`Server 1` + `Server 2`) and GioTV cookies fetched in parallel for minimum latency.
-  const [tgCandidates, regularCookie, starCookie] = await Promise.all([
-    v1NumericId ? resolveTgRpcCandidates(v1NumericId, force) : Promise.resolve([] as DirectPlayCandidate[]),
+  // The TG leg is budget-raced: when `_serverFn` hangs or rotates its hash, GioTV candidates
+  // still reach the browser within the 7s `/api/live/direct-config` client budget instead of
+  // stalling behind discovery (the background TG call warms `tgVerifiedFnId` for the retry).
+  const tgBudgeted = (async (): Promise<DirectPlayCandidate[]> => {
+    if (!v1NumericId) return [];
+    const budget = new Promise<DirectPlayCandidate[]>((resolve) => setTimeout(() => resolve([]), 5000));
+    return Promise.race([resolveTgRpcCandidates(v1NumericId, force), budget]);
+  })();
+  // The playlist's own per-channel `#EXTHTTP` cookie (`jtv39.m3u8`): BTS entries carry a token
+  // minted for exactly their channel path (`acl=/bpk-tv/<Ch>_BTS/WDVLive/*`), the rest a coarse
+  // site token — the same cookie the Android app plays with. Budget-raced so a blocked
+  // playlist fetch can never delay direct-config; the background load warms `jioCache`.
+  const playlistBudgeted = (async (): Promise<string> => {
+    if (!v1NumericId || !matchedGio) return "";
+    const budget = new Promise<string>((resolve) => setTimeout(() => resolve(""), 3000));
+    const lookup = (async () => {
+      try {
+        const pool = await loadJioCached(cfg, false);
+        // GioTV-fallback items share the ids but carry no playlist cookie; only a real entry
+        // whose stream points at the playlist host counts.
+        const hit = pool.find(
+          (c) => c.rawId === v1NumericId && c.cmd && /allinonereborn/i.test(c.cmd),
+        );
+        return extractHdneaToken(hit?.cookie) || "";
+      } catch {
+        return "";
+      }
+    })();
+    return Promise.race([lookup, budget]);
+  })();
+  const [tgCandidates, regularCookie, starCookie, playlistCookie] = await Promise.all([
+    tgBudgeted,
     matchedGio && matchedGio.urls.some((u) => !isJioStarPlUrl(u)) ? fetchGioRegularCookie(force) : Promise.resolve(""),
     matchedGio && matchedGio.urls.some((u) => isJioStarPlUrl(u))
       ? fetchGioStarCookieForChannel(matchedGio.id, force)
       : Promise.resolve(""),
+    playlistBudgeted,
   ]);
 
   const gioKeys = matchedGio ? pairsToHexRecord(matchedGio.keys) : {};
@@ -2187,16 +2221,20 @@ async function resolveDirectPlayCandidates(
   }
 
   // 2. GioTV (`jstr4web.json`) direct CDN URLs + fresh Star/Regular `__hdnea__` tokens.
+  // URLs stay verbatim (query intact) exactly like the app's `JjtvProtocol.streams`: the browser
+  // applies the cookie with replace semantics and keeps every sibling parameter.
   if (matchedGio) {
     for (const rawUrl of matchedGio.urls) {
       const container: "dash" | "hls" = /\.m3u8(?:$|\?)/i.test(rawUrl) ? "hls" : "dash";
       const embeddedToken = extractHdneaToken(rawUrl);
-      const freshCookie = isJioStarPlUrl(rawUrl) ? starCookie : regularCookie;
-      const baseCleanUrl = rawUrl.split("?")[0]!;
+      const coarseCookie = isJioStarPlUrl(rawUrl) ? starCookie : regularCookie;
+      // Channel-minted playlist cookie wins over the coarse site cookie when it is fresher;
+      // an expired playlist cookie loses automatically, so no extra candidate is needed.
+      const freshCookie = playlistCookie ? pickFreshestHdnea([playlistCookie, coarseCookie]) : coarseCookie;
       if (freshCookie) {
         pushCandidate({
           label: "GioTV Direct · Fresh Token",
-          url: baseCleanUrl,
+          url: rawUrl,
           cookie: freshCookie,
           clearKeys: gioKeys,
           container,
@@ -2205,7 +2243,7 @@ async function resolveDirectPlayCandidates(
       if (embeddedToken) {
         pushCandidate({
           label: "GioTV Direct · Embedded Token",
-          url: baseCleanUrl,
+          url: rawUrl,
           cookie: embeddedToken,
           clearKeys: gioKeys,
           container,
@@ -2242,10 +2280,31 @@ async function resolveDirectPlayCandidates(
     }
   }
 
+  // 4. Never waste player time on a provably-expired token when the same URL also has a
+  // fresh one, and order freshest-first (stable, so TG Server 1 still precedes Server 2).
+  const now = Date.now();
+  const rankCandidate = (c: DirectPlayCandidate): number => {
+    const exp = hdneaExpiryMs(c.cookie || c.url);
+    if (exp === null) return 1;
+    return exp > now + 5_000 ? 2 : 0;
+  };
+  const byUrl = new Map<string, DirectPlayCandidate[]>();
+  for (const c of candidates) {
+    const group = byUrl.get(c.url);
+    if (group) group.push(c);
+    else byUrl.set(c.url, [c]);
+  }
+  const pruned: DirectPlayCandidate[] = [];
+  for (const group of byUrl.values()) {
+    const usable = group.filter((c) => rankCandidate(c) > 0);
+    pruned.push(...(usable.length > 0 ? usable : group));
+  }
+  pruned.sort((a, b) => rankCandidate(b) - rankCandidate(a));
+
   return {
     matchedId: v1NumericId,
     matchedName: matchedGio?.name ?? (channelName || null),
-    candidates,
+    candidates: pruned,
   };
 }
 
@@ -3273,10 +3332,42 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       au.style.display = "none"; au.innerHTML = "";
     }
     function sUrl(ext, probe) { return "/api/live/stream/" + encodeURIComponent(ch.id) + ext + "?_t=" + Date.now() + (probe ? "&probe=1" : ""); }
-    function startHls(url) {
+    function hdneaOf(s) {
+      var m = /(?:^|[?;&\s])(__hdnea__=[^;\s&"'<>]+)/.exec(String(s == null ? "" : s));
+      return m ? m[1] : null;
+    }
+    function withTok(url, tok, replace) {
+      var h = url.indexOf("#"), frag = h >= 0 ? url.slice(h) : "", base = h >= 0 ? url.slice(0, h) : url;
+      var q = base.indexOf("?"), params = (q >= 0 ? base.slice(q + 1) : "").split("&").filter(function (p) { return p.length > 0; });
+      var has = params.some(function (p) { return p.split("=", 1)[0] === "__hdnea__"; });
+      if (!replace && has) return url;
+      var kept = params.filter(function (p) { return p.split("=", 1)[0] !== "__hdnea__"; });
+      kept.push(tok);
+      return (q >= 0 ? base.slice(0, q) : base) + "?" + kept.join("&") + frag;
+    }
+    function sameHost(a, b) {
+      try { return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase(); } catch (e) { return false; }
+    }
+    function startHls(url, tok, host) {
       clean();
       if (window.Hls && Hls.isSupported()) {
-        hp = new Hls({ lowLatencyMode: true });
+        var activeTok = tok || "";
+        hp = new Hls({ lowLatencyMode: true, xhrSetup: function (xhr, u) {
+          try {
+            xhr.addEventListener("load", function () {
+              try {
+                var fin = xhr.responseURL || "";
+                if (fin && /\.m3u8(?:[?#]|$)/i.test(u) && host && sameHost(fin, host)) {
+                  var learned = hdneaOf(fin);
+                  if (learned) activeTok = learned;
+                }
+              } catch (e) {}
+            });
+            if (!activeTok || !host || u.indexOf("allinonereborn") >= 0 || !sameHost(u, host)) return;
+            var signed = withTok(u, activeTok, false);
+            if (signed !== u) xhr.open("GET", signed, true);
+          } catch (e) {}
+        } });
         hp.loadSource(url); hp.attachMedia(v);
         hp.on(Hls.Events.MANIFEST_PARSED, () => {
           const tr = hp.audioTracks || [];
@@ -3361,44 +3452,73 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       Promise.resolve(mp.play()).catch(() => { v.muted = true; mu.textContent = "Unmute"; v.play().catch(() => {}); });
       mp.on(mpegts.Events.ERROR, () => { if (fallback) startHls(sUrl(".m3u8")); else { st.textContent = "Stream interrupted."; rt.style.display = "inline-block"; ov.classList.remove("hide"); } });
     }
+    function waitDirectFrames(ms) {
+      return new Promise(function (resolve) {
+        const t0 = Date.now();
+        (function poll() {
+          if ((v.videoWidth > 0 && v.videoHeight > 0) || (!v.paused && v.currentTime > 0.3)) return resolve(true);
+          if (Date.now() - t0 > ms) return resolve(false);
+          setTimeout(poll, 250);
+        })();
+      });
+    }
     async function tryDirectPlay() {
       try {
-        const dr = await fetch("/api/live/direct-config?id=" + encodeURIComponent(ch.id) + "&name=" + encodeURIComponent(ch.name || ""));
-        if (!dr.ok) return false;
-        const dd = await dr.json().catch(() => ({}));
-        const cands = Array.isArray(dd.candidates) ? dd.candidates : [];
+        const dc = new AbortController(); const dtm = setTimeout(function () { dc.abort(); }, 7000);
+        let cands = [];
+        try {
+          const dr = await fetch("/api/live/direct-config?id=" + encodeURIComponent(ch.id) + "&name=" + encodeURIComponent(ch.name || ""), { signal: dc.signal });
+          if (!dr.ok) return false;
+          const dd = await dr.json().catch(() => ({}));
+          cands = Array.isArray(dd.candidates) ? dd.candidates : [];
+        } catch { return false; } finally { clearTimeout(dtm); }
         if (!cands.length || !window.shaka) return false;
         shaka.polyfill.installAll();
         if (!shaka.Player.isBrowserSupported()) return false;
         if (shaka.log && shaka.LogLevel) shaka.log.setLevel(shaka.LogLevel.NONE);
+        const passDeadline = Date.now() + 40000;
         for (let idx = 0; idx < cands.length; idx++) {
+          if (Date.now() > passDeadline) return false;
           const cand = cands[idx];
-          if (cand.container === "hls") { startHls(cand.url + (cand.cookie ? (cand.url.includes("?") ? "&" : "?") + cand.cookie : "")); return true; }
+          st.textContent = "Trying " + (cand.label || "direct server") + "…";
+          if (cand.container === "hls") {
+            startHls(cand.cookie ? withTok(cand.url, cand.cookie, true) : cand.url, cand.cookie, cand.url);
+            if (await waitDirectFrames(7000)) return true;
+            continue;
+          }
           const attempts = cand.cookie ? [cand.cookie, ""] : [""];
           for (let a = 0; a < attempts.length; a++) {
             clean();
             sp = new shaka.Player();
             const activeCookie = attempts[a];
+            let activeTok = activeCookie;
             const ck = cand.clearKeys || {};
             sp.configure({
               drm: Object.keys(ck).length ? { clearKeys: ck } : {},
-              streaming: { lowLatencyMode: true, rebufferingGoal: 2, bufferingGoal: 20, retryParameters: { maxAttempts: 2, baseDelay: 400, backoffFactor: 2, timeout: 12000 } },
-              manifest: { retryParameters: { maxAttempts: 2, baseDelay: 400, backoffFactor: 2, timeout: 12000 } }
+              streaming: { lowLatencyMode: true, rebufferingGoal: 2, bufferingGoal: 20, retryParameters: { maxAttempts: 2, baseDelay: 300, backoffFactor: 2, timeout: 7000 } },
+              manifest: { retryParameters: { maxAttempts: 1, baseDelay: 300, backoffFactor: 2, timeout: 7000 } }
             });
             const net = sp.getNetworkingEngine && sp.getNetworkingEngine();
-            if (net && activeCookie) {
+            if (net) {
               net.registerRequestFilter(function (type, req) {
-                if ((type === 0 || type === 1) && req.uris && req.uris[0]) {
-                  const u = req.uris[0];
-                  if (!u.includes("allinonereborn") && !u.includes("__hdnea__=")) {
-                    req.uris[0] = u.split("?")[0] + "?" + activeCookie;
-                  }
-                }
+                if ((type !== 0 && type !== 1) || !req.uris || !req.uris[0]) return;
+                const u = req.uris[0];
+                if (u.includes("allinonereborn") || !sameHost(u, cand.url)) return;
+                if (!activeTok) return;
+                req.uris[0] = withTok(u, activeTok, false);
               });
             }
-            if (net && Object.keys(ck).length) {
+            if (net) {
               net.registerResponseFilter(function (type, resp) {
-                if (type !== 0 || !resp.data) return;
+                if (type === 0 && resp.uri) {
+                  try {
+                    if (!resp.uri.includes("allinonereborn") && sameHost(resp.uri, cand.url)) {
+                      const learned = hdneaOf(resp.uri);
+                      if (learned) activeTok = learned;
+                    }
+                  } catch (e) {}
+                }
+                if (type !== 0 || !resp.data || !Object.keys(ck).length) return;
                 try {
                   let xml = new TextDecoder().decode(resp.data);
                   if (!/<MPD[\s>]/i.test(xml)) return;
@@ -3417,9 +3537,11 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
             }
             try {
               await sp.attach(v);
-              await sp.load(cand.url);
+              const rootUrl = activeCookie ? withTok(cand.url, activeCookie, true) : cand.url;
+              await Promise.race([sp.load(rootUrl), new Promise(function (_, rej) { setTimeout(function () { rej(new Error("direct-timeout")); }, 8000); })]);
               v.play().catch(function () { v.muted = true; mu.textContent = "Unmute"; v.play().catch(function () {}); });
-              return true;
+              // A manifest that loads but never renders must fail over, not trap the embed.
+              if (await waitDirectFrames(6000)) return true;
             } catch {}
           }
         }
@@ -3470,7 +3592,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         if (v.videoWidth > 0 && v.videoHeight > 0) return;
         st.textContent = "The stream started but no video arrived. Segments were refused or the format is unsupported.";
         rt.style.display = "inline-block"; ov.classList.remove("hide");
-      }, 15000);
+      }, 25000);
     }
     v.onpause = () => { pl.textContent = "Play"; };
     pl.onclick = () => v.paused ? v.play() : v.pause();
