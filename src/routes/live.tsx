@@ -165,28 +165,44 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
   }, []);
 
   return (
-    <main className="player-scene relative h-screen w-full overflow-hidden bg-black">
-      {activeChannel && (
-        <LiveVideoSurface
-          channelId={activeChannel.id}
-          channelName={activeChannel.name}
-          directUrl={activeChannel.directUrl}
-          drm={activeChannel.drm ?? null}
-          container={activeChannel.container}
-          activeSource={activeChannel.source}
-          muted={muted}
-          reloadNonce={reloadNonce}
-          selectedAudioTrack={activeAudio}
-          onAudioTracksChange={handleTracks}
-          onContainerDetected={setContainerKind}
-          onAutoMuted={handleAutoMuted}
-        />
-      )}
+    /*
+      Two layouts, one DOM.
 
-      <div className="bg-player-scrim pointer-events-none absolute inset-0" />
+      Desktop keeps the full-bleed scene: the picture is the page, the bars float over it.
 
-      {/* Top Bar */}
-      <div className="absolute inset-x-0 top-0 z-20 flex flex-wrap items-center justify-between gap-3 p-4 md:p-8">
+      A phone gets a 16:9 player that occupies its own box at the top, everything else in normal
+      flow underneath. The old single layout stretched the player to the whole viewport on a
+      phone, so the channel chooser sat a full screen below a black void -- which is why a refused
+      channel felt like a trap, and why every overlay we added landed on something. A player that
+      owns exactly its own rectangle cannot cover the controls, and the channel you want is one
+      short scroll away.
+    */
+    <main className="player-scene relative flex min-h-screen w-full flex-col bg-black lg:block lg:h-screen lg:overflow-hidden">
+      <div className="relative aspect-video w-full shrink-0 bg-black lg:absolute lg:inset-0 lg:aspect-auto">
+        {activeChannel && (
+          <LiveVideoSurface
+            channelId={activeChannel.id}
+            channelName={activeChannel.name}
+            directUrl={activeChannel.directUrl}
+            drm={activeChannel.drm ?? null}
+            container={activeChannel.container}
+            activeSource={activeChannel.source}
+            muted={muted}
+            reloadNonce={reloadNonce}
+            selectedAudioTrack={activeAudio}
+            onAudioTracksChange={handleTracks}
+            onContainerDetected={setContainerKind}
+            onAutoMuted={handleAutoMuted}
+            onNextChannel={() => stepChannel(1)}
+            onSwitchChannel={(id) => setActiveId(id)}
+          />
+        )}
+      </div>
+
+      <div className="bg-player-scrim pointer-events-none absolute inset-0 hidden lg:block" />
+
+      {/* Top Bar: below the player in flow on a phone, over it on desktop. */}
+      <div className="z-20 flex flex-wrap items-center justify-between gap-3 p-4 lg:absolute lg:inset-x-0 lg:top-0 md:p-8">
         <div className="flex items-center gap-3">
           <Link to="/" aria-label="Back" className="glass rounded-full p-2.5">
             <ArrowLeft className="size-5" />
@@ -206,8 +222,8 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
             <img src="/favicon.png" alt="" width={14} height={14} className="size-3.5 rounded-[3px]" />
             STREAMR
           </Link>
-          <div>
-            <p className="font-display text-base font-bold leading-tight [overflow-wrap:anywhere] line-clamp-2 md:text-2xl">
+          <div className="min-w-0 flex-1 basis-full sm:basis-auto">
+            <p className="font-display text-base font-bold leading-tight break-words [overflow-wrap:anywhere] line-clamp-2 md:text-2xl">
               {activeChannel?.number !== undefined && (
                 <span className="mr-2 tabular-nums text-accent">{activeChannel.number}</span>
               )}
@@ -258,7 +274,7 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
       {/* One source, so there is nothing to fall back from: say the list is short or dead, or
           say nothing at all. */}
       {(portalError || backupError || (!loading && visibleChannels.length === 0)) && (
-        <div className="absolute left-4 right-4 top-20 z-30 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs md:left-8 md:right-auto md:max-w-xl">
+        <div className="relative z-30 mx-4 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs lg:absolute lg:left-8 lg:right-auto lg:top-20 lg:mx-0 lg:max-w-xl">
           <p className="font-bold text-accent">AK TV returned no channels.</p>
           <p className="mt-0.5 text-muted-foreground">
             {portalError ?? backupError ?? "The playlist answered but listed nothing. Press Refresh to try again."}
@@ -374,7 +390,7 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
       )}
 
       {/* Bottom Controls */}
-      <div className="absolute inset-x-0 bottom-0 z-20 space-y-3 p-4 md:p-8">
+      <div className="z-20 space-y-3 p-4 lg:absolute lg:inset-x-0 lg:bottom-0 md:p-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
             {/* The browsers refuse unmuted autoplay, so we start muted and tell the viewer how to
