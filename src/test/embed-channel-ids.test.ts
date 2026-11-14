@@ -3,6 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // An embed is loaded by someone else's page, with a channel id and nothing else. Three things
 // have to hold: it answers for ids from every source, it does not wait on a source it is not
 // using, and it carries the pieces needed to play from the viewer's own address.
+//
+// What changed: `/embed/<id>` is no longer a server-rendered document. The gateway declines it and
+// the router renders the app's own player, which asks this endpoint who the channel is. So the
+// resolution questions moved here, and the chrome questions moved to embed-player-surface.test.tsx.
 
 const TG_PLAYLIST = `#EXTM3U
 #EXTINF:-1 tvg-id="3436" group-title="Kids",Discovery Kids
@@ -20,13 +24,24 @@ function stubNetwork(): { urls: string[] } {
   return { urls };
 }
 
+type Body = Record<string, unknown> & { error?: string; sources?: string[]; name?: string; number?: number };
+
+async function api(path: string) {
+  const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+  // No env override: the stub answers the default AK TV playlist address, which is the one a
+  // deployed instance reads when nobody configures anything.
+  const res = await maybeHandleLiveRequest(new Request(`https://player.example${path}`), {});
+  if (!res) return { status: 0, body: {} as Body };
+  return { status: res.status, body: (await res.json()) as Body };
+}
+
 async function embed(id: string) {
   const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
   const res = await maybeHandleLiveRequest(
     new Request(`https://player.example/embed/${encodeURIComponent(id)}`),
     {},
   );
-  return res!;
+  return res;
 }
 
 afterEach(() => {
@@ -35,58 +50,33 @@ afterEach(() => {
 });
 
 describe("embedding by channel id", () => {
-  it("renders a player for a tg: id and never waits on maxTV", async () => {
-    const net = stubNetwork();
-    const res = await embed("tg:3436");
-
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/html");
-    // Framing is the whole point of an embed.
-    expect(res.headers.get("content-security-policy")).toContain("frame-ancestors *");
-    expect(res.headers.get("access-control-allow-origin")).toBe("*");
-
-    const html = await res.text();
-    expect(html).toContain("Discovery Kids");
-    expect(html).toContain("tg:3436");
-    // The player boots from the DTO's own stream URL, so a dead source cannot stall the frame.
-    expect(html).toContain("/api/live/stream/");
-    expect(net.urls.some((u) => u.includes("maxtv") || u.includes("action="))).toBe(false);
+  it("is the app's own route, so it cannot drift from the app's own player", async () => {
+    stubNetwork();
+    // Declining is the fix: there is one engine, and the router is what renders it. A second
+    // hand-written player is exactly how `/embed/2524` came to sit on "connecting" while
+    // `/live/tg:0-9-pictures` played the same channel.
+    expect(await embed("tg:3436")).toBeNull();
   });
 
-  it("carries a way back to the site, because the host's viewers are the point", async () => {
-    stubNetwork();
-    const res = await embed("tg:3436");
-    const html = await res.text();
+  it("hands the player a tg: channel with a playable source, and never waits on maxTV", async () => {
+    const net = stubNetwork();
+    const { status, body } = await api("/api/public/channels/tg%3A3436");
 
-    // A real anchor, not a label: `target="_top"` is what lifts the click out of the iframe and
-    // onto the host's page, which is the only navigation an embedded player may perform.
-    expect(html).toMatch(/<a class="brand" href="\/" target="_top"/);
-    expect(html).toContain('rel="noopener"');
-    expect(html).toContain('src="/favicon.png"');
-    expect(html).toContain('alt="STREAMR"');
-    // The badge must still be clickable inside a stage that ignores pointer events.
-    expect(html).toMatch(/\.brand \{[^}]*pointer-events: auto/);
-
-    // In the control row at the bottom-right, but above the loading/error overlay -- the state
-    // a viewer sees when nothing else is on screen.
-    const brandZ = Number(/\.brand \{[^}]*z-index: (\d+)/.exec(html)?.[1]);
-    const overlayZ = Number(/\.ov \{[^}]*z-index: (\d+)/.exec(html)?.[1]);
-    expect(brandZ).toBeGreaterThan(overlayZ);
-    // The rows must not open their own stacking contexts, or the badge's z-index is compared
-    // against its own row instead of against the overlay, and it disappears again.
-    expect(html).not.toMatch(/\.top \{[^}]*z-index/);
-    expect(html).not.toMatch(/\.bot \{[^}]*z-index/);
-    // Bottom-right of the player: beside Fullscreen, after the transport buttons.
-    const bottomBar = /<div class="bot">([\s\S]*?)<button id="fs">/.exec(html)?.[1] ?? "";
-    expect(bottomBar).toContain('class="brand"');
-    expect(bottomBar).toContain("STREAMR");
+    expect(status).toBe(200);
+    expect(body.name).toBe("Discovery Kids");
+    // The player boots from this URL, so a dead source cannot stall the frame.
+    expect(body.sources?.[0]).toContain("/api/live/stream/");
+    expect(net.urls.some((u) => u.includes("maxtv") || u.includes("action="))).toBe(false);
   });
 
   it("serves the whole AK TV section from one URL, without resolving anything first", async () => {
     const net = stubNetwork();
-    const res = await embed("tgtv");
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const res = (await maybeHandleLiveRequest(new Request("https://player.example/embed/tgtv"), {}))!;
     expect(res.status).toBe(200);
+    // Framing is the whole point of an embed.
     expect(res.headers.get("content-security-policy")).toContain("frame-ancestors *");
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
     const html = await res.text();
 
     // A section page must paint instantly on someone else's site: the channel list is fetched by
@@ -95,10 +85,9 @@ describe("embedding by channel id", () => {
     expect(html).toContain("/api/live/channels?source=");
     expect(html).toContain('"tgtv"');
     expect(html).toContain("AK TV");
-    // It selects channels by embedding the single-channel player, so branding and playback rules
-    // are exactly the ones already tested above.
-    expect(html).toContain('/embed/" + encodeURIComponent(ch.id)');
-    expect(html).toMatch(/<a class="brand" href="[^"]*" target="_top"/);
+    // It selects channels by embedding the single-channel player, so playback and branding rules
+    // are the app's, not a second copy's.
+    expect(html).toContain('/embed/\" + encodeURIComponent(ch.id)');
   });
 
   it("builds copy-paste snippets from the address the page is served on", async () => {
@@ -115,29 +104,24 @@ describe("embedding by channel id", () => {
     expect(html).toContain("Copy");
   });
 
-  it("says a missing channel is missing, on the first frame, instead of spinning", async () => {
+  it("says a missing channel is missing, and says what to do about it", async () => {
     // The reported URL: /embed/tg%3Aset-hd.sonyliv against a playlist that does not list it.
-    // The old shell spent ~22s trying a direct connection and a probe before admitting it.
+    // Nothing here can ever play, so the answer is a 404 with the reason in it -- not a spinner.
     stubNetwork();
-    const res = await embed("tg:set-hd.sonyliv");
-    expect(res.status).toBe(200);
-    const html = await res.text();
-
-    expect(html).toContain("not in the AK TV playlist");
-    expect(html).toContain("tg:set-hd.sonyliv");
-    expect(html).toContain("/embed/tgtv");
-    // No player shell, no probe: nothing here can ever play, so nothing may try.
-    expect(html).not.toContain("/api/live/stream/");
-    expect(html).not.toContain("Connecting to");
+    const { status, body } = await api("/api/public/channels/tg%3Aset-hd.sonyliv");
+    expect(status).toBe(404);
+    expect(body.error).toContain("No channel matches");
+    expect(body.error).toContain("tg:set-hd.sonyliv");
+    // The remedy, in the same breath: an upstream status is never reported bare.
+    expect(body.error).toContain("/api/public/channels");
   });
 
   it("opens a channel by its number, because a number is what gets shared", async () => {
     stubNetwork();
     // The stubbed AK TV playlist lists exactly one channel, so it is number 1.
-    const res = await embed("1");
-    const html = await res.text();
-    expect(html).toContain("Discovery Kids");
-    expect(html).not.toContain("not in the AK TV playlist");
+    const { status, body } = await api("/api/public/channels/1");
+    expect(status).toBe(200);
+    expect(body.name).toBe("Discovery Kids");
   });
 
   it("serves only AK TV: a request that names no source must not reach a portal", async () => {
@@ -158,18 +142,9 @@ describe("embedding by channel id", () => {
 
   it("still resolves a channel the playlist spells with a provider suffix", async () => {
     stubNetwork();
-    const res = await embed("tg:discoverykids");
-    const html = await res.text();
     // Present in the stubbed playlist as Discovery Kids, id tg:3436 -- the key finds it.
-    expect(html).toContain("Discovery Kids");
-    expect(html).not.toContain("not in the AK TV playlist");
-  });
-
-  it("still renders for an id it cannot find, so the embed never shows a blank page", async () => {
-    stubNetwork();
-    const res = await embed("tg:does-not-exist");
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain("tg:does-not-exist");
+    const { status, body } = await api("/api/public/channels/tg%3Adiscoverykids");
+    expect(status).toBe(200);
+    expect(body.name).toBe("Discovery Kids");
   });
 });

@@ -206,8 +206,13 @@ https://PLAYER/api/live/playlist.m3u?source=tgtv&filter=all
 ## The STREAMR mark
 
 Every embedded player shows a small STREAMR badge **over the channel itself**, in the
-**bottom-right corner**, immediately left of the Fullscreen button. The SDK picker shows one under
-its channel grid too.
+**bottom-right corner** of the frame — outside the row of transport buttons, so it is never
+competing with Unmute/Reload/Fullscreen for the same tap. The SDK picker shows one under its
+channel grid too.
+
+The badge for a single channel points at **that channel's page on your site**, `/watch/<number>`,
+not at the front page. A viewer who likes what they are watching lands on the channel they were
+already watching.
 
 - It is a layer of its own, above the controls, the top bar and the "Connecting…"/error overlay,
   so it stays visible while the stream is loading or when it fails — the moments when the frame
@@ -216,6 +221,8 @@ its channel grid too.
   the site loading inside the player frame.
 - It renders inside the embed's own document, which is cross-origin. The host's CSS cannot hide
   it, and the host's scripts cannot remove it.
+- It is chrome around *your own player*: `/embed/<channel>` mounts the same component as
+  `/live/<channel>`, so a fix to playback reaches both. If the two ever disagree, that is a bug.
 - It is part of the embed, not a setting, because a player on someone else's site should tell
   their viewers where it came from.
 

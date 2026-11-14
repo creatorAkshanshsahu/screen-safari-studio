@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
@@ -91,29 +93,27 @@ describe("share links", () => {
 });
 
 describe("the embed never sits on \"Connecting to live stream…\"", () => {
-  it("handles hls.js's fatal error, quoting what our relay already knew", async () => {
+  it("is the app's engine, so the app's error handling comes with it", async () => {
     stub();
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    // `/embed/2523` used to be a hand-written second player, and it had the bug the app did not:
+    // no Hls.Events.ERROR handler at all, so a 403 changed nothing on screen until a 12s watchdog
+    // -- and Reload restarted the watchdog. Declining here is what makes that impossible: the
+    // frame renders LiveVideoSurface, the same component `/live/<id>` renders.
     const res = await maybeHandleLiveRequest(new Request("https://player.example/embed/2523"), {
       TGTV_PLAYLIST_URL: "https://tg.example/playlist.m3u",
     });
-    const html = await res!.text();
-
-    // The embed player had no Hls.Events.ERROR handler at all, so a 403 on the manifest changed
-    // nothing on screen until a 12s watchdog -- and if the viewer pressed Reload, the watchdog
-    // restarted and the text went back to "Connecting…". Forever, in effect.
-    expect(html).toContain("Hls.Events.ERROR");
-    expect(html).toContain("lastRelayError");
-    expect(html).toContain("HTTP 403");
+    expect(res).toBeNull();
   });
 
-  it("keeps the relay's own words so the browser's refusal can quote them", async () => {
-    stub();
-    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
-    const res = await maybeHandleLiveRequest(new Request("https://player.example/embed/2523"), {
-      TGTV_PLAYLIST_URL: "https://tg.example/playlist.m3u",
-    });
-    const html = await res!.text();
-    expect(html).toContain('lastRelayError = j.error');
+  it("keeps the relay's own words so the browser's refusal can quote them", () => {
+    // A canary, because this half only runs in a browser: the engine needs a media element, hls.js
+    // from /vendor, and a CDN that refuses it. What must not silently disappear is the two lines
+    // that turn a fatal media error into a sentence a viewer can act on.
+    const src = readFileSync(path.resolve(__dirname, "../components/tv/LiveVideoSurface.tsx"), "utf8");
+    // Subscribed where a manifest 403 arrives, not only at the watchdog.
+    expect(src).toMatch(/HlsCtor\.Events\.ERROR/);
+    // The relay's message is passed through verbatim rather than replaced by a generic string.
+    expect(src).toMatch(/reportError\(j\.error \|\|/);
   });
 });
