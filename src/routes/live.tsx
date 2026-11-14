@@ -16,7 +16,7 @@ import {
   Maximize,
 } from "lucide-react";
 import { LiveVideoSurface, type AudioTrackOption } from "@/components/tv/LiveVideoSurface";
-import type { LiveChannelDto } from "@/lib/live-gateway";
+import { accentInk, parseAccent, type LiveChannelDto } from "@/lib/live-gateway";
 
 export const Route = createFileRoute("/live")({
   head: () => ({
@@ -58,6 +58,12 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
   const [showEmbedModal, setShowEmbedModal] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [portalError, setPortalError] = useState<string | null>(null);
+  /**
+   * `?colour=FF6600` themes this player for whoever linked here, exactly as it themes an embed. Read
+   * after mount rather than during render: this page is server-rendered too, and the query string
+   * only exists in the browser.
+   */
+  const [accent, setAccent] = useState<string | null>(null);
   const [servedBy, setServedBy] = useState<string>("");
   const [backupError, setBackupError] = useState<string | null>(null);
 
@@ -156,8 +162,26 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
 
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const apiUrl = `${origin}/api/live/channels?source=${source}&filter=${filter}`;
+  // The documented surface, and the one to hand a host site: it is not this app's plumbing.
+  const publicApiUrl = `${origin}/api/public/channels?q=`;
+  const channelPublicUrl = activeChannel
+    ? `${origin}/api/public/channels/${encodeURIComponent(String(activeChannel.number ?? activeChannel.id))}`
+    : "";
+  const channelWatchUrl = activeChannel
+    ? `${origin}/watch/${encodeURIComponent(String(activeChannel.number ?? activeChannel.id))}`
+    : "";
+  const accentQuery = accent ? `?colour=${encodeURIComponent(accent)}` : "";
+  const channelEmbedCode = activeChannel
+    ? `<iframe src="${origin}/embed/${encodeURIComponent(String(activeChannel.number ?? activeChannel.id))}${accentQuery}" width="100%" height="480" frameborder="0" allowfullscreen allow="autoplay; fullscreen; encrypted-media; picture-in-picture"></iframe>`
+    : "";
   const m3uUrl = `${origin}/api/live/playlist.m3u?source=${source}&filter=${filter}`;
   const sdkCode = `<div id="og-live-tv"></div>\n<script src="${origin}/embed-sdk.js" data-target="#og-live-tv" data-source="${source}" data-filter="${filter}"></script>`;
+
+  useEffect(() => {
+    const raw = new URLSearchParams(window.location.search).get("colour");
+    const hex = parseAccent(raw);
+    if (hex) setAccent(hex);
+  }, []);
 
   const handleAutoMuted = useCallback(() => {
     setMuted(true);
@@ -177,7 +201,19 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
       owns exactly its own rectangle cannot cover the controls, and the channel you want is one
       short scroll away.
     */
-    <main className="player-scene relative flex min-h-screen w-full flex-col bg-black lg:block lg:h-screen lg:overflow-hidden">
+    <main
+      className="player-scene relative flex min-h-screen w-full flex-col bg-black lg:block lg:h-screen lg:overflow-hidden"
+      style={
+        accent
+          ? ({
+              "--accent": accent,
+              "--accent-foreground": accentInk(accent),
+              // The brand's own red lives in `--crimson-bright`; the LIVE chip and the focus rings
+              // read `--accent`, so setting it here is enough to re-theme the whole page.
+            } as React.CSSProperties)
+          : undefined
+      }
+    >
       <div className="relative aspect-video w-full shrink-0 bg-black lg:absolute lg:inset-0 lg:aspect-auto">
         {activeChannel && (
           <LiveVideoSurface
@@ -357,17 +393,22 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
       {showEmbedModal && activeChannel && (
         <div className="glass absolute left-4 right-4 top-24 z-30 max-w-xl space-y-3 rounded-2xl p-5 md:left-8">
           <div className="flex items-center justify-between">
-            <h2 className="font-display text-base font-bold">Embed on OG Website · {activeChannel.name}</h2>
+            <h2 className="font-display text-base font-bold">Embed {activeChannel.name}</h2>
+            <a href="/embed" target="_blank" rel="noopener" className="text-[11px] font-semibold text-accent underline">
+              Full guide, colour and API
+            </a>
             <Button variant="secondary" size="sm" onClick={() => setShowEmbedModal(false)} className="rounded-full text-xs">
               Close
             </Button>
           </div>
 
           {[
-            { key: "iframe", label: "1. Channel <iframe> Embed", value: activeChannel.iframeCode },
-            { key: "api", label: "2. Channels JSON API (CORS enabled)", value: apiUrl },
-            { key: "m3u", label: "3. AK TV M3U Playlist", value: m3uUrl },
-            { key: "sdk", label: "4. Full Live TV Grid + Player Widget", value: sdkCode },
+            { key: "iframe", label: "1. This channel · iframe", value: channelEmbedCode },
+            { key: "one", label: "2. This channel · sources and ClearKey (JSON)", value: channelPublicUrl },
+            { key: "api", label: "3. Channel list (public JSON API)", value: publicApiUrl },
+            { key: "watch", label: "4. This channel · full page", value: channelWatchUrl },
+            { key: "m3u", label: "5. AK TV M3U playlist", value: m3uUrl },
+            { key: "sdk", label: "6. Player and channel grid (script tag)", value: sdkCode },
           ].map((item) => (
             <div key={item.key} className="space-y-1 rounded-xl border border-border bg-background/80 p-3">
               <div className="flex items-center justify-between text-xs font-semibold text-muted-foreground">
