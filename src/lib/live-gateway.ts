@@ -3844,12 +3844,18 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     .bot { position: absolute; bottom: 0; inset-inline: 0; padding: 12px 16px; display: flex; justify-content: space-between; gap: 8px; background: linear-gradient(0deg, rgba(0,0,0,.85), transparent); }
     button, select { background: rgba(16,14,30,.85); color: #fff; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
     button:hover, select:hover { border-color: #00ecf7; }
-    /* The way back to the site. Small, always visible, and a real link: the whole point of
-       being embedded on someone else's page is that their viewers can find us. */
-    .brand { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; pointer-events: auto; transition: border-color .15s ease, background .15s ease; }
+    /* The way back to the site, laid over the channel itself.
+       A channel embedded on someone else's page is our branding on their page, so the badge is
+       a layer of its own above the controls (2), the connecting/error overlay (4) and the top
+       bar -- not a label inside any of them. It sat inside the top bar until now, which meant
+       the loading and error overlays painted straight over it: branding disappeared at exactly
+       the moment the frame was visible and nothing else was. */
+    .top { z-index: 2; }
+    .bot { z-index: 2; }
+    .brand { position: absolute; top: 10px; right: 12px; z-index: 30; display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); box-shadow: 0 2px 10px rgba(0,0,0,.55); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; pointer-events: auto; transition: border-color .15s ease, background .15s ease; }
     .brand:hover, .brand:focus-visible { border-color: #00ecf7; background: rgba(8,7,17,.94); outline: none; }
     .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
-    .ov { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: rgba(5,4,11,.74); text-align: center; padding: 20px; }
+    .ov { position: absolute; inset: 0; z-index: 4; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: rgba(5,4,11,.74); text-align: center; padding: 20px; }
     .ov.hide { display: none; }
   </style>
 </head>
@@ -3858,8 +3864,8 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     <video id="v" playsinline autoplay></video>
     <div class="top">
       <div><span class="live">LIVE</span><strong id="nm"></strong></div>
-      <a class="brand" href="/" target="_top" rel="noopener" title="Watch more live TV on STREAMR"><img src="/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
     </div>
+    <a class="brand" href="/" target="_top" rel="noopener" title="Watch more live TV on STREAMR"><img src="/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
     <div class="ov" id="ov"><div id="st" style="font-size:13px;color:#b4bbd0;">Connecting to live stream…</div><button id="rt" style="display:none;">Reload Stream</button></div>
     <div class="bot">
       <div style="display:flex;gap:8px;flex-wrap:wrap;">

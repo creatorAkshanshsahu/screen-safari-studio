@@ -109,12 +109,21 @@ https://PLAYER/api/live/playlist.m3u?source=tgtv&filter=all
 
 ## The STREAMR mark
 
-Every embedded player shows a small STREAMR logo in the top-right, and the SDK picker shows one
-under the channel grid. Clicking it navigates to your site with `target="_top"` — the host's page
-goes to you, rather than the player navigating inside its own frame.
+Every embedded player shows a small STREAMR badge **over the channel itself**, in the top-right
+corner of the video. The SDK picker shows one under its channel grid too.
 
-It is part of the embed, not a setting, because a player on someone else's site should tell their
-viewers where it came from.
+- It is a layer of its own, above the controls, the top bar and the "Connecting…"/error overlay,
+  so it stays visible while the stream is loading or when it fails — the moments when the frame
+  is otherwise empty.
+- Clicking it navigates with `target="_top"`: **the host's page goes to your site**, rather than
+  the site loading inside the player frame.
+- It renders inside the embed's own document, which is cross-origin. The host's CSS cannot hide
+  it, and the host's scripts cannot remove it.
+- It is part of the embed, not a setting, because a player on someone else's site should tell
+  their viewers where it came from.
+
+The one thing it cannot survive is the host cropping the frame with `overflow:hidden` or negative
+margins. If you ever find a site doing that, the fix is commercial, not technical.
 
 ## If a channel does not play on the host site
 
