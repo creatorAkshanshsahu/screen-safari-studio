@@ -27,8 +27,10 @@ describe("Live TV & OG Embed Gateway", () => {
     expect(text).toContain("https://streamr.lovable.app/api/live/stream/");
   });
 
+  // `st:1001` is a seed channel: it resolves without any network, so these two assert the
+  // player's own contract rather than the "id not found" page.
   it("serves standalone iframe player HTML on /embed/:id without X-Frame-Options block", async () => {
-    const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/maxtv_seed-ss1h"), undefined);
+    const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/st%3A1001"), undefined);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-security-policy")).toContain("frame-ancestors *");
@@ -37,7 +39,7 @@ describe("Live TV & OG Embed Gateway", () => {
   });
 
   it("embed page can play DASH channels, not just HLS and MPEG-TS", async () => {
-    const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/maxtv_seed-ss1h"), undefined);
+    const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/st%3A1001"), undefined);
     const html = await res!.text();
     // Shaka has to be on the page: without it the embed has no way to open an MPD.
     expect(html).toContain("/vendor/shaka-player.compiled.js");
