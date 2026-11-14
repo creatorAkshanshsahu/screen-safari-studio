@@ -69,6 +69,26 @@ if (typeof globalThis.addEventListener === "function") {
   );
 }
 
+// Node's own view of the same events. `globalThis.addEventListener` above is the browser API and
+// is never dispatched in Node, so a rejection with no handler had no listener here at all -- and
+// Node's default for an unhandled rejection is to *end the process*.
+//
+// The budget races in live-gateway are not affected (measured: `Promise.race` attaches handlers
+// to every input, so a leg that rejects after the timer won is observed). This is for the work
+// that is genuinely fire-and-forget -- cache warmers, handoff writes, an RPC whose answer nobody
+// waits for any more. One of those must not be able to take the server down and answer every
+// later request, including the page's own assets, with the dev proxy's 503. Log it and serve.
+const nodeProcess = (globalThis as { process?: { on?: unknown; listenerCount?: unknown } }).process;
+if (nodeProcess && typeof nodeProcess.on === "function") {
+  const proc = nodeProcess as { on: (event: string, cb: (reason: unknown) => void) => void; listenerCount?: (event: string) => number };
+  if (!proc.listenerCount || proc.listenerCount("unhandledRejection") === 0) {
+    proc.on("unhandledRejection", (reason) => {
+      record(reason);
+      console.error("[unhandledRejection] kept the server alive:", reason);
+    });
+  }
+}
+
 export function consumeLastCapturedError(): unknown {
   if (!lastCapturedError) return undefined;
   if (Date.now() - lastCapturedError.at > TTL_MS) {
