@@ -67,16 +67,19 @@ describe("embedding by channel id", () => {
     // The badge must still be clickable inside a stage that ignores pointer events.
     expect(html).toMatch(/\.brand \{[^}]*pointer-events: auto/);
 
-    // Over the channel, not inside a bar. The loading/error overlay is the state a viewer sees
-    // when nothing else is on screen, and it paints over anything at a lower level.
+    // In the control row at the bottom-right, but above the loading/error overlay -- the state
+    // a viewer sees when nothing else is on screen.
     const brandZ = Number(/\.brand \{[^}]*z-index: (\d+)/.exec(html)?.[1]);
     const overlayZ = Number(/\.ov \{[^}]*z-index: (\d+)/.exec(html)?.[1]);
     expect(brandZ).toBeGreaterThan(overlayZ);
-    expect(html).toMatch(/\.brand \{[^}]*position: absolute/);
-    // Directly under the stage rather than inside the top bar, which the overlay covers.
-    const topBar = /<div class="top">([\s\S]*?)<\/div>/.exec(html)?.[1] ?? "";
-    expect(topBar).not.toContain("brand");
-    expect(html).toMatch(/<div class="stage" id="stage">[\s\S]*class="brand"/);
+    // The rows must not open their own stacking contexts, or the badge's z-index is compared
+    // against its own row instead of against the overlay, and it disappears again.
+    expect(html).not.toMatch(/\.top \{[^}]*z-index/);
+    expect(html).not.toMatch(/\.bot \{[^}]*z-index/);
+    // Bottom-right of the player: beside Fullscreen, after the transport buttons.
+    const bottomBar = /<div class="bot">([\s\S]*?)<button id="fs">/.exec(html)?.[1] ?? "";
+    expect(bottomBar).toContain('class="brand"');
+    expect(bottomBar).toContain("STREAMR");
   });
 
   it("serves the whole AK TV section from one URL, without resolving anything first", async () => {
@@ -96,6 +99,20 @@ describe("embedding by channel id", () => {
     // are exactly the ones already tested above.
     expect(html).toContain('/embed/" + encodeURIComponent(ch.id)');
     expect(html).toMatch(/<a class="brand" href="[^"]*" target="_top"/);
+  });
+
+  it("builds copy-paste snippets from the address the page is served on", async () => {
+    // A friend wants a production URL to paste. The snippet must carry the origin the reader is
+    // actually looking at, so there is no placeholder to edit and no way to ship localhost.
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const res = (await maybeHandleLiveRequest(new Request("https://streamr.example/embed"), {}))!;
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("https://streamr.example/embed/tgtv");
+    expect(html).toContain("https://streamr.example/embed-sdk.js");
+    expect(html).toContain("https://streamr.example");
+    expect(html).not.toContain("PLAYER");
+    expect(html).toContain("Copy");
   });
 
   it("still renders for an id it cannot find, so the embed never shows a blank page", async () => {
