@@ -115,5 +115,8 @@ describe("the embed never sits on \"Connecting to live stream…\"", () => {
     expect(src).toMatch(/HlsCtor\.Events\.ERROR/);
     // The relay's message is passed through verbatim rather than replaced by a generic string.
     expect(src).toMatch(/reportError\(j\.error \|\|/);
+    // And only a policy refusal counts as "the browser blocked the sound": everything else is a
+    // real fault, and muting it would offer a remedy for the wrong problem.
+    expect(src).toMatch(/name !== "NotAllowedError"/);
   });
 });
