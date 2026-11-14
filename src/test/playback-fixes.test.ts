@@ -1,4 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  extractHdneaParam,
+  isHlsPlaylistUrl,
+  sameUrlHost,
+  withHdneaToken,
+} from "@/lib/direct-token";
 
 afterEach(() => {
   delete (globalThis as { __env__?: unknown }).__env__;
@@ -358,6 +364,120 @@ describe("Browser-Direct CDN playback (/api/live/direct-config) for Cloudflare W
     expect(body.channels.map((c) => c.id)).toContain("jio:892");
     expect(body.channels.map((c) => c.id)).toContain("jio:165");
     expect(body.channels[0]!.container).toBe("dash");
+  });
+
+  it("prunes expired embedded tokens and orders freshest candidates first", async () => {
+    const EXPIRED_CATALOGUE = JSON.stringify([
+      {
+        id: "892",
+        name: "Sony SAB HD",
+        category: "Entertainment",
+        logo: "https://cdn.example/sab.png",
+        url: "https://jiotvmblive.cdn.jio.com/bpk-tv/Sony_SAB_HD_MOB/WDVLive/index.mpd?__hdnea__=st=1~exp=1000000000~acl=/*~hmac=expired_embedded",
+        keys: [{ keyId: "400131994b445d8c8817202248760fda", key: "2d56ef4bfcfb9fb0ae172f29b9cd6bfe" }],
+      },
+    ]);
+    vi.stubGlobal("fetch", async (url: string) => {
+      const u = String(url);
+      if (u.includes("giotv-6op.pages.dev/jstr4web.json")) return new Response(EXPIRED_CATALOGUE, { status: 200 });
+      if (u.includes("allinonereborn2.online/jstrweb2/cookies.json")) return new Response(REGULAR_COOKIES, { status: 200 });
+      if (u.includes("livetgtv.lovable.app/_serverFn/")) {
+        return makeFramedTgRpcResponse({
+          result: {
+            urls: ["https://jiotvmblive.cdn.jio.com/bpk-tv/Sony_SAB_HD_MOB/TGServer/index.mpd"],
+            cookie: "__hdnea__=st=1~exp=1000000000~acl=/*~hmac=expired_tg",
+            clearKeys: { "400131994b445d8c8817202248760fda": "2d56ef4bfcfb9fb0ae172f29b9cd6bfe" },
+          },
+        });
+      }
+      return new Response("", { status: 404 });
+    });
+
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const res = await maybeHandleLiveRequest(
+      new Request("https://screen-safari-studio.lovable.app/api/live/direct-config?id=jio%3A892&refresh=1"),
+      {},
+    );
+    expect(res!.status).toBe(200);
+    const body = (await res!.json()) as {
+      candidates: Array<{ label: string; url: string; cookie: string }>;
+    };
+    // Expired embedded token pruned: the same verbatim URL keeps only its fresh-token variant.
+    const gioBase = "https://jiotvmblive.cdn.jio.com/bpk-tv/Sony_SAB_HD_MOB/WDVLive/index.mpd";
+    const gioVariants = body.candidates.filter((c) => c.url.split("?")[0] === gioBase);
+    expect(gioVariants.length).toBe(1);
+    expect(gioVariants[0]!.url).toBe(
+      "https://jiotvmblive.cdn.jio.com/bpk-tv/Sony_SAB_HD_MOB/WDVLive/index.mpd?__hdnea__=st=1~exp=1000000000~acl=/*~hmac=expired_embedded",
+    );
+    expect(gioVariants[0]!.cookie).toContain("regular_token_abc");
+    // Freshest-first ordering: fresh Gio candidate precedes the expired TG fallback.
+    expect(body.candidates[0]!.cookie).toContain("regular_token_abc");
+    expect(body.candidates[body.candidates.length - 1]!.cookie).toContain("expired_tg");
+  });
+
+  it("prefers the jtv39.m3u8 per-channel cookie over the coarse site cookie for direct playback", async () => {
+    const PLAYLIST = [
+      "#EXTM3U",
+      '#EXTINF:-1 tvg-id="892" group-title="Entertainment" tvg-logo="https://cdn.example/sab.png",Sony SAB HD',
+      "#KODIPROP:inputstream.adaptive.license_type=clearkey",
+      "#KODIPROP:inputstream.adaptive.license_key=https://allinonereborn2.online/jtv-fetch/keyid.php?id=892",
+      "#EXTVLCOPT:http-user-agent=@allinone_reborn",
+      '#EXTHTTP:{"cookie":"__hdnea__=st=1794000000~exp=2099999999~acl=/*~hmac=playlist_channel_892"}',
+      "https://allinonereborn2.online/jiotv-m3u/jtv2.mpd?id=892",
+    ].join("\n");
+    vi.stubGlobal("fetch", async (url: string) => {
+      const u = String(url);
+      if (u.includes("giotv-6op.pages.dev/jstr4web.json")) return new Response(GIO_CATALOGUE, { status: 200 });
+      if (u.includes("allinonereborn2.online/jstrweb2/cookies.json")) return new Response(REGULAR_COOKIES, { status: 200 });
+      if (/jiotv-m3u\/jtv\d{1,3}\.m3u8$/i.test(u)) return new Response(PLAYLIST, { status: 200 });
+      return new Response("", { status: 404 });
+    });
+
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const res = await maybeHandleLiveRequest(
+      new Request("https://screen-safari-studio.lovable.app/api/live/direct-config?id=jio%3A892&refresh=1"),
+      {},
+    );
+    expect(res!.status).toBe(200);
+    const body = (await res!.json()) as {
+      candidates: Array<{ label: string; url: string; cookie: string }>;
+    };
+    // Same channel-minted cookie the Android app plays with wins over cookies.json.
+    expect(body.candidates[0]!.label).toBe("GioTV Direct · Fresh Token");
+    expect(body.candidates[0]!.cookie).toContain("playlist_channel_892");
+  });
+});
+
+describe("App-faithful direct token policy (StreamRequestPolicy port)", () => {
+  const FRESH = "__hdnea__=st=1794000000~exp=1999999999~acl=/*~hmac=fresh";
+
+  it("appends the token while preserving sibling params and fragments", () => {
+    expect(withHdneaToken("https://cdn.example/a/index.mpd", FRESH, false)).toBe(
+      `https://cdn.example/a/index.mpd?${FRESH}`,
+    );
+    expect(withHdneaToken("https://cdn.example/a/index.mpd?id=5", FRESH, false)).toBe(
+      `https://cdn.example/a/index.mpd?id=5&${FRESH}`,
+    );
+    expect(withHdneaToken("https://cdn.example/a/index.mpd#frag", FRESH, false)).toBe(
+      `https://cdn.example/a/index.mpd?${FRESH}#frag`,
+    );
+  });
+
+  it("never overwrites a token already on a segment URL, but replaces it on the root manifest", () => {
+    const signed = "https://cdn.example/a/seg-1.m4s?__hdnea__=st=1~exp=2~acl=/a/*~hmac=minted&id=5";
+    expect(withHdneaToken(signed, FRESH, false)).toBe(signed);
+    expect(withHdneaToken(signed, FRESH, true)).toBe(`https://cdn.example/a/seg-1.m4s?id=5&${FRESH}`);
+  });
+
+  it("extracts raw token pairs for redirect learning and scopes tokens to their own host", () => {
+    expect(extractHdneaParam("https://cdn.example/a.mpd?__hdnea__=st=1~exp=2&x=1")).toBe("__hdnea__=st=1~exp=2");
+    expect(extractHdneaParam("no token here")).toBeNull();
+    expect(sameUrlHost("https://JIOTVMBLIVE.cdn.jio.com/a", "https://jiotvmblive.cdn.jio.com/b")).toBe(true);
+    expect(sameUrlHost("https://a.example/x", "https://b.example/x")).toBe(false);
+    expect(sameUrlHost("not a url", "https://a.example/")).toBe(false);
+    expect(isHlsPlaylistUrl("https://cdn.example/a/index.m3u8?__hdnea__=x")).toBe(true);
+    expect(isHlsPlaylistUrl("https://cdn.example/a/seg-1.ts")).toBe(false);
+    expect(isHlsPlaylistUrl("https://cdn.example/a/seg-1.m4s")).toBe(false);
   });
 });
 
