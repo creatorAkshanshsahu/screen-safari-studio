@@ -71,6 +71,18 @@ const MAG_USER_AGENT =
   "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2110 Safari/533.3";
 const MAG_DEVICE_UA = "Model: MAG254; Link: WiFi";
 const XTREAM_USER_AGENT = "IPTVSmartersPlayer";
+
+/**
+ * What an AK TV reshare host is asked with.
+ *
+ * The old default was `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36` -- the first
+ * half of a browser's user agent with the `(KHTML, like Gecko) Chrome/... Safari/537.36` tail cut
+ * off. No browser has ever sent that string, and a WAF rule that says "block the truncated one" is
+ * cheap to write, which is the shape of the 403 these hosts answer. A complete agent costs nothing
+ * and at least gives the request a chance of being treated as a browser.
+ */
+const AKTV_RELAY_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const CATALOGUE_TTL_MS = 15 * 60 * 1000;
 
 const PREVIEW_SEED_CHANNELS: LiveChannelItem[] = [
@@ -2914,6 +2926,17 @@ function stripProviderSuffix(value: string): string {
   return value.replace(/\.[a-z][a-z0-9-]{1,11}$/i, "");
 }
 
+/**
+ * "&Pictures HD By Premium PlugX" and "&PICTURES HD By Premium PlugX" are the same channel.
+ *
+ * The reseller's name is stamped onto every entry in these playlists, so it is the part that must
+ * be ignored when asking "is there another way to play this channel" -- the bare channel name is
+ * what a viewer recognises, and it is what the other categories list under a different id.
+ */
+export function channelFamily(name: string): string {
+  return channelSlug(String(name || "").replace(/\s+by\s+premium\s+plugx\s*$/i, ""));
+}
+
 /** The durable identity of a channel: its source plus a slug of its name. */
 export function channelKey(ch: { source: string; name: string }): string {
   return `${SOURCE_PREFIX[ch.source] ?? "st"}:${channelSlug(ch.name)}`;
@@ -4069,6 +4092,10 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       var ra = reg(ha);
       return ra === reg(hb) && ra.indexOf(".") >= 0;
     }
+    // What our relay answered when it was refused, kept so that a browser-side failure can quote
+    // the real cause instead of inventing one. "Connecting…" left up with no explanation is the
+    // one outcome this player must never produce.
+    var lastRelayError = "";
     function startHls(url, tok, host) {
       clean();
       if (window.Hls && Hls.isSupported()) {
@@ -4090,6 +4117,21 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
           } catch (e) {}
         } });
         hp.loadSource(url); hp.attachMedia(v);
+        hp.on(Hls.Events.ERROR, function (_, data) {
+          if (!data || !data.fatal) return;
+          var status = (data.response && data.response.code) || 0;
+          var browser = status ? " Your browser was refused too (HTTP " + status + ")." : "";
+          st.textContent = lastRelayError
+            ? lastRelayError + browser
+            : status === 403
+              ? "This channel's host refused the playlist (HTTP 403). The channel is live; the host is blocking us."
+              : status
+                ? "The playlist could not be loaded (HTTP " + status + ")."
+                : "This channel did not start. The host refused it or the format is unsupported here.";
+          mu.textContent = v.muted ? "Unmute" : "Mute";
+          rt.style.display = "inline-block";
+          ov.classList.remove("hide");
+        });
         hp.on(Hls.Events.MANIFEST_PARSED, () => {
           const tr = hp.audioTracks || [];
           if (tr.length > 1) {
@@ -4281,7 +4323,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       return got;
     }
     async function boot() {
-      directTried = false;
+      directTried = false; lastRelayError = "";
       clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
       armWatchdog();
       // Only the Jio CDN needs the viewer's own address. An AK TV channel that cannot play
@@ -4298,9 +4340,12 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         const r = await fetch(sUrl(probeExt, true), { signal: c.signal }); clearTimeout(tm);
         if (!r.ok) {
           const j = await r.json().catch(() => ({})); c.abort();
+          lastRelayError = j.error || "";
           if (await tryDirectOnce()) return;
+          // The refusal is about this address; the browser has a different one, so it is still
+          // worth trying -- but if it also fails, the error handler above quotes what we know.
           if (ch.directUrl) { startHls(ch.directUrl); return; }
-          st.textContent = j.error || ("HTTP " + r.status); rt.style.display = "inline-block"; return;
+          st.textContent = lastRelayError || ("HTTP " + r.status); rt.style.display = "inline-block"; return;
         }
         const kind = (r.headers.get("x-stream-container") || "").toLowerCase(); c.abort();
         if (kind === "dash") startDash(sUrl(".mpd"));
@@ -4325,6 +4370,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       clearTimeout(deadTimer);
       deadTimer = setTimeout(() => {
         if (v.videoWidth > 0 && v.videoHeight > 0) return;
+        if (rt.style.display !== "none") return;
         st.textContent = "No video after 12 seconds. The stream was refused, or this channel's format is not supported here.";
         rt.style.display = "inline-block"; ov.classList.remove("hide");
       }, 12000);
@@ -4667,7 +4713,16 @@ function renderWidgetSdkJs(): string {
 
 function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
   const enc = encodeURIComponent(ch.id);
-  const embedUrl = `${publicOrigin}/embed/${enc}`;
+  /*
+   * The share link carries the channel *number* when the playlist gives one, because that is the
+   * identity a viewer reads off the screen and types back in. The raw id is the fallback.
+   *
+   * It is also the only unambiguous form: these playlists list "&Pictures By Premium PlugX" more
+   * than once, so `tg:185` names two different channels (numbers 29 and 1218) and a link built
+   * from it lands on whichever the catalogue happened to sort first.
+   */
+  const shareId = ch.number !== undefined ? String(ch.number) : enc;
+  const embedUrl = `${publicOrigin}/embed/${shareId}`;
   const isDirectHttpsHls =
     ch.source === "tgtv" &&
     ch.mediaType === "hls" &&
@@ -4693,6 +4748,23 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
     ...(ch.drm && ch.drm.keys.length ? { drm: { type: "clearkey" as const, keys: ch.drm.keys } } : {}),
     ...(ch.mediaType ? { container: ch.mediaType } : {}),
   };
+}
+
+/**
+ * What a request to this stream should say it came from.
+ *
+ * A declared referrer wins, because the playlist is the authority on its own host. Otherwise the
+ * host's own origin: the value its player page would send, and the only one any browser could
+ * have produced for it.
+ */
+function referrerFor(streamUrl: string | undefined, declared: string | undefined): string {
+  if (declared) return declared;
+  if (!streamUrl || !/^https?:\/\//i.test(streamUrl)) return "";
+  try {
+    return `${new URL(streamUrl).origin}/`;
+  } catch {
+    return "";
+  }
 }
 
 /** A host the browser can never reach, so it must never appear in a URL we hand out. */
@@ -4788,6 +4860,41 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       candidates: resolved.candidates,
       playlistMint: resolved.playlistMint,
     });
+  }
+
+  /**
+   * The other entries for the same channel.
+   *
+   * These playlists carry the same channel several times -- once per reseller category, on a
+   * different host, in a different container. When the entry a viewer is on is refused by its
+   * host, "try it again" is not a remedy; "here is the same channel on another host" is. The
+   * names differ only by the reseller suffix and the capitalisation, so the family is the slug of
+   * the name with that suffix removed.
+   */
+  if (path === "/api/live/alternatives") {
+    const id = (url.searchParams.get("id") || "").trim();
+    if (!id) return jsonResponse(400, { ok: false, error: "An `id` is required." });
+    const pool = await loadCatalogueForId(cfg, id);
+    const current = findChannelByAnyId(pool, id);
+    if (!current) {
+      return jsonResponse(200, { ok: true, id, family: null, alternatives: [] });
+    }
+    const family = channelFamily(current.name);
+    const seen = new Set<string>([current.id]);
+    const alternatives = pool
+      .filter((c) => {
+        if (seen.has(c.id) || channelFamily(c.name) !== family) return false;
+        seen.add(c.id);
+        return true;
+      })
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        ...(c.number !== undefined ? { number: c.number } : {}),
+        container: c.mediaType || "hls",
+        category: displayCategoryName(c.category),
+      }));
+    return jsonResponse(200, { ok: true, id: current.id, family, alternatives });
   }
 
   if (path === "/api/live/channels") {
@@ -5311,12 +5418,20 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         publicOrigin,
         cfg.proxySecret,
         {
-          "User-Agent": ch.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "User-Agent": ch.userAgent || AKTV_RELAY_USER_AGENT,
+          "Accept-Language": "en-US,en;q=0.9",
           ...(ch.cookie ? { Cookie: ch.cookie } : {}),
           // These reshares commonly gate on the referrer their own player page would send.
           // The playlist declares it (`#EXTVLCOPT:http-referrer`) and we used to drop it, so a
           // channel that works in VLC answered 403 here and in the browser.
-          ...(ch.referrer ? { Referer: ch.referrer } : {}),
+          //
+          // When the playlist declares nothing, the host's own origin is the value its own player
+          // page would produce -- that is what a hotlink rule expects to see, and it is the only
+          // referrer a browser could ever have sent to it. This is a hypothesis, not a verified
+          // fix: the host answers 403 to the server *and* to the viewer's browser, and neither
+          // address can be changed from here. The refusal path below is untouched, so a wrong
+          // referrer costs nothing that was working.
+          ...(referrerFor(ch.cmd, ch.referrer) ? { Referer: referrerFor(ch.cmd, ch.referrer) } : {}),
         },
         undefined,
         request.headers.get("range"),

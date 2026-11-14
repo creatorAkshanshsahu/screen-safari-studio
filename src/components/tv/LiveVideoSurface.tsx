@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, SkipForward } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { DirectPlayCandidate } from "@/lib/live-gateway";
 import { extractHdneaParam, isHlsPlaylistUrl, sameTokenScope, withHdneaToken } from "@/lib/direct-token";
@@ -60,6 +60,13 @@ interface LiveVideoSurfaceProps {
   onAudioTracksChange?: (tracks: AudioTrackOption[], activeIndex: number) => void;
   onContainerDetected?: (kind: string) => void;
   onAutoMuted?: () => void;
+  /**
+   * The ways out of a dead channel. The product rule is that a blank screen is the worst outcome,
+   * so a refused stream must offer the next channel and the same channel on another host, not
+   * only Retry -- retrying a host that just refused us is the least likely thing to work.
+   */
+  onNextChannel?: (() => void) | undefined;
+  onSwitchChannel?: ((id: string) => void) | undefined;
 }
 
 declare global {
@@ -203,6 +210,8 @@ export function LiveVideoSurface({
   onAudioTracksChange,
   onContainerDetected,
   onAutoMuted,
+  onNextChannel,
+  onSwitchChannel,
 }: LiveVideoSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<InstanceType<NonNullable<Window["Hls"]>> | null>(null);
@@ -210,6 +219,10 @@ export function LiveVideoSurface({
   const [statusMsg, setStatusMsg] = useState<string | null>("Connecting to live stream…");
   const [hasError, setHasError] = useState(false);
   const [localRetry, setLocalRetry] = useState(0);
+  /** Same channel, other entries: offered only when this one is refused. */
+  const [alternatives, setAlternatives] = useState<
+    Array<{ id: string; name: string; number?: number; container: string; category: string }>
+  >([]);
   /** Set when a concrete fault has already been reported; the 15s timer must never overwrite it. */
   const specificErrorRef = useRef(false);
   /** True when playing directly against upstream CDN from the browser (no server segment log). */
@@ -231,10 +244,28 @@ export function LiveVideoSurface({
    */
   const directStallRef = useRef<{ code?: number; hadKeys: boolean } | null>(null);
 
+  /**
+   * The same channel on another host. Budgeted: a lookup that never arrives must not become
+   * another way for this overlay to hang, which is the failure it exists to avoid.
+   */
+  const lookUpAlternatives = () => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3500);
+    void fetch(`/api/live/alternatives?id=${encodeURIComponent(channelId)}`, { signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: unknown) => {
+        const list = (data as { alternatives?: typeof alternatives } | null)?.alternatives;
+        if (Array.isArray(list)) setAlternatives(list.slice(0, 3));
+      })
+      .catch(() => undefined)
+      .finally(() => clearTimeout(timer));
+  };
+
   const reportError = (msg: string) => {
     specificErrorRef.current = true;
     setHasError(true);
     setStatusMsg(msg);
+    lookUpAlternatives();
   };
 
   const clearOverlayIfRendering = () => {
@@ -307,8 +338,16 @@ export function LiveVideoSurface({
           return;
         }
         setHasError(true);
+        // Say something the moment the deadline expires. The old order set the error flag and
+        // then waited on /api/live/diagnose with no budget, so a slow or failed diagnosis left
+        // "Connecting to live stream…" on a black screen indefinitely -- the one outcome the
+        // product forbids.
+        setStatusMsg("No picture after 15 seconds. Checking what the stream answered…");
+        lookUpAlternatives();
+        const ctrl = new AbortController();
+        const giveUp = setTimeout(() => ctrl.abort(), 4000);
         const asked = `/api/live/diagnose?id=${encodeURIComponent(channelId)}`;
-        void fetch(asked)
+        void fetch(asked, { signal: ctrl.signal })
           .then((r) => (r.ok ? r.json() : null))
           .then((report: unknown) => {
             if (specificErrorRef.current) return;
@@ -352,10 +391,11 @@ export function LiveVideoSurface({
           .catch(() => {
             if (!specificErrorRef.current) {
               setStatusMsg(
-                "The stream started but no video arrived. The channel's segments were refused or the format is unsupported.",
+                "The stream did not start. This channel's host refused it or the format is unsupported here — try another channel.",
               );
             }
-          });
+          })
+          .finally(() => clearTimeout(giveUp));
         return;
       }
       settled = true;
@@ -1150,12 +1190,41 @@ export function LiveVideoSurface({
         a viewer is trying to use.
       */}
       {statusMsg && (
-        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/65 p-6 text-center">
-          <p className="max-w-md text-sm text-muted-foreground">{statusMsg}</p>
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 overflow-y-auto bg-black/65 p-4 text-center">
+          <p className="max-w-md text-xs text-muted-foreground sm:text-sm">{statusMsg}</p>
           {hasError && (
-            <Button variant="secondary" onClick={() => setLocalRetry((n) => n + 1)} className="glass rounded-full px-5">
-              <RefreshCw className="mr-2 size-4" /> Retry Live Stream
-            </Button>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <Button variant="secondary" onClick={() => setLocalRetry((n) => n + 1)} className="glass rounded-full px-4 text-xs">
+                <RefreshCw className="mr-2 size-4" /> Retry Live Stream
+              </Button>
+              {onNextChannel && (
+                <Button variant="secondary" onClick={onNextChannel} className="glass rounded-full px-4 text-xs">
+                  <SkipForward className="mr-2 size-4" /> Next Channel
+                </Button>
+              )}
+            </div>
+          )}
+          {/* The same channel, on a host that has not refused us. These playlists list it once per
+              reseller category, so a dead entry usually has a live sibling two taps away. */}
+          {hasError && alternatives.length > 0 && onSwitchChannel && (
+            <div className="w-full max-w-md space-y-1.5">
+              <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                Same channel, other sources
+              </p>
+              <div className="flex flex-wrap justify-center gap-1.5">
+                {alternatives.map((alt) => (
+                  <button
+                    key={alt.id}
+                    type="button"
+                    onClick={() => onSwitchChannel(alt.id)}
+                    className="glass rounded-full px-3 py-1 text-[11px] font-semibold text-foreground"
+                  >
+                    {alt.number !== undefined && <span className="mr-1 tabular-nums text-accent">{alt.number}</span>}
+                    {alt.container.toUpperCase()} · {alt.category}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
         </div>
       )}

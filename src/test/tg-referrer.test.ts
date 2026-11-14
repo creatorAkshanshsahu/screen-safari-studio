@@ -89,11 +89,21 @@ describe("the playlist's referrer directive is honoured", () => {
     expect(seg!.headers["Referer"]).toBe("https://premiumplugx.example/");
   });
 
-  it("does not invent a referrer for a channel that declares none", async () => {
+  it("sends the host's own origin when the playlist declares none", async () => {
+    // Never somebody else's page: the only referrer a browser could have produced for this host
+    // is the host's own origin, which is also what a hotlink rule expects to see.
     const net = stub();
     await openManifest("tg:9001");
     const upstream = net.calls.find((c) => c.url.includes("/live/plain/"));
     expect(upstream).toBeDefined();
-    expect(upstream!.headers["Referer"]).toBeUndefined();
+    expect(upstream!.headers["Referer"]).toBe("https://cdn.premiumplugx.example/");
+  });
+
+  it("never claims the STREAMR page as the referrer", async () => {
+    const net = stub();
+    await openManifest("tg:9001");
+    for (const call of net.calls) {
+      expect(call.headers["Referer"] ?? "").not.toContain("player.example");
+    }
   });
 });
