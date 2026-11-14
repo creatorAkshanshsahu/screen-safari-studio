@@ -217,6 +217,12 @@ export function LiveVideoSurface({
   const autoDirectRetryRef = useRef(0);
   /** Channel key the auto-retry budget belongs to; reset when the channel or manual reload changes. */
   const autoRetryKeyRef = useRef("");
+  /**
+   * The proxy's verdict on whether the advertised ClearKey id is the one the manifest declares
+   * (`exact` / `relabelled` / `unmatched` / `none`). A mismatch decrypts to a black picture with
+   * no error at all, so it must be reported as a key fault rather than guessed at.
+   */
+  const keyMatchRef = useRef<string | null>(null);
 
   const reportError = (msg: string) => {
     specificErrorRef.current = true;
@@ -307,10 +313,24 @@ export function LiveVideoSurface({
               return;
             }
             const bytes = segs.reduce((n, x) => n + (x.bytes ?? 0), 0);
+            if (bytes <= 0) {
+              setStatusMsg("Segments were requested and answered without data.");
+              return;
+            }
+            // Bytes reaching the worker is not the same as frames reaching the screen: encrypted
+            // segments with the wrong key arrive perfectly well and decode to nothing. Say which
+            // fault it is when the proxy already knows, instead of offering "key or codec".
+            const km = keyMatchRef.current;
+            if (km === "unmatched" || km === "relabelled") {
+              setStatusMsg(
+                km === "unmatched"
+                  ? "This source's key is not the one this channel's manifest declares, so the picture cannot be decrypted. A wrong key, not the network — try another source for this channel."
+                  : "This source's key carried a different id than the channel's manifest and was re-applied to it. If the picture stays black, the key itself is wrong for this channel rather than the connection.",
+              );
+              return;
+            }
             setStatusMsg(
-              bytes > 0
-                ? "Segments arrived but produced no picture. The key or the codec is wrong for this channel, not the network."
-                : "Segments were requested and answered without data.",
+              "Segments arrived but produced no picture. The key or the codec is wrong for this channel, not the network.",
             );
           })
           .catch(() => {
@@ -1029,6 +1049,7 @@ export function LiveVideoSurface({
           return;
         }
         const kind = (res.headers.get("x-stream-container") || "").toLowerCase();
+        keyMatchRef.current = res.headers.get("x-clear-key-match");
         const matched = parseKeyHeader(res.headers.get("x-clear-keys"));
         probeCtrl.abort();
         if (kind === "dash") startDash(streamUrl(".mpd"), matched);
