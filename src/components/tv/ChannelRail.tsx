@@ -7,13 +7,38 @@ import type { LiveChannelDto } from "@/lib/live-gateway";
 export function ChannelRail() {
   const [liveItems, setLiveItems] = useState<LiveChannelDto[]>([]);
 
+  /*
+   * The home page is often the first request a cold instance sees, which is exactly when the
+   * playlist is not in memory yet. One attempt left the rail showing placeholder channels until the
+   * viewer reloaded. It asks again instead -- twice more, then the static rail stands in.
+   */
   useEffect(() => {
-    fetch("/api/live/channels?source=tgtv&filter=all&limit=16")
-      .then((r) => r.json())
-      .then((d: { channels?: LiveChannelDto[] }) => {
-        if (d.channels && d.channels.length > 0) setLiveItems(d.channels);
-      })
-      .catch(() => undefined);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+
+    const load = async () => {
+      attempt += 1;
+      try {
+        const res = await fetch("/api/live/channels?source=tgtv&filter=all&limit=16");
+        const d = (await res.json()) as { channels?: LiveChannelDto[] };
+        if (cancelled) return;
+        if (d.channels && d.channels.length > 0) {
+          setLiveItems(d.channels);
+          return;
+        }
+      } catch {
+        // A transient failure is a reason to ask again, not a reason to give up on the rail.
+      }
+      if (cancelled || attempt >= 3) return;
+      timer = setTimeout(() => void load(), attempt === 1 ? 1500 : 4000);
+    };
+
+    void load();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, []);
 
   return (
