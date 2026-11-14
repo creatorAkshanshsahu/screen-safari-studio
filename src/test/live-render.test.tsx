@@ -66,6 +66,29 @@ describe("Live route", () => {
     });
   });
 
+  it("never floats a hint over the header or the channel guide", async () => {
+    // The report: a "Tap to Unmute Live Audio" bubble at `top-24` landed on the channel name and
+    // the filter pills on a phone -- covering the controls it was telling you to use.
+    renderLive();
+    await waitFor(() => expect(screen.getAllByText("Colors HD").length).toBeGreaterThan(0));
+    const page = document.body;
+    const floating = [...page.querySelectorAll("button")].filter((b) =>
+      /Tap to Unmute Live Audio/.test(b.textContent ?? ""),
+    );
+    expect(floating).toHaveLength(0);
+    // The cue lives on the control that performs it.
+    expect(screen.getAllByText(/Unmute|Mute/).length).toBeGreaterThan(0);
+  });
+
+  it("keeps branding in the header row, where it cannot cover anything", async () => {
+    renderLive();
+    await waitFor(() => expect(screen.getAllByText("AK TV").length).toBeGreaterThan(0));
+    const brand = screen.getAllByTitle("STREAMR home");
+    expect(brand.length).toBeGreaterThan(0);
+    // In the header, not absolutely positioned over the player.
+    for (const el of brand) expect(el.className).not.toContain("absolute");
+  });
+
   it("shows each channel's number, which is how a viewer names one", async () => {
     renderLive();
     await waitFor(() => expect(screen.getAllByText("Colors HD").length).toBeGreaterThan(0));
