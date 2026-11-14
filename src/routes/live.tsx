@@ -156,12 +156,24 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
     if (hex) setAccent(hex);
   }, []);
 
+  /**
+   * Picking a channel is an act of the viewer, so it replaces what the URL asked for.
+   *
+   * Without this, `requestedId` -- captured once from the address bar -- outlived every click: the
+   * stage kept preferring the link's channel over the one just chosen, so the guide worked and the
+   * picture never changed. No picture, and no way to pick another.
+   */
+  const pickChannel = (id: string) => {
+    setRequestedId("");
+    setActiveId(id);
+  };
+
   const stepChannel = (delta: number) => {
     const pool = visibleChannels.length > 0 ? visibleChannels : channels;
     if (pool.length === 0 || !activeChannel) return;
     const idx = Math.max(0, pool.findIndex((c) => c.id === activeChannel.id));
     const next = pool[(idx + delta + pool.length) % pool.length];
-    if (next) setActiveId(next.id);
+    if (next) pickChannel(next.id);
   };
 
   const copySnippet = (key: string, text: string) => {
@@ -204,19 +216,19 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
   });
 
   /*
-   * The player mounts on the id the URL asked for, and only takes the catalogue's version of that
-   * channel once it is known. `activeChannel` cannot be trusted before then: while the list is
-   * loading it falls back to the first entry, which is a different channel from the one in the
-   * address bar -- and a mounted player keyed on the wrong id would start the wrong stream.
+   * The player mounts on a channel the catalogue has actually named -- never on a guess.
+   *
+   * Mounting on the id from the address bar looked like a free head start and was not: on a cold
+   * instance the engine's first probe ran before the catalogue existed, was answered with a 504
+   * that carries no direct-play recipe, and the frame sat on "Connecting to …" with nothing to
+   * fall back to. The list is one request away, it warms the catalogue the probe then reads, and
+   * the player is no longer the thing that pays for the cold start.
+   *
+   * While the list is still loading, `activeChannel` falls back to the first entry, which may be a
+   * different channel from the one in the address bar -- so it is only accepted once it matches.
    */
-  const requestedChannel = activeChannel && (!requestedId || matchesRequest(requestedId, activeChannel)) ? activeChannel : null;
-  const stageChannel: StageChannel | null = requestedChannel
-    ? describe(requestedChannel)
-    : requestedId
-      ? { id: requestedId, name: decodeURIComponent(requestedId), source }
-      : activeChannel
-        ? describe(activeChannel)
-        : null;
+  const stageChannel: StageChannel | null =
+    activeChannel && (!requestedId || matchesRequest(requestedId, activeChannel)) ? describe(activeChannel) : null;
 
   const activeNumber = activeChannel ? String(activeChannel.number ?? activeChannel.id) : "";
 
@@ -270,7 +282,7 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
           watermark={{ href: "/", title: "STREAMR home" }}
           onContainerDetected={setContainerKind}
           onNextChannel={() => stepChannel(1)}
-          onSwitchChannel={(id) => setActiveId(id)}
+          onSwitchChannel={pickChannel}
           extras={
             <div className="flex items-center gap-1.5">
               <button
@@ -410,7 +422,7 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
                 <button
                   type="button"
                   key={ch.id}
-                  onClick={() => setActiveId(ch.id)}
+                  onClick={() => pickChannel(ch.id)}
                   aria-pressed={selected}
                   className={`flex items-center gap-2.5 rounded-xl p-2.5 text-left transition ${
                     selected ? "bg-primary text-primary-foreground" : "glass hover:border-accent/60"
