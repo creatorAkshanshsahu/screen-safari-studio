@@ -6,3 +6,5 @@
 - [ ] Restyle live, movie, and series players and verify their controls.
 - [ ] Deliver an updated cyberpunk TV design Markdown guide.
 - [x] Add "by Akshansh Sahu" to the full logo and produce a new entrance video MP4.
+- [ ] Add "by Akshansh Sahu" to the in-app logo and refresh the app icon.
+- [ ] Diagnose and fix live-channel playback.
