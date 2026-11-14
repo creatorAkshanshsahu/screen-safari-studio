@@ -75,7 +75,7 @@ describe("links handed to other machines use the public origin", () => {
     vi.stubGlobal("fetch", async () => new Response("", { status: 404 }));
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = await maybeHandleLiveRequest(
-      new Request("http://internal:3000/api/live/channels", {
+      new Request("http://internal:3000/api/live/channels?source=maxtv", {
         headers: {
           host: "internal:3000",
           "x-forwarded-host": "screen-safari-studio.lovable.app",
@@ -94,7 +94,7 @@ describe("links handed to other machines use the public origin", () => {
     vi.stubGlobal("fetch", async () => new Response("", { status: 404 }));
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = await maybeHandleLiveRequest(
-      new Request("http://localhost:3000/api/live/channels", {
+      new Request("http://localhost:3000/api/live/channels?source=maxtv", {
         headers: { host: "localhost:3000", "x-forwarded-host": "telly.example", "x-forwarded-proto": "https" },
       }),
       {},

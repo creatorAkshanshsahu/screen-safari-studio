@@ -6,6 +6,14 @@
  */
 
 export interface LiveChannelItem {
+  /**
+   * The channel's own number, for dialling it: `/embed/143`, `/live/143`.
+   *
+   * The playlist's `tvg-chno` when it has one, otherwise position in the playlist. Either way it
+   * is the shortest thing a viewer can write down or read out, and it survives the playlist being
+   * edited as long as the ordering holds.
+   */
+  number?: number;
   id: string;
   rawId: string;
   source: "maxtv" | "starshare" | "jio" | "tgtv";
@@ -40,6 +48,8 @@ export interface LiveChannelDto {
    * entry point resolves either form.
    */
   key: string;
+  /** The channel's number: what a viewer reads out, links, and types. */
+  number?: number;
   source: "maxtv" | "starshare" | "jio" | "tgtv";
   name: string;
   category: string;
@@ -1026,6 +1036,8 @@ interface ParsedM3uEntry {
   name: string;
   url: string;
   tvgId: string;
+  /** `tvg-chno`, when the playlist numbers its channels. */
+  chno: string;
   logo: string;
   group: string;
   /** `#KODIPROP:...license_type=clearkey` — these channels are DRM protected. */
@@ -1080,6 +1092,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
         ...{
           name,
           tvgId: attrs["tvg-id"] || attrs["tvg-chno"] || attrs["channel-id"] || "",
+          chno: attrs["tvg-chno"] || "",
           logo: attrs["tvg-logo"] || "",
           group: attrs["group-title"] || "",
         },
@@ -2783,6 +2796,7 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
   return entries.map((e, i) => ({
     id: `tg:${e.tvgId || i}`,
     rawId: e.tvgId || String(i),
+    number: /^\d+$/.test(e.chno) ? Number(e.chno) : i + 1,
     source: "tgtv" as const,
     name: e.name,
     category: e.group || "AK TV",
@@ -2915,6 +2929,14 @@ export function findChannelByAnyId<T extends { id: string; rawId: string; name: 
     return rid === bare || rid === bareBare || stripProviderSuffix(rid) === bareBare;
   });
   if (byPlaylistId) return byPlaylistId;
+
+  // A bare number is a channel number ("143"), which is the form a viewer is most likely to
+  // share: short enough to read out loud.
+  if (/^\d+$/.test(bareBare)) {
+    const n = Number(bareBare);
+    const byNumber = items.find((c) => (c as { number?: number }).number === n);
+    if (byNumber) return byNumber;
+  }
 
   const byName = items.find((c) => channelSlug(c.name) === bareBare);
   if (byName) return byName;
@@ -4433,7 +4455,9 @@ function renderEmbedKitHtml(origin: string): string {
     ${sections.map((x) => sectionCard(x.source, x.label)).join("")}
     <section>
       <h2>One channel</h2>
-      <p>Replace the id with any channel id from <code>/api/live/channels?source=tgtv&amp;filter=all</code>.</p>
+      <p>Every channel has a number. <code>/embed/143</code> is the same channel as
+      <code>/embed/tg%3A1001</code> is as <code>/embed/sony-set-hd</code> — numbers are the
+      easiest to read out, names are the ones that survive the playlist changing.</p>
       ${box(
         "one",
         `<iframe src="${origin}/embed/tg%3A3436" title="STREAMR" width="100%" style="aspect-ratio:16/9;border:0;border-radius:12px;background:#000" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`,
@@ -4544,6 +4568,12 @@ function renderPlaylistEmbedHtml(source: "tgtv" | "jio" | "maxtv", origin: strin
           img.loading = "lazy";
           b.appendChild(img);
         }
+        if (c.number !== undefined) {
+          const n = document.createElement("span");
+          n.textContent = String(c.number);
+          n.style.cssText = "opacity:.55;font-variant-numeric:tabular-nums;flex-shrink:0;";
+          b.appendChild(n);
+        }
         const s = document.createElement("span");
         s.textContent = c.name;
         b.appendChild(s);
@@ -4572,8 +4602,8 @@ function renderWidgetSdkJs(): string {
   if (!s) return;
   const origin = new URL(s.src, location.href).origin;
   const mount = document.querySelector(s.getAttribute("data-target") || "#og-live-tv");
-  const source = s.getAttribute("data-source") || "maxtv";
-  const filter = s.getAttribute("data-filter") || "hindi";
+  const source = s.getAttribute("data-source") || "tgtv";
+  const filter = s.getAttribute("data-filter") || "all";
   if (!mount) return;
   mount.innerHTML = '<div style="background:#080711;border:1px solid rgba(255,255,255,.1);border-radius:16px;overflow:hidden;color:#fff;font-family:system-ui,sans-serif;"><div style="aspect-ratio:16/9;background:#000;"><iframe id="sr-f" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen style="width:100%;height:100%;border:0;"></iframe></div><div style="padding:14px;"><input id="sr-q" type="search" placeholder="Search Live TV…" style="width:100%;margin-bottom:10px;background:#121022;border:1px solid rgba(255,255,255,.15);color:#fff;padding:8px 14px;border-radius:999px;font-size:13px;"/><div id="sr-g" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;max-height:260px;overflow:auto;"></div><a href="' + origin + '/" target="_top" rel="noopener" style="display:inline-flex;align-items:center;gap:6px;margin-top:12px;color:rgba(255,255,255,.62);text-decoration:none;font-size:10px;font-weight:800;letter-spacing:.14em;"><img src="' + origin + '/favicon.png" alt="" width="16" height="16" style="border-radius:4px;display:block;" /><span>STREAMR</span></a></div></div>';
   const f = mount.querySelector("#sr-f"), q = mount.querySelector("#sr-q"), g = mount.querySelector("#sr-g");
@@ -4584,7 +4614,7 @@ function renderWidgetSdkJs(): string {
     g.innerHTML = "";
     all.filter(c => !t || (c.name + " " + c.category).toLowerCase().includes(t)).slice(0, 120).forEach(c => {
       const b = document.createElement("button");
-      b.textContent = c.name;
+      b.textContent = (c.number !== undefined ? c.number + " · " : "") + c.name;
       b.style.cssText = "text-align:left;padding:8px 10px;border-radius:10px;cursor:pointer;border:1px solid " + (c.id === cur ? "#00ecf7" : "rgba(255,255,255,.1)") + ";background:#121022;color:#fff;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
       b.onclick = () => pick(c);
       g.appendChild(b);
@@ -4610,6 +4640,7 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
   return {
     id: ch.id,
     key,
+    ...(ch.number !== undefined ? { number: ch.number } : {}),
     source: ch.source,
     name: ch.name,
     category: displayCategoryName(ch.category),
@@ -4721,8 +4752,10 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   }
 
   if (path === "/api/live/channels") {
-    const source = url.searchParams.get("source") || "maxtv";
-    const filter = url.searchParams.get("filter") || "hindi";
+    // AK TV is the only source the site offers, so it is also the default: a request that names
+    // no source must not quietly serve a portal the UI no longer shows.
+    const source = url.searchParams.get("source") || "tgtv";
+    const filter = url.searchParams.get("filter") || "all";
     const q = (url.searchParams.get("q") || "").trim().toLowerCase();
     const category = (url.searchParams.get("category") || "").trim().toLowerCase();
     const force = url.searchParams.get("refresh") === "1";
@@ -4792,8 +4825,8 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   }
 
   if (path === "/api/live/playlist.m3u") {
-    const source = url.searchParams.get("source") || "maxtv";
-    const filter = url.searchParams.get("filter") || "hindi";
+    const source = url.searchParams.get("source") || "tgtv";
+    const filter = url.searchParams.get("filter") || "all";
     const raw = await getChannelsBySource(cfg, source, false);
     let filtered = raw.filter((c) => keepsByFilter(c.name, c.category, filter));
     if (filtered.length === 0 && filter !== "all") filtered = raw;

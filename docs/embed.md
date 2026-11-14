@@ -1,5 +1,22 @@
 # Putting a STREAMR player on another website
 
+## Share links look like this
+
+```
+https://PLAYER/live/143          ← one channel, by its number
+https://PLAYER/live/colors-hd    ← the same channel, by name (survives playlist edits)
+https://PLAYER/embed/143         ← the same channel, as a player only, for another site
+```
+
+Every channel has a **number** and a **name key**. Copying the address bar while watching a
+channel gives you its own URL, and pasting it opens that channel and nothing else — the site no
+longer lands on a default source.
+
+There is one source: **AK TV**. maxTV and JioTV are gone; a request that names no source gets
+AK TV.
+
+---
+
 Four things you can put on someone else's page, smallest effort first:
 
 - **the AK TV section** — player *and* channel list — **one `<iframe>`, no ids**
@@ -117,14 +134,15 @@ it does not sit on a spinner.
 
 ### Where the ids come from
 
-| Prefix | Source | Example |
-|---|---|---|
-| `tg:` | **AK TV** playlist | `tg:3436` |
-| `jio:` | JioTV | `jio:143` |
-| `st:` | maxTV portal | `st:1001` |
+| Form | Example |
+|---|---|
+| number | `143` |
+| name key | `colors-hd` |
+| catalogue id | `tg:3436` |
 
-The ids are stable. They are the same in the app, in links, and in an embed, so a channel you
-embed today keeps working.
+Numbers come from the playlist's `tvg-chno` when it has one, otherwise its position in the
+playlist. The name key does not depend on the playlist at all, so it is the form to use for links
+you expect to last.
 
 ---
 

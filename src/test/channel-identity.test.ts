@@ -11,7 +11,7 @@ import { channelKey, channelSlug, findChannelByAnyId } from "@/lib/live-gateway"
  * forgiving without ever landing on the wrong channel.
  */
 
-type Row = { id: string; rawId: string; name: string; source: string };
+type Row = { id: string; rawId: string; name: string; source: string; number?: number };
 
 const rec = (id: string, rawId: string, name: string, source = "tgtv"): Row => ({
   id,
@@ -78,6 +78,19 @@ describe("findChannelByAnyId", () => {
     // "set-hd" must not resolve to "SET HD Movies" and vice versa.
     expect(findChannelByAnyId(POOL, "tg:set-hd-movies")?.name).toBe("SET HD Movies");
     expect(findChannelByAnyId([rec("tg:1", "1", "SET HD Movies")], "tg:set-hd")).toBeNull();
+  });
+
+  it("resolves a channel by its number, which is the shortest thing to share", () => {
+    const numbered: Row[] = [
+      { ...rec("tg:1001", "1001", "Star Plus HD"), number: 1 },
+      { ...rec("tg:1002", "1002", "Sony SET HD"), number: 2 },
+      { ...rec("tg:1003", "1003", "Colors HD"), number: 143 },
+    ];
+    expect(findChannelByAnyId(numbered, "143")?.name).toBe("Colors HD");
+    expect(findChannelByAnyId(numbered, "1")?.name).toBe("Star Plus HD");
+    // A number that matches no channel number but is a real playlist id still resolves by id.
+    expect(findChannelByAnyId(numbered, "tg:1002")?.name).toBe("Sony SET HD");
+    expect(findChannelByAnyId(numbered, "999")).toBeNull();
   });
 
   it("returns null rather than guessing when nothing matches", () => {
