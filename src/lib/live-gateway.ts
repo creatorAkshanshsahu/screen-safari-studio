@@ -2510,24 +2510,15 @@ const tgtvCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | 
   error: null,
 };
 
-async function fetchTgTvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
-  // Primary: GioTV / TG V1 1,176-channel JSON catalogue (works on Cloudflare Workers with full ClearKeys).
-  const gio = await loadGioTvRawCached(false);
-  if (gio.length > 0) {
-    return gio.map((g) => ({
-      id: `tg:${g.id}`,
-      rawId: g.id,
-      source: "tgtv" as const,
-      name: g.name,
-      category: g.category || "TG TV",
-      logo: g.logo,
-      cmd: g.urls[0]!,
-      mediaType: jioMediaType(g.urls[0]!),
-      ...(g.keys.length ? { drm: { type: "clearkey" as const, keys: g.keys } } : {}),
-    }));
-  }
-
-  // Fallback: M3U playlist at `cfg.tgtvPlaylistUrl`
+/**
+ * The TG playlist itself — `livetgtv.lovable.app/api/public/playlist.m3u`.
+ *
+ * This is the TG tab's real source. Its entries are TG's own plain-HTTPS HLS, with no cookie
+ * and no DRM, which is exactly the shape `toDto` turns into a `directUrl`: the viewer's browser
+ * plays it untouched, with no proxy in the path and no token to reconstruct. Nothing about it
+ * depends on the worker's egress address.
+ */
+async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
   if (!cfg.tgtvPlaylistUrl) return [];
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
@@ -2562,6 +2553,41 @@ async function fetchTgTvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]
     ...(e.userAgent ? { userAgent: e.userAgent } : {}),
     ...(e.cookie ? { cookie: e.cookie } : {}),
   }));
+}
+
+async function fetchTgTvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]> {
+  // Primary: the TG playlist. It used to be the *fallback*, behind GioTV's catalogue, and
+  // GioTV always returned 1,176 channels — so the TG tab silently stopped serving TG's own
+  // streams and served jio CDN channels instead. Those are blocked at the worker's address and
+  // need per-request signing in the browser, which is why the tab broke while TG's own
+  // playlist had been working. A tab named after a source should use that source.
+  let playlistError: unknown = null;
+  try {
+    const fromPlaylist = await fetchTgPlaylistCatalogue(cfg);
+    if (fromPlaylist.length > 0) return fromPlaylist;
+  } catch (err) {
+    playlistError = err;
+  }
+
+  // Fallback: GioTV's 1,176-channel JSON catalogue (ClearKeys included). Same channel numbering
+  // as JioTV, so it is a usable second choice when the playlist is unreachable.
+  const gio = await loadGioTvRawCached(false).catch(() => []);
+  if (gio.length > 0) {
+    return gio.map((g) => ({
+      id: `tg:${g.id}`,
+      rawId: g.id,
+      source: "tgtv" as const,
+      name: g.name,
+      category: g.category || "TG TV",
+      logo: g.logo,
+      cmd: g.urls[0]!,
+      mediaType: jioMediaType(g.urls[0]!),
+      ...(g.keys.length ? { drm: { type: "clearkey" as const, keys: g.keys } } : {}),
+    }));
+  }
+
+  if (playlistError) throw playlistError;
+  return [];
 }
 
 async function loadTgTvCached(cfg: GatewayConfig, force = false): Promise<LiveChannelItem[]> {
