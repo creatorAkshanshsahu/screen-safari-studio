@@ -79,6 +79,25 @@ describe("embedding by channel id", () => {
     expect(html).toMatch(/<div class="stage" id="stage">[\s\S]*class="brand"/);
   });
 
+  it("serves the whole AK TV section from one URL, without resolving anything first", async () => {
+    const net = stubNetwork();
+    const res = await embed("tgtv");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-security-policy")).toContain("frame-ancestors *");
+    const html = await res.text();
+
+    // A section page must paint instantly on someone else's site: the channel list is fetched by
+    // the browser, not by this request.
+    expect(net.urls).toEqual([]);
+    expect(html).toContain("/api/live/channels?source=");
+    expect(html).toContain('"tgtv"');
+    expect(html).toContain("AK TV");
+    // It selects channels by embedding the single-channel player, so branding and playback rules
+    // are exactly the ones already tested above.
+    expect(html).toContain('/embed/" + encodeURIComponent(ch.id)');
+    expect(html).toMatch(/<a class="brand" href="[^"]*" target="_top"/);
+  });
+
   it("still renders for an id it cannot find, so the embed never shows a blank page", async () => {
     stubNetwork();
     const res = await embed("tg:does-not-exist");
