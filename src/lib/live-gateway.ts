@@ -4411,9 +4411,30 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto, accent?: string | null): 
         if (!r.ok) {
           const j = await r.json().catch(() => ({})); c.abort();
           lastRelayError = j.error || "";
+          /*
+           * The relay's own recipe first.
+           *
+           * The route answers a refusal with the exact address it could not use, and for an AK TV
+           * reshare that address is already resolved: the reseller's playlist.php redirect has
+           * been followed server-side to the token-signed CDN manifest behind it. Handing the
+           * browser the redirector instead -- which is what this did -- asks the reseller for the
+           * stream *with the host page as its Origin*, and the answer to that is 403. The player
+           * then sat there while the one address that could have worked was already in hand.
+           */
+          const recipe = j.directPlay;
+          if (recipe && recipe.url) {
+            st.textContent = "Trying " + (recipe.label || "the direct source") + "…";
+            if (recipe.container === "hls") {
+              startHls(recipe.cookie ? withTok(recipe.url, recipe.cookie, true) : recipe.url, recipe.cookie, recipe.url);
+              if (await waitDirectFrames(7000)) return true;
+            } else if (window.shaka) {
+              startDash(recipe.url);
+              if (await waitDirectFrames(7000)) return true;
+            }
+          }
           if (await tryDirectOnce()) return;
-          // The refusal is about this address; the browser has a different one, so it is still
-          // worth trying -- but if it also fails, the error handler above quotes what we know.
+          // Last resort: the catalogue's own direct address. For a reseller redirector this is the
+          // request that gets refused, but some entries are plain CDN links and work.
           if (ch.directUrl) { startHls(ch.directUrl); return; }
           st.textContent = lastRelayError || ("HTTP " + r.status); rt.style.display = "inline-block"; return;
         }

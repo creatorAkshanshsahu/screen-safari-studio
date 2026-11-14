@@ -107,3 +107,20 @@ describe("the notice page heals itself", () => {
     expect(text).toContain("cannot load right now");
   });
 });
+
+describe("the embed hands the browser the address the server resolved", () => {
+  it("uses the relay's own recipe before the catalogue's redirector", async () => {
+    stub();
+    const { text } = await get("/embed/2524");
+    // The refusal carries the exact address the relay could not use, already resolved through the
+    // reseller's redirect. The embed used to ignore it and hand hls.js the redirector, whose answer
+    // to a browser request is 403 -- the player then waited for a stream that was already refused.
+    expect(text).toContain("const recipe = j.directPlay");
+    expect(text).toContain("recipe.url");
+    // ...and the redirector is only the last resort, after the recipe and the candidates.
+    const recipeAt = text.indexOf("const recipe = j.directPlay");
+    const redirectorAt = text.indexOf("if (ch.directUrl) { startHls(ch.directUrl); return; }");
+    expect(recipeAt).toBeGreaterThan(-1);
+    expect(redirectorAt).toBeGreaterThan(recipeAt);
+  });
+});
