@@ -836,8 +836,37 @@ async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: Live
   throw lastErr instanceof Error ? lastErr : new StalkerError(null, "The portal lists no channels");
 }
 
-/** The playable URL for one channel handle. */
-async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string> {
+/**
+ * One `create_link` exchange, reporting both the link and whatever the portal said instead.
+ *
+ * A portal may hand back the channel's own address unchanged, so the catalogue's `cmd` is a
+ * valid answer too — some panels put the media URL there and keep `create_link` for accounting.
+ */
+/**
+ * Portals address media relative to themselves and write the placeholder host into the link,
+ * e.g. `ffmpeg http://localhost/ch/1234_`. Every Stalker client rewrites that onto the portal's
+ * own host; a worker that does not will try to reach `localhost`, which is itself.
+ */
+function rewriteStalkerLoopback(raw: string, portal: string): string {
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    if (host !== "localhost" && host !== "127.0.0.1" && host !== "0.0.0.0" && host !== "::1") {
+      return raw;
+    }
+    const p = new URL(portal);
+    u.protocol = p.protocol;
+    u.host = p.host;
+    return u.toString();
+  } catch {
+    return raw;
+  }
+}
+
+async function createLinkOnce(
+  cfg: GatewayConfig,
+  cmd: string,
+): Promise<{ url: string | null; said: string | null }> {
   const body = await stalkerRequest(cfg, "itv", "create_link", {
     cmd,
     series: "",
@@ -846,10 +875,38 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
     download: "0",
     force_ch_link_check: "0",
   });
-  // A portal may hand back the channel's own address unchanged; that is a valid answer too.
-  const url = extractStalkerStreamUrl(stalkerLink(body) ?? "") || extractStalkerStreamUrl(cmd);
-  if (!url) throw new StalkerError(null, stalkerError(body) ?? "The portal returned no playable link for this channel");
-  return url;
+  const raw = extractStalkerStreamUrl(stalkerLink(body) ?? "") || extractStalkerStreamUrl(cmd);
+  const url = raw ? rewriteStalkerLoopback(raw, stalkerAccount(cfg).portal) : null;
+  return { url, said: stalkerError(body) };
+}
+
+/** The playable URL for one channel handle. */
+async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string> {
+  const first = await createLinkOnce(cfg, cmd);
+  if (first.url) return first.url;
+
+  // A portal that answers `create_link` with an empty `js` and no error text has, in practice,
+  // dropped the session between the catalogue call and this one. `isStalkerExpired` cannot see
+  // it: the portal sends no refusal to match on, so the silent empty answer is the whole
+  // message. Handshake once and ask again — a play token is only burned once it exists, so
+  // repeating a call that produced no link costs nothing.
+  stalkerSession.token = null;
+  stalkerSession.endpoint = null;
+  stalkerSession.profiled = false;
+  stalkerSession.account = null;
+  await stalkerHandshake(cfg);
+  const retried = await createLinkOnce(cfg, cmd);
+  if (retried.url) return retried.url;
+
+  // Report what actually happened rather than a sentence that reads like a network fault. A
+  // silent portal and a refusal that names a reason are different problems, and the trace in
+  // `/api/live/diagnose?source=maxtv` shows the exchange either way.
+  throw new StalkerError(
+    null,
+    retried.said ??
+      first.said ??
+      "The portal accepted the request but returned no stream address for this channel, and gave no reason. Open /api/live/diagnose?source=maxtv to see the exchange.",
+  );
 }
 
 // ---------- JioTV M3U backup source ----------
