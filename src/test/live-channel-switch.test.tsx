@@ -61,6 +61,38 @@ function renderLive(initialChannelId?: string) {
   return render(<RouterProvider router={router as never} />);
 }
 
+describe("opening the guide on a cold instance", () => {
+  /*
+   * The relay answers a cold instance in two steps: the first request comes back empty with
+   * `warming: true` (or simply empty, while the playlist is in flight), and the read lands a moment
+   * later. The page used to take the first answer as the truth and stop -- an empty guide until the
+   * viewer pressed Refresh, which is the report: "it should load whenever I open the website".
+   *
+   * It now keeps asking by itself, and this test stands in for the moment the playlist lands.
+   */
+  it("fills the guide in by itself once the playlist arrives", async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        calls += 1;
+        const body = calls === 1 ? { ok: true, channels: [], categories: [], warming: true } : payload;
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      }),
+    );
+
+    renderLive();
+    // The first answer is empty, so the page says so honestly rather than claiming to connect.
+    await waitFor(() => expect(screen.getAllByText(/AK TV returned no channels yet/).length).toBeGreaterThan(0));
+
+    // No click, no refresh: the retry brings the guide in on its own.
+    await waitFor(() => expect(screen.getByRole("button", { name: /Sports18 1 HD/ })).toBeTruthy(), {
+      timeout: 5000,
+    });
+    expect(calls).toBeGreaterThan(1);
+  });
+});
+
 describe("a channel opened from a shared link", () => {
   it("plays the channel the link named, by number", async () => {
     renderLive("2524");

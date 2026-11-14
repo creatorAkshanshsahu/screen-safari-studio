@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, Code2, Copy, Check, Search } from "lucide-react";
 import { LivePlayerStage, type StageChannel } from "@/components/tv/LivePlayerStage";
@@ -56,6 +56,10 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
    */
   const [accent, setAccent] = useState<string | null>(null);
   const [backupError, setBackupError] = useState<string | null>(null);
+  /** The relay's own words about a playlist read that failed, rather than a guess about it. */
+  const [tgtvError, setTgtvError] = useState<string | null>(null);
+  /** The relay is still reading the playlist. Ask again shortly; it is not stuck. */
+  const [warming, setWarming] = useState(false);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -66,6 +70,41 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
       setActiveId(requested);
     }
   }, [initialChannelId]);
+
+  /*
+   * The guide keeps asking.
+   *
+   * Opening the site is the one moment the playlist is definitely not in this instance's memory,
+   * and it used to be the moment the page asked exactly once -- then sat on "the playlist answered
+   * but listed nothing", which was never what happened. The playlist was still being read, or its
+   * host was slow, or the platform's proxy had cut the first request short. None of those are
+   * fixed by asking a second time later; all of them are made visible by it.
+   *
+   * Backoff, a ceiling, and a stop the moment channels arrive: five attempts over about twenty
+   * seconds, against a relay that answers its own read in eight.
+   */
+  const RETRY_DELAYS_MS = [1000, 2000, 3500, 5000, 7000];
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryAttempt = useRef(0);
+  const loadRef = useRef<(force?: boolean) => Promise<void>>(async () => undefined);
+
+  const cancelRetry = useCallback(() => {
+    if (retryTimer.current) clearTimeout(retryTimer.current);
+    retryTimer.current = null;
+  }, []);
+
+  const scheduleRetry = useCallback(() => {
+    if (retryTimer.current) return;
+    const delay = RETRY_DELAYS_MS[Math.min(retryAttempt.current, RETRY_DELAYS_MS.length - 1)];
+    if (retryAttempt.current >= RETRY_DELAYS_MS.length) return;
+    retryAttempt.current += 1;
+    retryTimer.current = setTimeout(() => {
+      retryTimer.current = null;
+      void loadRef.current(false);
+    }, delay);
+  }, []);
+
+  useEffect(() => cancelRetry, [cancelRetry]);
 
   const loadCatalogue = useCallback(
     async (force = false) => {
@@ -80,13 +119,30 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
           portalError?: string | null;
           servedBy?: string;
           backupError?: string | null;
+          tgtvError?: string | null;
+          warming?: boolean;
         };
         const list = data.channels ?? [];
         setChannels(list);
         setCategories(data.categories ?? []);
         setPortalError(data.portalError ?? null);
         setBackupError(data.backupError ?? null);
+        setTgtvError(data.tgtvError ?? null);
+        setWarming(Boolean(data.warming));
         setSelectedCategory("");
+        /*
+         * Ask again while there is nothing to show. A manual refresh is the viewer taking the
+         * wheel, so it resets the budget rather than counting against it.
+         */
+        if (list.length > 0) {
+          retryAttempt.current = 0;
+          cancelRetry();
+        } else if (force) {
+          retryAttempt.current = 0;
+          scheduleRetry();
+        } else {
+          scheduleRetry();
+        }
         if (list.length > 0) {
           /*
            * A pasted link may name a channel by number (`/live/2524`), by key
@@ -112,8 +168,27 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
   );
 
   useEffect(() => {
+    loadRef.current = loadCatalogue;
+    // A different source or filter is a different question: its retry budget starts over.
+    retryAttempt.current = 0;
     void loadCatalogue(false);
   }, [loadCatalogue]);
+
+  /*
+   * Coming back to the tab is the cheapest possible retry: the viewer is looking again, and the
+   * catalogue they were waiting for may have landed while they were away.
+   */
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onFocus = () => {
+      if (channels.length === 0 && !retryTimer.current) {
+        retryAttempt.current = 0;
+        void loadRef.current(false);
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [channels.length]);
 
   const visibleChannels = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -339,12 +414,40 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
         </section>
 
         {/* One source, so there is nothing to fall back from: say the list is short or dead. */}
-        {(portalError || backupError || (!loading && visibleChannels.length === 0)) && (
+        {(portalError || backupError || tgtvError || (!loading && visibleChannels.length === 0)) && (
           <div className="mb-3 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs">
-            <p className="font-bold text-accent">AK TV returned no channels.</p>
-            <p className="mt-0.5 text-muted-foreground">
-              {portalError ?? backupError ?? "The playlist answered but listed nothing. Press Refresh to try again."}
+            {/*
+             * "Still coming" and "came back empty" look identical on screen and are not the same
+             * thing. The page knows which, because the relay says so -- and while it is the first,
+             * the page is already asking again, so the honest label is a promise rather than an
+             * error.
+             */}
+            <p className="font-bold text-accent">
+              {channels.length === 0 && (warming || retryAttempt.current > 0)
+                ? "AK TV returned no channels yet."
+                : "AK TV returned no channels."}
             </p>
+            <p className="mt-0.5 text-muted-foreground">
+              {channels.length === 0 && (warming || retryAttempt.current > 0)
+                ? `Retrying by itself — attempt ${Math.max(retryAttempt.current, 1)}. The relay is reading the playlist${
+                    tgtvError ? ` (last answer: ${tgtvError})` : ""
+                  }.`
+                : (portalError ??
+                  tgtvError ??
+                  backupError ??
+                  "The playlist answered but listed nothing. Press Refresh to try again.")}
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                retryAttempt.current = 0;
+                cancelRetry();
+                void loadCatalogue(true);
+              }}
+              className="mt-2 rounded-full bg-accent px-3 py-1 text-[11px] font-bold text-accent-foreground"
+            >
+              Refresh now
+            </button>
           </div>
         )}
 

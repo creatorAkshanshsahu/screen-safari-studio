@@ -3126,8 +3126,16 @@ function akTvOnly<T extends { source: string }>(items: T[]): T[] {
   return items.filter((c) => c.source === "tgtv");
 }
 
-/** How long one read of the AK TV playlist may spend before it gives up. */
-const TG_PLAYLIST_TIMEOUT_MS = 10_000;
+/**
+ * How long one read of the AK TV playlist may spend before it gives up.
+ *
+ * A playlist is a single, potentially large file served by a host that is not ours, over a link
+ * that is not ours. Ten seconds was enough to fail a slow-but-healthy host -- and a failed read
+ * starts over from nothing, so the guide stayed empty for as long as the host stayed slow. Fifteen
+ * is still a deadline: the page does not wait on it any more (see `CHANNELS_FIRST_PAINT_MS`), it
+ * just keeps asking while the read completes once.
+ */
+const TG_PLAYLIST_TIMEOUT_MS = 15_000;
 
 /**
  * How long a channel open may spend learning the catalogue before answering anyway.
@@ -3141,7 +3149,7 @@ const TG_PLAYLIST_TIMEOUT_MS = 10_000;
  *
  * A budget that is shorter than the work it wraps is not a deadline, it is a guaranteed failure.
  */
-const STREAM_CATALOGUE_BUDGET_MS = 15_000;
+const STREAM_CATALOGUE_BUDGET_MS = 20_000;
 
 /**
  * The same budget for a container probe, which is a much cheaper question.
@@ -3167,6 +3175,20 @@ const STREAM_PROBE_BUDGET_MS = 6_000;
  * The work is not cancelled -- it still fills the caches, so a retry is quick.
  */
 const PROBE_ANSWER_BUDGET_MS = 6_500;
+
+/**
+ * How long the channel guide waits for the playlist on a first paint.
+ *
+ * It used to wait for the whole read, which on a cold instance is the playlist (10s) and then the
+ * backup catalogue (a second fetch) before the page was told anything at all. A viewer opening the
+ * site saw an empty guide for twenty seconds and then had to press Refresh -- and if the platform's
+ * proxy lost patience first, the request never arrived and the page said nothing whatsoever.
+ *
+ * Short enough that the guide paints and starts retrying, long enough for a warm read to land
+ * inside it. A forced refresh is an explicit ask, so it keeps the long budget: that request exists
+ * precisely to wait.
+ */
+const CHANNELS_FIRST_PAINT_MS = 8_000;
 
 /**
  * Resolve with `work`, or with the fallback once `ms` has passed — whichever is first.
@@ -4855,7 +4877,27 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
     // "All" is the line-up a viewer reads, and AK TV is all there is. Asking for a retired source
     // by name still answers -- it is a code path with tests, not a button anyone presses -- but the
     // combined list can no longer contain rows this product does not offer.
-    const listed = await getChannelsBySource(cfg, source === "all" ? "tgtv" : source, force);
+    //
+    // The wait is bounded, and whether it was the bound that ended it is reported rather than
+    // guessed at: a catalogue read that is still running is `warming`, and the page keeps asking.
+    // Silence -- an empty list with no explanation -- is what made a slow playlist indistinguishable
+    // from an empty one.
+    const overrideWait = Number((env as { LIVE_CHANNELS_WAIT_MS?: string } | null)?.LIVE_CHANNELS_WAIT_MS);
+    const waitMs =
+      Number.isFinite(overrideWait) && overrideWait > 0
+        ? overrideWait
+        : force
+          ? STREAM_CATALOGUE_BUDGET_MS
+          : CHANNELS_FIRST_PAINT_MS;
+    type Listing = { arrived: boolean; value: LiveChannelItem[] };
+    const settled = await withBudget<Listing>(
+      getChannelsBySource(cfg, source === "all" ? "tgtv" : source, force).then(
+        (value): Listing => ({ arrived: true, value }),
+      ),
+      waitMs,
+      { arrived: false, value: [] },
+    );
+    const listed = settled.value;
     const raw = source === "all" ? akTvOnly(listed) : listed;
     let filtered = raw.filter((c) => keepsByFilter(c.name, c.category, filter));
     if (filtered.length === 0 && filter !== "all") filtered = raw;
@@ -4914,6 +4956,17 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
       portalError,
       portalEndpoint: memCache.maxtv.endpoint,
       backupError: jioCache.error,
+      /*
+       * Why the guide is empty, when it is. `tgtvCache.error` has been recorded on every failed
+       * playlist read since the cache was written and had no way out of the process: the page could
+       * only say "the playlist answered but listed nothing", which is the one thing that was never
+       * true. It was not answering at all, and this is what it said when it did not.
+       */
+      tgtvError: tgtvCache.error,
+      tgtvFetchedAt: tgtvCache.fetchedAt || null,
+      listedAt: listed.length > 0 ? Date.now() : null,
+      /** The catalogue read is still running. Ask again; it is not stuck. */
+      warming: !settled.arrived,
       categories,
       channels,
     });
