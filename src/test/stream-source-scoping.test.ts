@@ -65,20 +65,59 @@ describe("stream route source scoping", () => {
     stubNetwork([]);
 
     const res = await openStream("jio:204");
-    // 504, not 503: a 503 with an empty body is the platform's dev proxy giving up before any
-    // handler ran, and the two need completely different fixes. This one came from us.
-    expect(res.status).toBe(504);
-    const body = (await res.json()) as { error: string };
+    /*
+     * The distinction that used to live in the status code now lives in the verdict header: a 5xx
+     * from the platform's dev proxy arrives with no body and no header, while this answer came
+     * from us. What the probe returns is a 200 because it is a question being answered -- the
+     * number it would have used is still in the body, for the player's message.
+     */
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-stream-verdict")).toBe("unavailable");
+    const body = (await res.json()) as { error: string; code?: number };
+    expect(body.code).toBe(504);
     expect(body.error).toContain("jio");
     expect(body.error).toContain("Press Retry");
+  });
+
+  it("answers a probe that would otherwise outlive the player's patience", async () => {
+    /*
+     * The report this fixes: "Dev server returned 502 for GET /api/live/stream/tg%3A3146.mpd
+     * ?probe=1 ... before the app handler ran". That message is the platform's proxy talking, and
+     * it means the browser hung up first: the probe's parts added up to more than the player is
+     * willing to wait, so the player abandoned a request that was still working.
+     *
+     * One deadline for the whole probe, shorter than the player's own, and a verdict instead of a
+     * dropped connection. Nothing here waits on anything that answers, so the deadline is the only
+     * thing that can end it.
+     */
+    vi.stubGlobal("fetch", () => new Promise<Response>(() => undefined));
+
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const started = Date.now();
+    const res = await maybeHandleLiveRequest(
+      new Request("http://localhost/api/live/stream/tg%3A3146.mpd?probe=1"),
+      { LIVE_PROBE_ANSWER_MS: "120" },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(res!.status).toBe(200);
+    expect(res!.headers.get("x-stream-verdict")).toBe("unavailable");
+    const body = (await res!.json()) as { ok: boolean; error: string; code?: number };
+    expect(body.ok).toBe(false);
+    expect(body.code).toBe(504);
+    expect(body.error).toContain("Press Retry");
+    // Bounded by the deadline, not by the stub: the player gives a probe eight seconds.
+    expect(elapsed).toBeLessThan(4000);
   });
 
   it("still reports an unknown id as 404 when the catalogue did load", async () => {
     stubNetwork([["jiotv-m3u", () => new Response(JIO_PLAYLIST, { status: 200 })]]);
 
     const res = await openStream("jio:999");
-    expect(res.status).toBe(404);
-    const body = (await res.json()) as { error: string };
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-stream-verdict")).toBe("unavailable");
+    const body = (await res.json()) as { error: string; code?: number };
+    expect(body.code).toBe(404);
     expect(body.error).toBe("Channel not found");
   });
 });
