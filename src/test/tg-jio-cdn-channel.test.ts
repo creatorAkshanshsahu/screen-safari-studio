@@ -57,10 +57,19 @@ describe("a TG channel that lives on the Jio CDN", () => {
     const body = (await res.json()) as {
       ok: boolean;
       error: string;
+      code?: number;
       directPlay?: { url: string; container: string; clearKeys: Record<string, string>; cookie: string };
     };
 
-    expect(res.status).toBe(502);
+    /*
+     * A probe is a question, so the answer is a 200 carrying a verdict -- not a 5xx. The player
+     * still gets the refusal and the recipe; what it no longer gets is an editor dev overlay
+     * claiming the app crashed, painted over a page that is working. The header is what proves
+     * the answer came from us rather than from the platform's proxy giving up.
+     */
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-stream-verdict")).toBe("unavailable");
+    expect(body.code).toBe(502);
     expect(body.error).toContain("450");
     // The browser is told to fetch the CDN address itself, with the channel's own keys.
     expect(body.directPlay?.url).toBe(
@@ -89,11 +98,14 @@ describe("a TG channel that lives on the Jio CDN", () => {
     });
 
     const res = await open("tg:9");
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-stream-verdict")).toBe("unavailable");
     const body = (await res.json()) as {
       error: string;
+      code?: number;
       directPlay?: { url: string };
     };
+    expect(body.code).toBe(502);
     expect(body.error).toContain("475");
     expect(body.directPlay?.url).toBe("https://edge.premiumplugx.example/kids/sonic.mpd");
   });

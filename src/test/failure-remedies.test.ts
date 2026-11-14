@@ -129,6 +129,15 @@ describe("the embed never sits on \"Connecting to live stream…\"", () => {
      * so it is pinned by reading it.
      */
     expect(src).toContain("}, [channelId, reloadNonce, localRetry]);");
+
+    /*
+     * Both ends of the probe verdict, pinned together: the relay answers a probe with a 200 and
+     * `X-Stream-Verdict: unavailable` (see live-gateway's `probeAnswer`), so the player must read
+     * that header -- otherwise the answer would be taken for a manifest, and a channel that
+     * cannot play would be handed to the DASH engine as though it could.
+     */
+    expect(src).toContain('res.headers.get("x-stream-verdict")');
+    expect(src).toContain('verdict === "unavailable"');
     expect(src).toContain("const latest = useRef({");
     expect(src).not.toMatch(/\}, \[channelId, channelName, directUrl/);
   });

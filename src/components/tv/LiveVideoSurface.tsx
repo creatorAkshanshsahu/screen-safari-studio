@@ -1233,6 +1233,14 @@ export function LiveVideoSurface({
         if (startedDirect || cancelled) return;
       }
 
+      /*
+       * Say where we are, not where we were. The direct pass leaves "Refreshing CDN token…" behind
+       * it, and that message then sits under a probe that is doing something else entirely -- for
+       * as long as the probe takes, which is the six or seven seconds a viewer spends deciding the
+       * app has hung.
+       */
+      if (!cancelled) setStatusMsg(`Connecting to ${latest.current.channelName}…`);
+
       const probeCtrl = new AbortController();
       const timer = setTimeout(() => probeCtrl.abort(), 8000);
       const wantDash = (latest.current.container || "").toLowerCase() === "dash";
@@ -1243,9 +1251,17 @@ export function LiveVideoSurface({
         const [res] = await Promise.all([fetch(streamUrl(probeExt, true), { signal: probeCtrl.signal }), enginesReady]);
         if (cancelled) return;
         clearTimeout(timer);
-        if (!res.ok) {
+        /*
+         * A probe is a question, and the relay answers it -- including when the answer is "this
+         * address cannot play this channel". The verdict header is that answer, carried on a 200
+         * so an editor's dev overlay does not paint a crash dialog over a page that is working.
+         * A 5xx with no verdict still lands here too: that one came from something in between.
+         */
+        const verdict = res.headers.get("x-stream-verdict");
+        if (!res.ok || verdict === "unavailable") {
           const j = (await res.json().catch(() => ({}))) as {
             error?: string;
+            code?: number;
             directPlay?: DirectPlayCandidate;
           };
           probeCtrl.abort();
@@ -1270,7 +1286,7 @@ export function LiveVideoSurface({
             return;
           }
           if (!cancelled) {
-            reportError(j.error || `Stream unavailable (HTTP ${res.status})`);
+            reportError(j.error || `Stream unavailable (HTTP ${j.code ?? res.status})`);
           }
           return;
         }

@@ -3155,6 +3155,20 @@ const STREAM_CATALOGUE_BUDGET_MS = 15_000;
 const STREAM_PROBE_BUDGET_MS = 6_000;
 
 /**
+ * How long a probe may spend *in total* before it answers anyway.
+ *
+ * The individual budgets above do not add up to a bounded request: a cold catalogue (6s), one
+ * upstream hop (10s) and a redirector mint (3.5s) can stack to twenty seconds. The player gives a
+ * probe eight, so on a dead channel it was the browser that gave up first -- and a request the
+ * client abandons is, for the platform's proxy, a request that never answered: the browser reports
+ * `502 ... before the app handler ran` and the editor paints it as a build error.
+ *
+ * One deadline, shorter than the player's patience, and a verdict instead of a dropped connection.
+ * The work is not cancelled -- it still fills the caches, so a retry is quick.
+ */
+const PROBE_ANSWER_BUDGET_MS = 6_500;
+
+/**
  * Resolve with `work`, or with the fallback once `ms` has passed — whichever is first.
  *
  * A route handler that outlives the platform proxy is answered with a 502 that never reaches
@@ -3609,13 +3623,37 @@ function corsEmbedHeaders(extra: Record<string, string> = {}): Record<string, st
   };
 }
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse(status: number, body: unknown, extra?: Record<string, string>): Response {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: corsEmbedHeaders({
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
+      ...extra,
     }),
+  });
+}
+
+/**
+ * A container probe is a question. Answer it -- even when the answer is "no".
+ *
+ * `?probe=1` asks one thing: what container is this channel, and can this address play it. The
+ * player is asking to decide which library to load, not to fetch a stream. Answering that question
+ * with a 5xx was a mistake with two consequences:
+ *
+ *   - A 5xx on `/api/*` is what the editor's dev overlay paints as "The app encountered an error",
+ *     over a page that is working. A dead channel looked like a crashed build.
+ *   - It made "did we answer?" indistinguishable from "the platform proxy gave up", which is the
+ *     only thing a status was carrying. The verdict header says the answer came from us, and says
+ *     so on a 200 where nothing can mistake it for a failure.
+ *
+ * Real media requests keep their statuses: a `<video>` tag and an embed SDK branch on them, and a
+ * 502 there means what a 502 always means.
+ */
+function probeAnswer(isProbe: boolean, status: number, body: Record<string, unknown>): Response {
+  if (!isProbe) return jsonResponse(status, body);
+  return jsonResponse(200, { ...body, ok: false, verdict: "unavailable", code: status }, {
+    "X-Stream-Verdict": "unavailable",
   });
 }
 
@@ -3903,8 +3941,14 @@ async function proxyMediaStream(
      * or 503 claiming "before the app handler ran", a message that names the proxy and blames the
      * build. It is neither: it is an upstream that never replied. Ten seconds per hop, then the
      * refusal path takes over and the client is handed the recipe instead of a hung request.
+     *
+     * A probe gets three. Its whole answer has to fit inside `PROBE_ANSWER_BUDGET_MS`, and the
+     * refusal itself is the useful part of that answer: waiting ten seconds to learn "refused"
+     * would mean the deadline fired first and the player was told "still resolving" instead of
+     * being handed the address it can actually play. The long wait is for the media request, where
+     * a slow first byte is normal and the viewer is watching the result.
      */
-    const hopSignal = AbortSignal.timeout(10_000);
+    const hopSignal = AbortSignal.timeout(probeOpts?.isProbe ? 3_000 : 10_000);
     let res: Response;
     try {
       res = await fetch(currentUrl, { headers: hopHeaders, redirect: "manual", signal: hopSignal });
@@ -3936,6 +3980,25 @@ async function proxyMediaStream(
       range: range ?? null,
     });
     const status = upRes?.status ?? 502;
+    if (probeOpts?.isProbe) {
+      /*
+       * The probe already has its answer: this address cannot serve the container. It is not a
+       * server fault, so it does not get a server status -- a 5xx here is what the editor turns
+       * into a crash dialog, and what a dropped connection was hiding.
+       */
+      const recipe = refusalRecipe && (isJioRefusal(status) || status >= 400)
+        ? typeof refusalRecipe === "function"
+          ? await refusalRecipe()
+          : refusalRecipe
+        : undefined;
+      return probeAnswer(true, status === 404 ? 404 : 502, {
+        ok: false,
+        error: recipe
+          ? `The stream host refused this server's address (HTTP ${status}). Playing it directly from your browser instead.`
+          : `Upstream stream returned HTTP ${status}`,
+        ...(recipe ? { directPlay: recipe } : {}),
+      });
+    }
     if (refusalRecipe && (isJioRefusal(status) || status >= 400)) {
       // Built here, not earlier: resolving a redirector costs a round trip, and it is only worth
       // spending on the path where the browser is about to be handed the address.
@@ -4556,6 +4619,32 @@ function publicOriginFor(request: Request, url: URL): string {
 // ---------- Entry Point Called from src/server.ts ----------
 
 export async function maybeHandleLiveRequest(request: Request, env: unknown): Promise<Response | null> {
+  const url = new URL(request.url);
+  /*
+   * A probe gets one deadline for everything it does. Nothing else does: a media request is
+   * streamed and must be allowed to run as long as the viewer is watching.
+   *
+   * This is the difference between "the player asked and we answered 'no'" and "the player asked,
+   * waited eight seconds, gave up, and the platform's proxy reported a 502 that never reached this
+   * file". Only one of those can be retried sensibly, and only one of them is the truth.
+   */
+  const override = Number((env as { LIVE_PROBE_ANSWER_MS?: string } | null)?.LIVE_PROBE_ANSWER_MS);
+  const budget = Number.isFinite(override) && override > 0 ? override : PROBE_ANSWER_BUDGET_MS;
+  if (!url.pathname.startsWith("/api/live/stream/") || url.searchParams.get("probe") !== "1") {
+    return handleLiveRequest(request, env);
+  }
+  return withBudget(
+    handleLiveRequest(request, env),
+    budget,
+    probeAnswer(true, 504, {
+      ok: false,
+      error:
+        "The relay is still resolving this channel and could not answer in time. Press Retry, or pick another channel — the resolution keeps running in the background.",
+    }),
+  );
+}
+
+async function handleLiveRequest(request: Request, env: unknown): Promise<Response | null> {
   const url = new URL(request.url);
   const path = url.pathname;
 
@@ -5227,12 +5316,12 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       // status is the only thing that tells them apart from the browser console.
       if (pool.length === 0) {
         const source = /^(jio|tg|st|xt):/i.exec(rawId)?.[1]?.toLowerCase() ?? "live";
-        return jsonResponse(504, {
+        return probeAnswer(isProbe, 504, {
           ok: false,
           error: `The ${source} catalogue did not load in time, so this channel could not be resolved. Press Retry — the catalogue keeps loading in the background.`,
         });
       }
-      return jsonResponse(404, { ok: false, error: "Channel not found" });
+      return probeAnswer(isProbe, 404, { ok: false, error: "Channel not found" });
     }
 
     if (handoff && handoff.kind === "mpegts" && handoff.resolvedUrl) {
@@ -5264,7 +5353,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     }
 
     if (ch.source === "tgtv") {
-      if (!ch.cmd) return jsonResponse(503, { ok: false, error: "This AK TV channel has no stream URL" });
+      if (!ch.cmd) return probeAnswer(isProbe, 503, { ok: false, error: "This AK TV channel has no stream URL" });
       // Some TG playlist entries are not on TG's host at all: they point at a Jio CDN address,
       // which answers the worker's egress with 450/451 and the viewer's browser with 200 and
       // `Access-Control-Allow-Origin: *`. Proxying one can only fail, so say so immediately and
@@ -5289,7 +5378,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         return { ...recipe, url: await resolveManifestUrl(recipe.url, headers) };
       };
       if (isJioCdnHost(ch.cmd)) {
-        return jsonResponse(502, {
+        return probeAnswer(isProbe, 502, {
           ok: false,
           error: `This channel streams from the Jio CDN, which refuses the server's address (HTTP 450). It is being played directly from your browser instead.`,
           directPlay: await recipeFor(),
