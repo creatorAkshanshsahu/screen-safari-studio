@@ -183,19 +183,6 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
         />
       )}
 
-      {autoMutedBanner && muted && (
-        <button
-          type="button"
-          onClick={() => {
-            setMuted(false);
-            setAutoMutedBanner(false);
-          }}
-          className="glass absolute left-1/2 top-24 z-30 -translate-x-1/2 rounded-full border border-accent/60 px-4 py-2 text-xs font-bold text-foreground shadow-lg transition hover:bg-accent hover:text-accent-foreground"
-        >
-          <VolumeX className="mr-1.5 inline size-4" /> Tap to Unmute Live Audio
-        </button>
-      )}
-
       <div className="bg-player-scrim pointer-events-none absolute inset-0" />
 
       {/* Top Bar */}
@@ -205,8 +192,22 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
             <ArrowLeft className="size-5" />
           </Link>
           <span className="rounded bg-live px-2.5 py-0.5 text-xs font-bold tracking-widest text-white">LIVE</span>
+          {/* Branding, in the header row rather than floating over the picture.
+              On a phone the player and the channel guide occupy the same box, so a corner overlay
+              lands on the controls or the channel you are trying to pick — which is exactly what
+              was reported. In the embed the badge stays over the video, because there the video
+              really is the whole frame and nothing sits under it. */}
+          <Link
+            to="/"
+            title="STREAMR home"
+            aria-label="STREAMR"
+            className="glass inline-flex shrink-0 items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-extrabold tracking-[0.14em] text-foreground no-underline"
+          >
+            <img src="/favicon.png" alt="" width={14} height={14} className="size-3.5 rounded-[3px]" />
+            STREAMR
+          </Link>
           <div>
-            <p className="font-display text-lg font-bold md:text-2xl">
+            <p className="font-display text-base font-bold leading-tight [overflow-wrap:anywhere] line-clamp-2 md:text-2xl">
               {activeChannel?.number !== undefined && (
                 <span className="mr-2 tabular-nums text-accent">{activeChannel.number}</span>
               )}
@@ -376,16 +377,21 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
       <div className="absolute inset-x-0 bottom-0 z-20 space-y-3 p-4 md:p-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
+            {/* The browsers refuse unmuted autoplay, so we start muted and tell the viewer how to
+                fix it — on this button, which is the control that actually does it. This used to be
+                a bubble floating at `top-24`, which on a phone landed squarely on the channel name
+                and the filter pills: it covered the things you had to touch to use the page. A
+                hint must never sit on top of the UI it is describing. */}
             <Button
               variant="secondary"
               onClick={() => {
                 setAutoMutedBanner(false);
                 setMuted((m) => !m);
               }}
-              className="glass rounded-full px-4 text-xs font-bold"
+              className={`glass rounded-full px-4 text-xs font-bold ${muted && autoMutedBanner ? "animate-pulse border border-accent text-accent ring-2 ring-accent/40" : ""}`}
             >
               {muted ? <VolumeX className="mr-1.5 size-4" /> : <Volume2 className="mr-1.5 size-4" />}
-              {muted ? "Unmute" : "Mute"}
+              {muted ? (autoMutedBanner ? "Tap to Unmute" : "Unmute") : "Mute"}
             </Button>
 
             <Button
