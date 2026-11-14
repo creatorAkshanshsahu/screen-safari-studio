@@ -1035,10 +1035,14 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
 }
 
 /** "dash", "hls" or "mp4" from the media URL, never from the page. */
-function jioMediaType(url: string): "hls" | "mp4" | "dash" {
+export function jioMediaType(url: string): "hls" | "mp4" | "dash" {
   const ext = url.split("?")[0]!.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "m3u8") return "hls";
-  if (ext === "mp4") return "mp4";
+  // `mp4` is this union's bucket for everything that is not a manifest — the stream route maps
+  // it to a `.ts` URL, and the player picks the transport-stream engine from what it receives.
+  // A `.ts` address used to fall through to `dash`, which asked a DASH parser to read a
+  // transport stream: the channel was probed as `.mpd` and shown as DASH before failing.
+  if (ext === "mp4" || ext === "ts" || ext === "mpegts") return "mp4";
   return "dash";
 }
 
@@ -2660,6 +2664,54 @@ async function loadTgTvCached(cfg: GatewayConfig, force = false): Promise<LiveCh
   } catch (e) {
     tgtvCache.error = e instanceof Error ? e.message : String(e);
     return tgtvCache.items;
+  }
+}
+
+/**
+ * The catalogue a channel id names, and only that one.
+ *
+ * The stream route used to resolve every `jio:` and `st:` id through the `"all"` catalogue,
+ * which `Promise.all`s maxTV, JioTV and TG TV together. Opening a JioTV channel therefore
+ * waited on the maxTV portal: eight address candidates, twenty seconds each when a panel
+ * hangs. That is what a 502 "before the app handler ran" is -- the platform's proxy giving up
+ * on a request that was still waiting for an unrelated source. An id prefix names its source,
+ * so it is also the cheapest possible filter.
+ */
+async function loadCatalogueForId(
+  cfg: GatewayConfig,
+  rawId: string,
+  force = false,
+): Promise<LiveChannelItem[]> {
+  const id = rawId.toLowerCase();
+  if (id.startsWith("xt:")) return loadStarshareCached(cfg, force);
+  if (id.startsWith("tg:")) return loadTgTvCached(cfg, force);
+  if (id.startsWith("jio:")) return loadJioCached(cfg, force);
+  if (id.startsWith("st:")) return loadMaxtvCached(cfg, force);
+  return getChannelsBySource(cfg, "all", force);
+}
+
+/** How long a channel open may spend learning the catalogue before answering anyway. */
+const STREAM_CATALOGUE_BUDGET_MS = 8_000;
+
+/**
+ * Resolve with `work`, or with the fallback once `ms` has passed — whichever is first.
+ *
+ * A route handler that outlives the platform proxy is answered with a 502 that never reaches
+ * this code, which reads as a build error and is untraceable. Answering ourselves, late but
+ * with a status we chose, keeps the failure legible. The work is not cancelled: it still
+ * populates the cache, so a retry is fast.
+ */
+async function withBudget<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -4498,13 +4550,21 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       return new Response(handoff.body, { status: 200, headers: handoff.headers });
     }
 
-    const pool = rawId.startsWith("xt:")
-      ? await loadStarshareCached(cfg, false)
-      : rawId.startsWith("tg:")
-        ? await loadTgTvCached(cfg, false)
-        : await getChannelsBySource(cfg, "all", false);
+    const pool = await withBudget(loadCatalogueForId(cfg, rawId, false), STREAM_CATALOGUE_BUDGET_MS, []);
     const ch = pool.find((c) => c.id === rawId || c.rawId === rawId);
-    if (!ch) return jsonResponse(404, { ok: false, error: "Channel not found" });
+    if (!ch) {
+      // An empty pool means the catalogue never arrived, which is a different problem from an
+      // id that is genuinely absent — and the player should be told which. 503 rather than 502:
+      // this response came from us, so it is retryable and it names the source.
+      if (pool.length === 0) {
+        const source = /^(jio|tg|st|xt):/i.exec(rawId)?.[1]?.toLowerCase() ?? "live";
+        return jsonResponse(503, {
+          ok: false,
+          error: `The ${source} catalogue did not load in time, so this channel could not be resolved. Press Retry — the catalogue keeps loading in the background.`,
+        });
+      }
+      return jsonResponse(404, { ok: false, error: "Channel not found" });
+    }
 
     if (handoff && handoff.kind === "mpegts" && handoff.resolvedUrl) {
       return proxyMediaStream(
