@@ -87,6 +87,27 @@ export function LivePlayerStage({
 
   const bindMedia = useCallback((el: HTMLVideoElement | null) => setMediaEl(el), []);
 
+  /*
+   * Stable identities on purpose. The engine keys its playback lifecycle on the channel, but a
+   * caller that hands it a fresh arrow function on every render is a call site waiting to restart
+   * the stream -- so this one does not, and the engine no longer cares either way.
+   */
+  const handleTracks = useCallback(
+    (next: AudioTrackOption[], active: number) => {
+      setTracks(next);
+      onAudioTracksChange?.(next, active);
+    },
+    [onAudioTracksChange],
+  );
+  const handleContainer = useCallback(
+    (kind: string) => onContainerDetected?.(kind),
+    [onContainerDetected],
+  );
+  const handleAutoMuted = useCallback(() => {
+    setMuted(true);
+    setSoundPrompt(true);
+  }, []);
+
   useEffect(() => {
     if (!mediaEl) return;
     const onPlay = () => setPlaying(true);
@@ -208,15 +229,9 @@ export function LivePlayerStage({
           reloadNonce={reloadNonce + innerNonce}
           selectedAudioTrack={activeTrack}
           onMediaElement={bindMedia}
-          onAudioTracksChange={(next, active) => {
-            setTracks(next);
-            onAudioTracksChange?.(next, active);
-          }}
-          onContainerDetected={onContainerDetected}
-          onAutoMuted={() => {
-            setMuted(true);
-            setSoundPrompt(true);
-          }}
+          onAudioTracksChange={handleTracks}
+          onContainerDetected={handleContainer}
+          onAutoMuted={handleAutoMuted}
           onNextChannel={onNextChannel}
           onSwitchChannel={onSwitchChannel}
         />

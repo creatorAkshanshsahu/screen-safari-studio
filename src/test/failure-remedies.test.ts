@@ -118,5 +118,18 @@ describe("the embed never sits on \"Connecting to live stream…\"", () => {
     // And only a policy refusal counts as "the browser blocked the sound": everything else is a
     // real fault, and muting it would offer a remedy for the wrong problem.
     expect(src).toMatch(/name !== "NotAllowedError"/);
+
+    /*
+     * The playback effect may only be restarted by a different channel, a reload or a retry.
+     *
+     * It used to list the callback props too, and the stage passes a fresh arrow on every render --
+     * including the renders the engine itself causes by reporting tracks. Each one tore the stream
+     * down and started over: probe, attach, report, restart, for as long as you cared to watch.
+     * A dependency array cannot be caught by a render test here (the engine needs a media element),
+     * so it is pinned by reading it.
+     */
+    expect(src).toContain("}, [channelId, reloadNonce, localRetry]);");
+    expect(src).toContain("const latest = useRef({");
+    expect(src).not.toMatch(/\}, \[channelId, channelName, directUrl/);
   });
 });

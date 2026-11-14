@@ -71,9 +71,12 @@ describe("/watch/<id>", () => {
     expect(screen.queryByText(/Episodes/i)).toBeNull();
   });
 
-  it("mounts the player on the id the link named, before the catalogue answers", async () => {
-    // A cold catalogue read takes a second. The number in the URL is already enough for the relay,
-    // so the picture must not wait for the list.
+  it("mounts the player only once the catalogue has named the channel", async () => {
+    /*
+     * The first version of the page mounted on the id in the URL to save a round trip. On a cold
+     * instance that made the player probe before the catalogue existed, and the probe's 504 carries
+     * no direct-play recipe -- a frame stuck on "Connecting to …". Resolve first, then play.
+     */
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)) as unknown as typeof fetch);
 
     const rootRoute = createRootRoute();
@@ -89,7 +92,9 @@ describe("/watch/<id>", () => {
     const { container } = render(<RouterProvider router={router as never} />);
 
     await waitFor(() => expect(container.querySelector(".aspect-video")).not.toBeNull());
-    // The player's own identity strip is up, keyed on the id from the address bar.
-    expect(screen.getByText("2524")).toBeTruthy();
+    // The box is there, the player is not invented, and the page does not claim a channel it has
+    // not resolved.
+    expect(container.querySelector("video")).toBeNull();
+    expect(screen.queryByLabelText(/Mute|Unmute/)).toBeNull();
   });
 });

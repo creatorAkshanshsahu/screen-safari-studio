@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw, SkipForward } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { DirectPlayCandidate } from "@/lib/live-gateway";
@@ -456,6 +456,59 @@ export function LiveVideoSurface({
     if (videoRef.current) videoRef.current.muted = muted;
   }, [muted]);
 
+  /**
+   * Props that arrive later, or that a caller re-creates on every render.
+   *
+   * The playback effect is deliberately keyed on the *channel* only. Everything else -- the direct
+   * address, the ClearKey, the container, and every callback -- is read through this ref, which is
+   * refreshed on each render. That is not a micro-optimisation:
+   *
+   *   - A caller that passes `onAudioTracksChange={() => setTracks(...)}` inline creates a new
+   *     function identity on every render, and the engine itself causes those renders (tracks,
+   *     container, playing state). With callbacks in the dependency array the effect tore itself
+   *     down and started over on every one of them: probe, attach, report tracks, restart. On a
+   *     real channel that is an endless "Connecting to …" with no picture.
+   *   - A direct address that arrives a second after the player started (metadata resolving while
+   *     the frame is already up) used to be invisible to the fallback that needs it, because the
+   *     effect had closed over `undefined`.
+   *
+   * One line in a dependency array was the difference between a player and a spinner, and it was
+   * invisible from the call site. So the call site can no longer get it wrong.
+   */
+  const latest = useRef({
+    channelName,
+    directUrl,
+    drm,
+    container,
+    activeSource,
+    onAudioTracksChange,
+    onContainerDetected,
+    onAutoMuted,
+    onNextChannel,
+    onSwitchChannel,
+  });
+  latest.current = {
+    channelName,
+    directUrl,
+    drm,
+    container,
+    activeSource,
+    onAudioTracksChange,
+    onContainerDetected,
+    onAutoMuted,
+    onNextChannel,
+    onSwitchChannel,
+  };
+
+  // Stable by construction: these read the ref, so their identity never changes and they are
+  // always current.
+  const emitAudioTracks = useCallback(
+    (tracks: AudioTrackOption[], active: number) => latest.current.onAudioTracksChange?.(tracks, active),
+    [],
+  );
+  const emitContainer = useCallback((kind: string) => latest.current.onContainerDetected?.(kind), []);
+  const emitAutoMuted = useCallback(() => latest.current.onAutoMuted?.(), []);
+
   // Hand the element up once, and take it back on unmount. The callback is expected to be stable.
   useEffect(() => {
     onMediaElement?.(videoRef.current);
@@ -522,7 +575,7 @@ export function LiveVideoSurface({
         const name = (e as { name?: string } | null)?.name;
         if (name !== "NotAllowedError") return;
         el.muted = true;
-        onAutoMuted?.();
+        emitAutoMuted();
         await el.play().catch(() => undefined);
       }
     };
@@ -535,7 +588,7 @@ export function LiveVideoSurface({
         if (hindi) player.selectAudioLanguage(hindi);
       }
       const opts: AudioTrackOption[] = langs.map((name, idx) => ({ index: idx, label: name }));
-      onAudioTracksChange?.(opts, Math.max(langs.indexOf(player.getAudioLanguage() ?? ""), 0));
+      emitAudioTracks(opts, Math.max(langs.indexOf(player.getAudioLanguage() ?? ""), 0));
       await safePlay();
     };
 
@@ -560,7 +613,7 @@ export function LiveVideoSurface({
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 7000);
         try {
-          const q = `/api/live/direct-config?id=${encodeURIComponent(channelId)}&name=${encodeURIComponent(channelName)}${refresh ? "&refresh=1" : ""}`;
+          const q = `/api/live/direct-config?id=${encodeURIComponent(channelId)}&name=${encodeURIComponent(latest.current.channelName)}${refresh ? "&refresh=1" : ""}`;
           const res = await fetch(q, { signal: ctrl.signal });
           if (!res.ok) return [];
           const data = (await res.json().catch(() => null)) as { candidates?: DirectPlayCandidate[] } | null;
@@ -626,10 +679,19 @@ export function LiveVideoSurface({
         activeCookie: string,
         normalizedKeys: Record<string, string>,
       ): Promise<"played" | "refused" | "stalled"> => {
+        if (cancelled || !videoRef.current) return "stalled";
+        /*
+         * Shaka is fetched only when a DASH candidate is actually reached, so it may still be on
+         * its way here. Waiting for it is the whole point of the lazy load: the alternative was
+         * reading `window.shaka` once at the top of `tryBrowserDirect` and declaring every DASH
+         * channel "stalled" because the script had not finished downloading when the player began.
+         */
+        await ensureEngine("shaka");
+        const shaka = window.shaka;
         if (cancelled || !videoRef.current || !shaka) return "stalled";
         cleanup();
         directModeRef.current = true;
-        onContainerDetected?.("DASH");
+        emitContainer("DASH");
         setStatusMsg(`Trying ${cand.label}…`);
 
         const player = new shaka.Player();
@@ -790,7 +852,7 @@ export function LiveVideoSurface({
         if (cancelled || !videoRef.current) return false;
         cleanup();
         directModeRef.current = true;
-        onContainerDetected?.("HLS");
+        emitContainer("HLS");
         setStatusMsg(`Trying ${cand.label}…`);
         const signedHls = cand.cookie ? withHdneaToken(cand.url, cand.cookie, true) : cand.url;
         // App-faithful session token (StreamRequestPolicy): variant/segment requests are signed
@@ -844,7 +906,7 @@ export function LiveVideoSurface({
               hls.audioTrack = hindiIdx;
               preferred = hindiIdx;
             }
-            onAudioTracksChange?.(opts, preferred);
+            emitAudioTracks(opts, preferred);
           };
           hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
             syncTracks();
@@ -941,7 +1003,7 @@ export function LiveVideoSurface({
       if (!forceRefresh) {
         // Cached tokens may have expired between page load and play: one automatic
         // fresh-token pass before falling back to the (ASN-blocked) proxy path.
-        setStatusMsg(`Refreshing CDN token for ${channelName}…`);
+        setStatusMsg(`Refreshing CDN token for ${latest.current.channelName}…`);
         if (await attemptAll(await fetchCandidates(true))) return true;
         if (cancelled) return false;
       }
@@ -963,7 +1025,7 @@ export function LiveVideoSurface({
         });
         return;
       }
-      onContainerDetected?.("DASH");
+      emitContainer("DASH");
       try {
         shaka.polyfill.installAll();
         if (!shaka.Player.isBrowserSupported()) {
@@ -975,7 +1037,7 @@ export function LiveVideoSurface({
         shakaRef.current = player;
 
         const clearKeys: Record<string, string> = {};
-        const source = matched && matched.length > 0 ? matched : (drm?.keys ?? []);
+        const source = matched && matched.length > 0 ? matched : (latest.current.drm?.keys ?? []);
         for (const pair of source) {
           const kid = toHexKeyId(pair.kid);
           const key = toHexKeyId(pair.k);
@@ -1040,7 +1102,7 @@ export function LiveVideoSurface({
     const startHls = (url: string, triedDirectFallback = false) => {
       if (cancelled || !videoRef.current) return;
       cleanup();
-      onContainerDetected?.("HLS");
+      emitContainer("HLS");
       const HlsCtor = window.Hls;
       if (HlsCtor && HlsCtor.isSupported()) {
         const hls = new HlsCtor({ lowLatencyMode: true, backBufferLength: 30 });
@@ -1060,7 +1122,7 @@ export function LiveVideoSurface({
             hls.audioTrack = hindiIdx;
             preferred = hindiIdx;
           }
-          onAudioTracksChange?.(opts, preferred);
+          emitAudioTracks(opts, preferred);
         };
 
         hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
@@ -1076,8 +1138,9 @@ export function LiveVideoSurface({
           if (!triedDirectFallback) {
             void (async () => {
               if (await tryBrowserDirect(false)) return;
-              if (!cancelled && directUrl && url !== directUrl) {
-                startHls(directUrl, true);
+              const fallbackUrl = latest.current.directUrl;
+              if (!cancelled && fallbackUrl && url !== fallbackUrl) {
+                startHls(fallbackUrl, true);
                 return;
               }
               if (!cancelled) reportError(fault);
@@ -1098,7 +1161,7 @@ export function LiveVideoSurface({
       if (cancelled || !videoRef.current) return;
       cleanup();
       directModeRef.current = false;
-      onAudioTracksChange?.([], -1);
+      emitAudioTracks([], -1);
       if (!window.mpegts) {
         void ensureEngine("mpegts").then(() => {
           if (!cancelled) startMpegTs(url, fallbackToHls);
@@ -1109,7 +1172,7 @@ export function LiveVideoSurface({
         startHls(streamUrl(".m3u8"));
         return;
       }
-      onContainerDetected?.("MPEG-TS");
+      emitContainer("MPEG-TS");
       mpegtsInstance = window.mpegts.createPlayer(
         { type: "mpegts", isLive: true, url },
         { enableWorker: true, enableStashBuffer: false, liveBufferLatencyChasing: true },
@@ -1137,7 +1200,7 @@ export function LiveVideoSurface({
       specificErrorRef.current = false;
       directModeRef.current = false;
       setHasError(false);
-      setStatusMsg(`Connecting to ${channelName}…`);
+      setStatusMsg(`Connecting to ${latest.current.channelName}…`);
       /*
        * Download the engine *while* the relay is being asked about the channel, not before it.
        *
@@ -1155,7 +1218,7 @@ export function LiveVideoSurface({
       // which is what the AK TV channel report showed -- and accept a server that sends the
       // headers the playlist declared. So AK TV goes through the relay first and keeps the
       // browser-direct attempt as its fallback, not the other way round.
-      const preferDirectFirst = activeSource === "jio" || /^jio:/i.test(channelId);
+      const preferDirectFirst = latest.current.activeSource === "jio" || /^jio:/i.test(channelId);
 
       // JioTV and AK TV streams must play directly from the viewer's browser IP because
       // Cloudflare Worker datacenter egress IPs receive HTTP 450/451 from cdn.jio.com.
@@ -1172,7 +1235,7 @@ export function LiveVideoSurface({
 
       const probeCtrl = new AbortController();
       const timer = setTimeout(() => probeCtrl.abort(), 8000);
-      const wantDash = (container || "").toLowerCase() === "dash";
+      const wantDash = (latest.current.container || "").toLowerCase() === "dash";
       const probeExt = wantDash ? ".mpd" : ".ts";
       try {
         // Both at once: the probe over the network, the engine over the wire. Whichever is slower
@@ -1201,8 +1264,9 @@ export function LiveVideoSurface({
             const rescued = await tryBrowserDirect(forceRefresh);
             if (rescued || cancelled) return;
           }
-          if (!cancelled && directUrl) {
-            startHls(directUrl, true);
+          const fallbackUrl = latest.current.directUrl;
+          if (!cancelled && fallbackUrl) {
+            startHls(fallbackUrl, true);
             return;
           }
           if (!cancelled) {
@@ -1227,7 +1291,8 @@ export function LiveVideoSurface({
           if (rescued || cancelled) return;
         }
         if (!cancelled) {
-          if (directUrl) startHls(directUrl, true);
+          const fallbackUrl = latest.current.directUrl;
+          if (fallbackUrl) startHls(fallbackUrl, true);
           else if (wantDash) startDash(streamUrl(".mpd"));
           else startMpegTs(streamUrl(".ts"), true);
         }
@@ -1240,7 +1305,12 @@ export function LiveVideoSurface({
       cancelled = true;
       cleanup();
     };
-  }, [channelId, channelName, directUrl, drm, container, activeSource, reloadNonce, localRetry, onAudioTracksChange, onContainerDetected, onAutoMuted]);
+    /*
+     * Exactly three reasons to tear the player down and start again: a different channel, a
+     * reload, or a local retry. Not a new callback identity, not a late-arriving `directUrl`, not
+     * a re-render. Everything else is read live through `latest`.
+     */
+  }, [channelId, reloadNonce, localRetry]);
 
   return (
     <div className="absolute inset-0 bg-black">

@@ -84,12 +84,8 @@ describe("an embedded channel", () => {
 
     // The one-source rule, in one assertion: whatever `/live/<id>` plays, this plays.
     expect(net.calls[0]).toContain("/api/public/channels/7");
-    /*
-     * The engine is keyed on the id the embed was *given* (`7`), not on the canonical id the API
-     * returns. That is what lets the player mount before the metadata request finishes: swapping
-     * the id underneath a running player would tear the stream down and start it again.
-     */
-    expect(prop("channelId")).toBe("7");
+    // The engine is keyed on the channel the relay named, which is what the app page plays too.
+    expect(prop("channelId")).toBe("tg:3436");
     expect(prop("channelName")).toBe("Discovery Kids");
     // The first source that is not our relay: the address the app page plays when the relay is
     // refused. The embed used to be missing exactly this, which is why it sat on "connecting".
@@ -98,16 +94,32 @@ describe("an embedded channel", () => {
     expect(prop("activeSource")).toBe("tgtv");
   });
 
-  it("mounts the player before the channel metadata has arrived", async () => {
-    // A cold catalogue read is a second of the viewer's life. The id is enough to start on, so the
-    // stream is connecting while the name, the direct address and the ClearKey are still in flight.
-    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)) as unknown as typeof fetch);
+  it("resolves the channel before it starts the player", async () => {
+    /*
+     * This ordering is load-bearing, and getting it "faster" is what broke playback.
+     *
+     * Mounting on the raw id meant the engine's first probe ran against a cold catalogue. The probe
+     * is answered with a 504 that carries no direct-play recipe, and the frame sat on "Connecting
+     * to …" with nothing left to try. Asking for the channel first warms the catalogue the probe is
+     * about to read, and hands the engine its direct address and ClearKey up front.
+     */
+    let release: (value: Response) => void = () => undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (release = resolve))) as unknown as typeof fetch,
+    );
     render(<EmbedChannelPlayer rawId="2524" />);
 
+    // Waiting is honest: the frame says what it is doing, and no player is invented meanwhile.
+    await waitFor(() => expect(screen.getByText(/Tuning 2524/)).toBeTruthy());
+    expect(screen.queryByTestId("engine")).toBeNull();
+
+    release(
+      new Response(JSON.stringify(CHANNEL), { status: 200, headers: { "content-type": "application/json" } }),
+    );
     await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
-    expect(prop("channelId")).toBe("2524");
-    // Nothing is on top of the picture while it connects.
-    expect(screen.queryByLabelText("Play with sound")).toBeNull();
+    expect(prop("channelId")).toBe("tg:3436");
+    expect(screen.queryByText(/Tuning/)).toBeNull();
   });
 
   it("starts the picture immediately, without waiting for a tap", async () => {
