@@ -68,6 +68,51 @@ describe("a playlist that does not arrive", () => {
     expect(elapsed).toBeLessThan(4000);
   });
 
+  it("answers exactly what the host told this server, on demand", async () => {
+    /*
+     * "It does not load" is four different faults wearing one sentence, and the deployed site is
+     * the only place the answer exists -- a host can refuse a datacentre address and welcome a
+     * browser. This endpoint asks the host again, right now, and reports what came back: status,
+     * content type, size, the first line of the body, and whether the URL was one we configured or
+     * our own default.
+     */
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response("<html>just a moment…</html>", {
+            status: 403,
+            headers: { "content-type": "text/html; charset=UTF-8" },
+          }),
+      ),
+    );
+
+    const { status, text } = await get("/api/live/diagnose?playlist=1");
+    const body = JSON.parse(text) as {
+      kind: string;
+      ok: boolean;
+      configuredUrl: string;
+      configuredFromEnv: boolean;
+      attempt: { parsed: number; error: string | null };
+      probe: { status: number | null; contentType: string | null; firstLine: string | null; ok: boolean };
+      cache: { channels: number };
+    };
+
+    expect(status).toBe(200);
+    expect(body.kind).toBe("tgtv-playlist");
+    expect(body.ok).toBe(false);
+    expect(body.configuredUrl).toBe("https://tg.example/playlist.m3u");
+    expect(body.configuredFromEnv).toBe(true);
+    expect(body.attempt.parsed).toBe(0);
+    expect(body.attempt.error).toContain("403");
+    // The facts that distinguish a block from an empty answer from a challenge page.
+    expect(body.probe.status).toBe(403);
+    expect(body.probe.contentType).toContain("text/html");
+    expect(body.probe.firstLine).toContain("just a moment");
+    expect(body.probe.ok).toBe(false);
+    expect(body.cache.channels).toBe(0);
+  });
+
   it("reports the channels as soon as the playlist lands", async () => {
     vi.stubGlobal(
       "fetch",

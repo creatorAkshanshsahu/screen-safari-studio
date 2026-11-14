@@ -29,7 +29,11 @@ const GIO_CATALOGUE = JSON.stringify([
   },
 ]);
 
-type Body = { servedBy: string; channels: Array<{ id: string; name: string; directUrl?: string; drm?: unknown }> };
+type Body = {
+  servedBy: string;
+  channels: Array<{ id: string; name: string; directUrl?: string; drm?: unknown }>;
+  tgtvError?: string | null;
+};
 
 async function catalogue(
   handlers: Array<[string, () => Response | Promise<Response>]>,
@@ -70,25 +74,38 @@ describe("TG TV catalogue source order", () => {
     expect(body.channels.some((c) => c.name === "Sony SAB HD")).toBe(false);
   });
 
-  it("falls back to GioTV when the TG playlist refuses", async () => {
+  /*
+   * "we are only seeing the jio and old mac tv channels we don't need them"
+   *
+   * The fallback was the problem, not the rescue. When the playlist could not be read, the guide
+   * was filled from GioTV's Jio CDN catalogue and those rows were relabelled `source: "tgtv"` --
+   * so the one moment the product was broken was the moment it looked most complete, with channels
+   * it does not offer and no sign that anything had failed. "The list is not empty" is not the same
+   * question as "the playlist loaded".
+   *
+   * It is the playlist or nothing now, and the reason travels with the empty list.
+   */
+  it("stays empty rather than serving Jio channels under AK TV ids", async () => {
     const body = await catalogue([
       ["livetgtv.lovable.app", () => new Response("nope", { status: 500 })],
       ["jstr4web.json", () => new Response(GIO_CATALOGUE, { status: 200 })],
     ]);
 
-    expect(body.servedBy).toBe("tgtv");
-    expect(body.channels[0]!.name).toBe("Sony SAB HD");
-    // GioTV's entry carries ClearKeys, so it is a DASH channel, not a directUrl HLS one.
-    expect(body.channels[0]!.directUrl).toBeUndefined();
-    expect(body.channels[0]!.drm).toBeTruthy();
+    expect(body.channels).toEqual([]);
+    expect(body.tgtvError).toContain("500");
   });
 
-  it("falls back to GioTV when the playlist answers with something that is not M3U", async () => {
+  it("says what came back when the host answers with something that is not an M3U", async () => {
     const body = await catalogue([
       ["livetgtv.lovable.app", () => new Response("<html>maintenance</html>", { status: 200 })],
       ["jstr4web.json", () => new Response(GIO_CATALOGUE, { status: 200 })],
     ]);
 
-    expect(body.channels[0]!.name).toBe("Sony SAB HD");
+    expect(body.channels).toEqual([]);
+    // The line that turns "it doesn't load" into something a person can act on.
+    expect(body.tgtvError).toContain("did not return an M3U");
+    expect(body.tgtvError).toContain("bytes");
+    // The first line of the body, so an HTML challenge is recognisable at a glance.
+    expect(body.tgtvError).toContain("<html>maintenance</html>");
   });
 });
