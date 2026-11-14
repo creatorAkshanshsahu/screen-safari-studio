@@ -2572,6 +2572,49 @@ async function loadOwnEntry(cfg: GatewayConfig, rawId: string): Promise<LiveChan
  * player appends it to each request with replace-kept semantics, so every other query
  * parameter survives and an already-signed URL is left alone.
  */
+/**
+ * Follow a reseller's redirector to the address that actually serves the manifest.
+ *
+ * `premiumplug.fun/tee/playlist.php/<name>.m3u8` is not a stream: it 302s to a token-signed ZEE5
+ * address whose `hdnts` token is minted at that moment. Handing the *redirector* to a viewer's
+ * browser means the browser's first request goes to the reseller, with the embedding site as its
+ * `Origin` -- a hotlink, from their point of view, and it answers 403. Handing it the resolved
+ * address means the browser talks to the CDN that actually holds the stream, with a token that is
+ * already valid.
+ *
+ * Best-effort and bounded: on any failure the original address is returned, because a redirect we
+ * could not follow is not a reason to hand back nothing.
+ */
+async function resolveManifestUrl(
+  url: string,
+  headers: Record<string, string>,
+  maxHops = 5,
+): Promise<string> {
+  if (!/^https?:\/\//i.test(url)) return url;
+  let current = url;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3500);
+  try {
+    for (let hop = 0; hop < maxHops; hop++) {
+      const res = await fetch(current, { headers, redirect: "manual", signal: ctrl.signal });
+      // The body is never needed: only the address matters here.
+      await res.body?.cancel().catch(() => undefined);
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location");
+        if (!loc) return current;
+        current = new URL(loc, current).toString();
+        continue;
+      }
+      return current;
+    }
+    return current;
+  } catch {
+    return url;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function directRecipeFor(ch: LiveChannelItem, label: string): DirectPlayCandidate {
   return {
     label,
@@ -3015,7 +3058,18 @@ async function loadCatalogueForId(
   if (id.startsWith("tg:")) return loadTgTvCached(cfg, force);
   if (id.startsWith("jio:")) return loadJioCached(cfg, force);
   if (id.startsWith("st:")) return loadMaxtvCached(cfg, force);
-  return getChannelsBySource(cfg, "all", force);
+  /*
+   * A bare id is a channel number or a name key -- `/embed/2524`, `/embed/colors-hd` -- and it used
+   * to resolve through the "all" catalogue. That meant `Promise.all` over maxTV, JioTV and AK TV,
+   * with the two dead portals in front: maxTV's portal is unreachable and walks its address
+   * candidates one after another, so the 8s budget expired with nothing to show. An embedded
+   * player then said "the channel list is still loading" over a perfectly healthy playlist.
+   *
+   * That is the bug this line fixes, and it is why `/embed/2524` could not open: the number is a
+   * bare id, and a shared link must not queue behind two sources this product no longer offers.
+   * Named sources are untouched -- `source=maxtv` still walks its own chain.
+   */
+  return loadTgTvCached(cfg, force);
 }
 
 /** How long a channel open may spend learning the catalogue before answering anyway. */
@@ -3075,9 +3129,9 @@ async function getChannelsBySource(cfg: GatewayConfig, source: string, force = f
     const combined = [...live, ...j, ...t];
     return combined.length > 0 ? combined : m;
   }
-  // The default path is "maxTV, with JioTV and TG TV backup playlists behind it".
-  // A portal that answered with a real catalogue wins; anything else falls through
-  // so a viewer still gets channels that actually play even on Cloudflare Worker IPs.
+  // Explicitly named sources -- including the default path, which `source=maxtv` still takes --
+  // keep their old chain of fallbacks. What changed is where a *sourceless* link lands: see
+  // `loadCatalogueForId`, which is the function a channel URL actually uses.
   const maxtv = await loadMaxtvCached(cfg, force);
   if (!memCache.maxtv.usingSeed && maxtv.length > 0) return maxtv;
   const jio = await loadJioCached(cfg, force);
@@ -3750,7 +3804,7 @@ async function proxyMediaStream(
    * that recipe instead of a bare status: the refusal is about *this* address, and the browser
    * has a different one.
    */
-  refusalRecipe?: DirectPlayCandidate,
+  refusalRecipe?: DirectPlayCandidate | (() => Promise<DirectPlayCandidate>),
 ): Promise<Response> {
   const headers: Record<string, string> = overrideHeaders
     ? { Accept: "*/*", ...overrideHeaders }
@@ -3796,10 +3850,13 @@ async function proxyMediaStream(
     });
     const status = upRes?.status ?? 502;
     if (refusalRecipe && (isJioRefusal(status) || status >= 400)) {
+      // Built here, not earlier: resolving a redirector costs a round trip, and it is only worth
+      // spending on the path where the browser is about to be handed the address.
+      const recipe = typeof refusalRecipe === "function" ? await refusalRecipe() : refusalRecipe;
       return jsonResponse(502, {
         ok: false,
         error: `The stream host refused this server's address (HTTP ${status}). Playing it directly from your browser instead.`,
-        directPlay: refusalRecipe,
+        directPlay: recipe,
       });
     }
     return jsonResponse(status === 404 ? 404 : 502, {
@@ -4411,8 +4468,39 @@ function renderEmbedNoticeHtml(
   href: string,
   linkLabel: string,
   origin: string,
+  /**
+   * A path to poll for the thing that was missing. A cold catalogue is a *temporary* fact, and a
+   * visitor on someone else's site cannot be asked to press Reload in our frame: the notice has to
+   * heal itself the moment the playlist answers, and admit defeat out loud if it never does.
+   */
+  retryPath?: string,
 ): string {
   const esc = (v: string) => v.replace(/[<>&"]/g, "");
+  const retryScript = retryPath
+    ? `
+  <script>
+    (function () {
+      var tries = 0, MAX = 10, GAP = 3000;
+      var note = document.getElementById("retry-note");
+      function attempt() {
+        tries++;
+        fetch(${JSON.stringify(retryPath)} + (${JSON.stringify(retryPath)}.indexOf("?") >= 0 ? "&" : "?") + "limit=1", { cache: "no-store" })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) {
+            var list = j && (j.channels || j.sources);
+            if (list && list.length) { location.reload(); return; }
+            if (tries < MAX) { setTimeout(attempt, GAP); return; }
+            if (note) note.textContent = "The playlist is not answering. This channel cannot load right now — try again later.";
+          })
+          .catch(function () {
+            if (tries < MAX) setTimeout(attempt, GAP);
+            else if (note) note.textContent = "The playlist is not answering. This channel cannot load right now — try again later.";
+          });
+      }
+      setTimeout(attempt, 1200);
+    })();
+  </script>`
+    : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4437,8 +4525,9 @@ function renderEmbedNoticeHtml(
     <a class="brand" href="${esc(origin)}/" target="_top" rel="noopener"><img src="${esc(origin)}/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
     <h1>${esc(title)}</h1>
     <p>${esc(detail)}</p>
+    <p id="retry-note" style="font-size:12px;color:#7d8497">Trying again…</p>
     <a class="go" href="${esc(href)}" target="_top">${esc(linkLabel)}</a>
-  </div>
+  </div>${retryScript}
 </body>
 </html>`;
 }
@@ -4558,9 +4647,18 @@ function renderEmbedKitHtml(origin: string): string {
 <body>
   <div class="wrap">
     <a class="brand" href="/"><img src="/favicon.png" alt="" />STREAMR</a>
-    <h1>Embed AK TV</h1>
-    <p>Every snippet already points at the address you are reading this on, so it can be pasted as-is. No domain to edit, no placeholder to replace.</p>
+    <h1>AK TV</h1>
+    <p>Your player, live. Every snippet below already points at the address you are reading this on, so it can be pasted as-is &mdash; no domain to edit, no placeholder to replace.</p>
     <div class="origin"><b>Your player address:</b> ${origin}</div>
+
+    <h2>Your player and channel list</h2>
+    <p>This is what a host site gets. Pick a channel here; it is the same player at <code>/embed/tgtv</code>.</p>
+    <div style="position:relative;padding-top:56.25%;border-radius:12px;overflow:hidden;background:#000">
+      <iframe src="${origin}/embed/tgtv" title="AK TV · STREAMR"
+        style="position:absolute;inset:0;width:100%;height:100%;border:0"
+        allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>
+    </div>
+    <p><a href="${origin}/live" target="_top" style="color:#00ecf7">Open it full page &rarr;</a></p>
 
     <h2>One channel</h2>
     <p>Replace <code>143</code> with any channel number. A name works too (<code>/embed/colors-hd</code>), and it survives the playlist being re-sourced better than a number does.</p>
@@ -5016,6 +5114,15 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       }
       const dto = toDto(ch, publicOrigin);
       const keys = ch.drm?.keys ?? [];
+      // A reseller redirector is not a source a host site can play: it refuses a browser request.
+      // Resolve it here so `sources[]` contains something a player can open directly.
+      const resolved = dto.directUrl
+        ? await resolveManifestUrl(dto.directUrl, {
+            "User-Agent": ch.userAgent || AKTV_RELAY_USER_AGENT,
+            Accept: "*/*",
+            ...(ch.referrer ? { Referer: ch.referrer } : {}),
+          })
+        : null;
       return jsonResponse(200, {
         id: publicId(ch),
         name: ch.name,
@@ -5024,7 +5131,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         // The relay first: it handles the playlist rewriting, the segments and the referrer the
         // host demands. The direct address is offered second for players that can reach the CDN
         // themselves, which is sometimes the only path that works at all.
-        sources: [dto.streamUrl, ...(dto.directUrl ? [dto.directUrl] : [])],
+        sources: [dto.streamUrl, ...(resolved ? [resolved] : [])],
         ...(keys.length
           ? {
               drm: {
@@ -5573,12 +5680,30 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       // which answers the worker's egress with 450/451 and the viewer's browser with 200 and
       // `Access-Control-Allow-Origin: *`. Proxying one can only fail, so say so immediately and
       // hand over the recipe instead of spending a round trip to be refused.
-      const recipe = directRecipeFor(ch, "AK TV playlist · browser-direct");
+      /**
+       * What the browser is handed when the relay is refused.
+       *
+       * The reseller's redirector (`…/playlist.php/<name>.m3u8`) is not the stream: it 302s to a
+       * token-signed CDN address minted on the spot. A browser asking the redirector sends the
+       * embedding page as its `Origin` -- a hotlink, from their point of view -- and is answered
+       * 403. Following the redirect here means the browser's first request goes to the CDN that
+       * actually holds the stream, with a token that is already valid.
+       */
+      const recipeFor = async (): Promise<DirectPlayCandidate> => {
+        const recipe = directRecipeFor(ch, "AK TV playlist · browser-direct");
+        if (recipe.container !== "hls") return recipe;
+        const headers = {
+          "User-Agent": ch.userAgent || AKTV_RELAY_USER_AGENT,
+          "Accept": "*/*",
+          ...(referrerFor(ch.cmd, ch.referrer) ? { Referer: referrerFor(ch.cmd, ch.referrer) } : {}),
+        };
+        return { ...recipe, url: await resolveManifestUrl(recipe.url, headers) };
+      };
       if (isJioCdnHost(ch.cmd)) {
         return jsonResponse(502, {
           ok: false,
           error: `This channel streams from the Jio CDN, which refuses the server's address (HTTP 450). It is being played directly from your browser instead.`,
-          directPlay: recipe,
+          directPlay: await recipeFor(),
         });
       }
       return proxyMediaStream(
@@ -5607,7 +5732,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         { isProbe, handoffId: ch.id },
         // Any other host can refuse this address just as well -- the "Premium" reshares are
         // not on Jio's CDN at all and answer 475. Guess the hostname and the next one breaks.
-        recipe,
+        recipeFor,
       );
     }
 
@@ -5722,10 +5847,11 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         return new Response(
           renderEmbedNoticeHtml(
             "The channel list is still loading",
-            "This player could not load the catalogue in time. Reload in a moment and the channel will resolve.",
+            "This player could not load the catalogue in time. It is retrying by itself — no need to reload.",
             `${publicOrigin}/embed/tgtv`,
             "Browse AK TV",
             publicOrigin,
+            `${publicOrigin}/api/public/channels`,
           ),
           { status: 200, headers },
         );
