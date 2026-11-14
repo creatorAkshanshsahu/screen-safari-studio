@@ -51,25 +51,25 @@ afterEach(() => {
 });
 
 describe("a slow cold catalogue", () => {
-  it("still resolves the embed instead of rendering the loading notice", async () => {
-    // Six seconds: comfortably inside the old 10s fetch timeout, comfortably past the old 8s
-    // budget -- the exact window in which the embed used to give up while the fetch succeeded.
+  it("still resolves the channel the embed asks for", async () => {
+    // Six seconds: comfortably inside the fetch timeout, comfortably past the old 8s budget --
+    // the exact window in which the embed used to give up while the fetch succeeded.
     slowStub(6_000);
-    const { text } = await get("/embed/2524");
+    const { status, text } = await get("/api/public/channels/2524");
 
-    expect(text).not.toContain("The channel list is still loading");
+    expect(status).toBe(200);
     expect(text).toContain("&Pictures By Premium PlugX");
-    expect(text).toContain('<video id="v"');
+    expect(text).toContain("/api/live/stream/");
   }, 20_000);
 
   it("and the app's own page lands on the same channel", async () => {
     slowStub(6_000);
-    const embed = await get("/embed/2524");
+    const embed = await get("/api/public/channels/2524");
 
     vi.unstubAllGlobals();
     vi.resetModules();
     slowStub(6_000);
-    const byId = await get("/embed/tg%3A0-9-pictures");
+    const byId = await get("/api/public/channels/tg%3A0-9-pictures");
 
     // Same channel, two addresses -- which is what "it doesn't match" was about.
     expect(byId.text).toContain("&Pictures By Premium PlugX");
@@ -82,8 +82,8 @@ describe("a slow cold catalogue", () => {
     const env = { TGTV_PLAYLIST_URL: "https://tg.example/playlist.m3u" };
 
     await Promise.all([
-      maybeHandleLiveRequest(new Request("https://player.example/embed/2524"), env),
-      maybeHandleLiveRequest(new Request("https://player.example/embed/tg%3A0-9-pictures"), env),
+      maybeHandleLiveRequest(new Request("https://player.example/api/public/channels/2524"), env),
+      maybeHandleLiveRequest(new Request("https://player.example/api/public/channels/tg%3A0-9-pictures"), env),
       maybeHandleLiveRequest(new Request("https://player.example/api/public/channels/2524"), env),
     ]);
 

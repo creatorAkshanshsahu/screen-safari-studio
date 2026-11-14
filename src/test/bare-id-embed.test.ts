@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
- * "https://…/embed/2524 … when we use this link and paste it doesn't open and keep on connecting."
+ * "https://…/embed/2524 … doesn't open and keep on connecting."
  *
  * `2524` is a bare id — a channel number with no source prefix. Resolving one used to go through
  * the "all" catalogue, which is `Promise.all` over maxTV, JioTV and AK TV. maxTV's portal is
@@ -10,6 +10,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
  *
  * The playlist was fine the whole time. The embed was queueing behind two sources this product no
  * longer offers.
+ *
+ * The embed page now fetches this endpoint and plays what it returns, so the endpoint *is* the
+ * contract: same resolution, same one-source rule, same single playlist read.
  */
 
 const PLAYLIST = `#EXTM3U
@@ -39,7 +42,8 @@ async function get(path: string) {
   const res = await maybeHandleLiveRequest(new Request(`https://player.example${path}`), {
     TGTV_PLAYLIST_URL: "https://tg.example/playlist.m3u",
   });
-  return { status: res!.status, text: await res!.text() };
+  if (!res) return { status: 0, text: "", json: () => ({}) };
+  return { status: res.status, text: await res.text(), json: async () => JSON.parse(await res.clone().text()) };
 }
 
 afterEach(() => {
@@ -47,20 +51,21 @@ afterEach(() => {
   vi.resetModules();
 });
 
-describe("a bare channel number in an embed URL", () => {
-  it("resolves the channel instead of rendering \"the channel list is still loading\"", async () => {
+describe("a bare channel number", () => {
+  it("resolves to the channel, with a playable source", async () => {
     stub();
-    const { text } = await get("/embed/2524");
+    const res = await get("/api/public/channels/2524");
+    const body = JSON.parse(res.text) as { id: string; name: string; sources: string[] };
 
-    expect(text).not.toContain("The channel list is still loading");
-    // It is a player document for the right channel.
-    expect(text).toContain("&Pictures By Premium PlugX");
-    expect(text).toContain('<video id="v"');
+    expect(res.status).toBe(200);
+    expect(body.id).toBe("2524");
+    expect(body.name).toContain("&Pictures By Premium PlugX");
+    expect(body.sources[0]).toContain("/api/live/stream/");
   });
 
   it("touches the AK TV playlist and nothing else", async () => {
     const net = stub();
-    await get("/embed/2524");
+    await get("/api/public/channels/2524");
 
     const hosts = net.calls.map((u) => {
       try {
@@ -69,7 +74,6 @@ describe("a bare channel number in an embed URL", () => {
         return u;
       }
     });
-    // The dead portals must not be consulted at all: they are what the budget was being spent on.
     expect(hosts).toContain("tg.example");
     expect(hosts.some((h) => h.includes("maxtv"))).toBe(false);
     expect(hosts.some((h) => h.includes("jio"))).toBe(false);
@@ -77,50 +81,44 @@ describe("a bare channel number in an embed URL", () => {
 
   it("does it fast: one playlist read, not a chain of candidates", async () => {
     const net = stub();
-    await get("/embed/2524");
-    expect(net.calls.filter((u) => u.includes("playlist.m3u")).length).toBeLessThanOrEqual(1);
+    await get("/api/public/channels/2524");
+    expect(net.calls.filter((u) => u.includes("playlist.m3u")).length).toBe(1);
   });
 
-  it("still resolves the same channel by its prefixed id and by name", async () => {
+  it("resolves the same channel by its prefixed id and by name", async () => {
     stub();
-    const byId = await get("/embed/tg%3A0-9-pictures");
-    expect(byId.text).toContain("&Pictures By Premium PlugX");
-
+    const byNumber = await get("/api/public/channels/2524");
     vi.unstubAllGlobals();
     vi.resetModules();
+
     stub();
-    const byName = await get("/embed/pictures-by-premium-plugx");
-    expect(byName.text).toContain("&Pictures By Premium PlugX");
+    const byId = await get("/api/public/channels/tg%3A0-9-pictures");
+    vi.unstubAllGlobals();
+    vi.resetModules();
+
+    stub();
+    const byName = await get("/api/public/channels/pictures-by-premium-plugx");
+
+    // Same channel through three doors. "It doesn't match" was the report.
+    for (const res of [byNumber, byId, byName]) {
+      expect(res.text).toContain("&Pictures By Premium PlugX");
+    }
   });
 });
 
-describe("the notice page heals itself", () => {
-  it("retries instead of telling a visitor on someone else's site to reload", async () => {
-    // An empty playlist is the only thing that can produce this page now.
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("#EXTM3U\n", { status: 200 })));
-    const { text } = await get("/embed/2524");
-
-    expect(text).toContain("The channel list is still loading");
-    expect(text).toContain("/api/public/channels");
-    expect(text).toContain("location.reload()");
-    // It has to admit defeat out loud if the playlist never answers.
-    expect(text).toContain("cannot load right now");
-  });
-});
-
-describe("the embed hands the browser the address the server resolved", () => {
-  it("uses the relay's own recipe before the catalogue's redirector", async () => {
+describe("the player a host site embeds", () => {
+  it("is the app's own route, not a second hand-written player", async () => {
     stub();
-    const { text } = await get("/embed/2524");
-    // The refusal carries the exact address the relay could not use, already resolved through the
-    // reseller's redirect. The embed used to ignore it and hand hls.js the redirector, whose answer
-    // to a browser request is 403 -- the player then waited for a stream that was already refused.
-    expect(text).toContain("const recipe = j.directPlay");
-    expect(text).toContain("recipe.url");
-    // ...and the redirector is only the last resort, after the recipe and the candidates.
-    const recipeAt = text.indexOf("const recipe = j.directPlay");
-    const redirectorAt = text.indexOf("if (ch.directUrl) { startHls(ch.directUrl); return; }");
-    expect(recipeAt).toBeGreaterThan(-1);
-    expect(redirectorAt).toBeGreaterThan(recipeAt);
+    const res = await get("/embed/2524");
+    // The gateway declines, and the router renders the shared player component. One engine means
+    // a fix cannot land in the app and miss the embed -- which is what happened twice.
+    expect(res.status).toBe(0);
+  });
+
+  it("still serves the section embed as a document", async () => {
+    stub();
+    const res = await get("/embed/tgtv");
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("<!DOCTYPE html>");
   });
 });

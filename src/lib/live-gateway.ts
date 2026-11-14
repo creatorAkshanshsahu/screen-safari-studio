@@ -2927,8 +2927,15 @@ async function fetchTgTvCatalogue(cfg: GatewayConfig): Promise<LiveChannelItem[]
   return [];
 }
 
-/** An in-flight catalogue read, so background warming cannot become a stampede. */
-let tgWarmInFlight: Promise<unknown> | null = null;
+/**
+ * The catalogue read currently in flight, if any.
+ *
+ * The owner is `loadTgTvCached` itself, not the warner: a player asks for the catalogue from
+ * `/api/public/channels/<id>`, `/api/live/stream/<id>` and the listings at the same moment, and a
+ * cold instance that reads the playlist once per caller is a cold instance that reads a 2 MB file
+ * four times over. Joining is the default; only a forced refresh may start a read of its own.
+ */
+let tgReadInFlight: Promise<LiveChannelItem[]> | null = null;
 
 /**
  * Fetch the catalogue in the background if this instance does not have it.
@@ -2938,34 +2945,42 @@ let tgWarmInFlight: Promise<unknown> | null = null;
  * page retries by itself.
  */
 async function warmCatalogue(env: unknown, request: Request): Promise<void> {
-  if (tgtvCache.items.length > 0 || tgWarmInFlight) return;
+  if (tgtvCache.items.length > 0 || tgReadInFlight) return;
   const cfg = getConfig(env, request);
   if (!cfg.tgtvPlaylistUrl) return;
-  tgWarmInFlight = loadTgTvCached(cfg, false).finally(() => {
-    tgWarmInFlight = null;
-  });
-  await tgWarmInFlight.catch(() => undefined);
+  await loadTgTvCached(cfg, false).catch(() => undefined);
 }
 
 async function loadTgTvCached(cfg: GatewayConfig, force = false): Promise<LiveChannelItem[]> {
   if (!force && tgtvCache.items.length > 0 && Date.now() - tgtvCache.fetchedAt < CATALOGUE_TTL_MS) {
     return tgtvCache.items;
   }
-  // Join a read already in flight rather than starting a second one: the background warm and the
-  // request that needs the answer are asking the same question.
-  if (tgWarmInFlight) {
-    await tgWarmInFlight.catch(() => undefined);
-    if (!force && tgtvCache.items.length > 0) return tgtvCache.items;
-  }
+  // Join a read already in flight rather than starting a second one: the background warm, the
+  // stream route and the public API are all asking the same question.
+  if (!force && tgReadInFlight) return tgReadInFlight;
+
+  const read = (async (): Promise<LiveChannelItem[]> => {
+    try {
+      const live = await fetchTgTvCatalogue(cfg);
+      tgtvCache.items = live;
+      tgtvCache.fetchedAt = Date.now();
+      tgtvCache.error = null;
+      return live;
+    } catch (e) {
+      tgtvCache.error = e instanceof Error ? e.message : String(e);
+      return tgtvCache.items;
+    }
+  })();
+
+  // A forced refresh is a request for the newest answer, so it neither joins nor registers: it must
+  // not make an unrelated caller wait on a read it did not ask for.
+  if (force) return read;
+
+  tgReadInFlight = read;
   try {
-    const live = await fetchTgTvCatalogue(cfg);
-    tgtvCache.items = live;
-    tgtvCache.fetchedAt = Date.now();
-    tgtvCache.error = null;
-    return live;
-  } catch (e) {
-    tgtvCache.error = e instanceof Error ? e.message : String(e);
-    return tgtvCache.items;
+    return await read;
+  } finally {
+    if (tgReadInFlight === read) tgReadInFlight = null;
   }
 }
 
@@ -4121,554 +4136,8 @@ async function proxyMediaStream(
   });
 }
 
-function renderStandaloneEmbedHtml(ch: LiveChannelDto, accent?: string | null): string {
-  const boot = JSON.stringify(ch).replace(/</g, "\\u003c");
-  /*
-   * The host's colour, applied where the player's accent lives: the LIVE badge, the focus ring, the
-   * control hover border and the STREAMR pill. Everything else stays dark on purpose -- a themed
-   * player must still look like a video player, and a light background behind a dark broadcast is
-   * the one combination that makes a stream look broken.
-   */
-  const accentHex = parseAccent(accent);
-  const accentCss = accentHex
-    ? `
-    :root { --accent: ${accentHex}; --accent-ink: ${accentInk(accentHex)}; }`
-    : `
-    :root { --accent: #00ecf7; --accent-ink: #05121a; }`;
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="referrer" content="no-referrer" />
-  <title>${ch.name.replace(/[<>&"]/g, "")} · STREAMR Live</title>
-  <style>${accentCss}
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { width: 100%; height: 100%; background: #000; color: #f6f7fc; font-family: system-ui, sans-serif; overflow: hidden; }
-    .stage { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: #05040b; }
-    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
-    .top { position: absolute; top: 0; inset-inline: 0; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; background: linear-gradient(180deg, rgba(0,0,0,.78), transparent); pointer-events: none; }
-    .live { background: var(--accent); color: var(--accent-ink); font-size: 10px; font-weight: 800; letter-spacing: .14em; padding: 3px 8px; border-radius: 999px; margin-right: 8px; }
-    .bot { position: absolute; bottom: 0; inset-inline: 0; padding: 12px 16px; display: flex; justify-content: space-between; gap: 8px; background: linear-gradient(0deg, rgba(0,0,0,.85), transparent); }
-    button, select { background: rgba(16,14,30,.85); color: #fff; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
-    button:hover, select:hover { border-color: var(--accent); }
-    button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-    /* The way back to the site: bottom-right corner, beside Fullscreen, over the channel.
-       It lives in the control row but carries its own z-index, and neither .top nor .bot may
-       set one -- an absolute element with z-index:auto does not open a stacking context, so the
-       badge's 30 is compared against the overlay's 4 directly. Give the row a z-index and the
-       loading/error overlay covers the badge again, which is how branding went missing the
-       first time. */
-    .brand { position: relative; z-index: 30; pointer-events: auto; flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.86); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; transition: border-color .15s ease, background .15s ease; }
-    .brand:hover, .brand:focus-visible { border-color: var(--accent); background: rgba(8,7,17,.94); outline: none; }
-    .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
-    .ov { position: absolute; inset: 0; z-index: 4; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: rgba(5,4,11,.74); text-align: center; padding: 20px; }
-    .ov.hide { display: none; }
-  </style>
-</head>
-<body>
-  <div class="stage" id="stage">
-    <video id="v" playsinline autoplay></video>
-    <div class="top">
-      <div><span class="live">LIVE</span><strong id="nm"></strong></div>
-    </div>
-    <div class="ov" id="ov"><div id="st" style="font-size:13px;color:#b4bbd0;">Connecting to live stream…</div><button id="rt" style="display:none;">Reload Stream</button></div>
-    <div class="bot">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button id="pl">Pause</button>
-        <button id="mu">Mute</button>
-        <button id="rl">Reload</button>
-        <select id="au" style="display:none;"></select>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
-        <a class="brand" href="/" target="_top" rel="noopener" title="Watch more live TV on STREAMR"><img src="/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
-        <button id="fs">Fullscreen</button>
-      </div>
-    </div>
-  </div>
-  <script src="/vendor/mpegts.js"></script>
-  <script src="/vendor/hls.min.js"></script>
-  <script src="/vendor/shaka-player.compiled.js"></script>
-  <script>
-    const ch = ${boot};
-    const v = document.getElementById("v"), ov = document.getElementById("ov"), st = document.getElementById("st"), rt = document.getElementById("rt"), au = document.getElementById("au"), mu = document.getElementById("mu"), pl = document.getElementById("pl");
-    document.getElementById("nm").textContent = ch.name;
-    if (new URLSearchParams(location.search).get("muted") === "1") { v.muted = true; mu.textContent = "Unmute"; }
-    let mp = null, hp = null, sp = null;
-    function clean() {
-      if (mp) { try { mp.unload(); mp.detachMediaElement(); mp.destroy(); } catch {} mp = null; }
-      if (hp) { try { hp.destroy(); } catch {} hp = null; }
-      if (sp) { try { sp.destroy(); } catch {} sp = null; }
-      au.style.display = "none"; au.innerHTML = "";
-    }
-    function sUrl(ext, probe) { return "/api/live/stream/" + encodeURIComponent(ch.id) + ext + "?_t=" + Date.now() + (probe ? "&probe=1" : ""); }
-    function hdneaOf(s) {
-      var m = /(?:^|[?;&\s])(__hdnea__=[^;\s&"'<>]+)/.exec(String(s == null ? "" : s));
-      return m ? m[1] : null;
-    }
-    function withTok(url, tok, replace) {
-      var h = url.indexOf("#"), frag = h >= 0 ? url.slice(h) : "", base = h >= 0 ? url.slice(0, h) : url;
-      var q = base.indexOf("?"), params = (q >= 0 ? base.slice(q + 1) : "").split("&").filter(function (p) { return p.length > 0; });
-      var has = params.some(function (p) { return p.split("=", 1)[0] === "__hdnea__"; });
-      if (!replace && has) return url;
-      var kept = params.filter(function (p) { return p.split("=", 1)[0] !== "__hdnea__"; });
-      kept.push(tok);
-      return (q >= 0 ? base.slice(0, q) : base) + "?" + kept.join("&") + frag;
-    }
-    function sameHost(a, b) {
-      try { return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase(); } catch (e) { return false; }
-    }
-    // Same provider, not necessarily the same host: reshared playlists serve the manifest from
-    // one CDN edge and the segments from a sibling, and a strict comparison leaves every
-    // segment unsigned -- which the CDN answers with 450/475.
-    function sameScope(a, b) {
-      if (sameHost(a, b)) return true;
-      var ha, hb;
-      try { ha = new URL(a).hostname.toLowerCase(); hb = new URL(b).hostname.toLowerCase(); } catch (e) { return false; }
-      if (!ha || !hb) return false;
-      function reg(h) {
-        var parts = h.split(".");
-        var two = /^(?:co|com|org|net|gov|ac|edu)\.[a-z]{2}$/.test(parts.slice(-2).join("."));
-        return parts.slice(two ? -3 : -2).join(".");
-      }
-      var ra = reg(ha);
-      return ra === reg(hb) && ra.indexOf(".") >= 0;
-    }
-    // What our relay answered when it was refused, kept so that a browser-side failure can quote
-    // the real cause instead of inventing one. "Connecting…" left up with no explanation is the
-    // one outcome this player must never produce.
-    var lastRelayError = "";
-    function startHls(url, tok, host) {
-      clean();
-      if (window.Hls && Hls.isSupported()) {
-        var activeTok = tok || "";
-        hp = new Hls({ lowLatencyMode: true, xhrSetup: function (xhr, u) {
-          try {
-            xhr.addEventListener("load", function () {
-              try {
-                var fin = xhr.responseURL || "";
-                if (fin && /\.m3u8(?:[?#]|$)/i.test(u) && host && sameHost(fin, host)) {
-                  var learned = hdneaOf(fin);
-                  if (learned) activeTok = learned;
-                }
-              } catch (e) {}
-            });
-            if (!activeTok || !host || u.indexOf("allinonereborn") >= 0 || !sameHost(u, host)) return;
-            var signed = withTok(u, activeTok, false);
-            if (signed !== u) xhr.open("GET", signed, true);
-          } catch (e) {}
-        } });
-        hp.loadSource(url); hp.attachMedia(v);
-        hp.on(Hls.Events.ERROR, function (_, data) {
-          if (!data || !data.fatal) return;
-          var status = (data.response && data.response.code) || 0;
-          var browser = status ? " Your browser was refused too (HTTP " + status + ")." : "";
-          st.textContent = lastRelayError
-            ? lastRelayError + browser
-            : status === 403
-              ? "This channel's host refused the playlist (HTTP 403). The channel is live; the host is blocking us."
-              : status
-                ? "The playlist could not be loaded (HTTP " + status + ")."
-                : "This channel did not start. The host refused it or the format is unsupported here.";
-          mu.textContent = v.muted ? "Unmute" : "Mute";
-          rt.style.display = "inline-block";
-          ov.classList.remove("hide");
-        });
-        hp.on(Hls.Events.MANIFEST_PARSED, () => {
-          const tr = hp.audioTracks || [];
-          if (tr.length > 1) {
-            let hi = -1;
-            tr.forEach((t, i) => {
-              const o = document.createElement("option");
-              o.value = i; o.textContent = "Audio: " + ([t.name, t.lang].filter(Boolean).join(" · ") || ("Track " + (i + 1)));
-              if (hi < 0 && /hin|^hi$/i.test((t.name || "") + " " + (t.lang || ""))) hi = i;
-              au.appendChild(o);
-            });
-            if (hi >= 0) hp.audioTrack = hi;
-            au.value = hp.audioTrack; au.style.display = "inline-block";
-            au.onchange = () => { hp.audioTrack = Number(au.value); };
-          }
-          v.play().catch(() => { v.muted = true; mu.textContent = "Unmute"; v.play().catch(() => {}); });
-        });
-      } else { v.src = url; v.play().catch(() => {}); }
-    }
-    function hexKey(v) {
-      v = String(v == null ? "" : v).trim();
-      if (!v) return null;
-      if (/^[0-9a-fA-F]{32}$/.test(v)) return v.toLowerCase();
-      var n = v.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
-      if (!/^[A-Za-z0-9+/]+$/.test(n)) return null;
-      var p = n + "===".slice((n.length + 3) % 4);
-      try {
-        var b = atob(p);
-        if (b.length !== 16) return null;
-        var h = "";
-        for (var i = 0; i < b.length; i++) h += b.charCodeAt(i).toString(16).padStart(2, "0");
-        return h;
-      } catch (e) { return null; }
-    }
-    function startDash(url) {
-      clean();
-      if (!window.shaka) { st.textContent = "DASH playback engine did not load."; rt.style.display = "inline-block"; ov.classList.remove("hide"); return; }
-      shaka.polyfill.installAll();
-      if (!shaka.Player.isBrowserSupported()) { st.textContent = "This browser cannot play protected DASH streams."; rt.style.display = "inline-block"; ov.classList.remove("hide"); return; }
-      if (shaka.log && shaka.LogLevel) shaka.log.setLevel(shaka.LogLevel.NONE);
-      sp = new shaka.Player();
-      var ck = {};
-      ((ch.drm && ch.drm.keys) || []).forEach(function (pair) {
-        var kid = hexKey(pair.kid), k = hexKey(pair.k);
-        if (kid && k) ck[kid] = k;
-      });
-      sp.configure({
-        drm: Object.keys(ck).length ? { clearKeys: ck } : {},
-        streaming: { lowLatencyMode: true, rebufferingGoal: 2, bufferingGoal: 20, retryParameters: { maxAttempts: 4, baseDelay: 500, backoffFactor: 2, timeout: 20000 } },
-        manifest: { retryParameters: { maxAttempts: 3, baseDelay: 500, backoffFactor: 2, timeout: 20000 } }
-      });
-      sp.addEventListener("error", function () {
-        st.textContent = Object.keys(ck).length ? "This DRM channel was refused. Its ClearKey document may have rotated." : "This channel is DRM protected and no key was provided.";
-        rt.style.display = "inline-block"; ov.classList.remove("hide");
-      });
-      Promise.resolve()
-        .then(function () { return sp.attach(v); })
-        .then(function () { return sp.load(url); })
-        .then(function () {
-          var langs = sp.getAudioLanguages() || [];
-          if (langs.length > 1) {
-            Array.prototype.forEach.call(langs, function (name, i) {
-              var o = document.createElement("option");
-              o.value = name; o.textContent = "Audio: " + name;
-              au.appendChild(o);
-            });
-            var hi = langs.filter(function (l) { return /^hi/i.test(l); })[0];
-            if (hi) sp.selectAudioLanguage(hi);
-            au.value = sp.getAudioLanguage() || langs[0];
-            au.style.display = "inline-block";
-            au.onchange = function () { sp.selectAudioLanguage(au.value); };
-          }
-          v.play().catch(function () { v.muted = true; mu.textContent = "Unmute"; v.play().catch(function () {}); });
-        })
-        .catch(function () { st.textContent = "DASH playback failed to start."; rt.style.display = "inline-block"; ov.classList.remove("hide"); });
-    }
-    function startTs(url, fallback) {
-      clean();
-      if (!window.mpegts || !mpegts.isSupported()) return startHls(sUrl(".m3u8"));
-      mp = mpegts.createPlayer({ type: "mpegts", isLive: true, url }, { enableWorker: true, enableStashBuffer: false, liveBufferLatencyChasing: true });
-      mp.attachMediaElement(v); mp.load();
-      Promise.resolve(mp.play()).catch(() => { v.muted = true; mu.textContent = "Unmute"; v.play().catch(() => {}); });
-      mp.on(mpegts.Events.ERROR, () => { if (fallback) startHls(sUrl(".m3u8")); else { st.textContent = "Stream interrupted."; rt.style.display = "inline-block"; ov.classList.remove("hide"); } });
-    }
-    function waitDirectFrames(ms) {
-      return new Promise(function (resolve) {
-        const t0 = Date.now();
-        (function poll() {
-          if ((v.videoWidth > 0 && v.videoHeight > 0) || (!v.paused && v.currentTime > 0.3)) return resolve(true);
-          if (Date.now() - t0 > ms) return resolve(false);
-          setTimeout(poll, 250);
-        })();
-      });
-    }
-    async function tryDirectPlay() {
-      try {
-        const dc = new AbortController(); const dtm = setTimeout(function () { dc.abort(); }, 7000);
-        let cands = [];
-        try {
-          const dr = await fetch("/api/live/direct-config?id=" + encodeURIComponent(ch.id) + "&name=" + encodeURIComponent(ch.name || ""), { signal: dc.signal });
-          if (!dr.ok) return false;
-          const dd = await dr.json().catch(() => ({}));
-          cands = Array.isArray(dd.candidates) ? dd.candidates : [];
-        } catch { return false; } finally { clearTimeout(dtm); }
-        if (!cands.length || !window.shaka) return false;
-        shaka.polyfill.installAll();
-        if (!shaka.Player.isBrowserSupported()) return false;
-        if (shaka.log && shaka.LogLevel) shaka.log.setLevel(shaka.LogLevel.NONE);
-        const passDeadline = Date.now() + 40000;
-        for (let idx = 0; idx < cands.length; idx++) {
-          if (Date.now() > passDeadline) return false;
-          const cand = cands[idx];
-          st.textContent = "Trying " + (cand.label || "direct server") + "…";
-          if (cand.container === "hls") {
-            startHls(cand.cookie ? withTok(cand.url, cand.cookie, true) : cand.url, cand.cookie, cand.url);
-            if (await waitDirectFrames(7000)) return true;
-            continue;
-          }
-          const attempts = cand.cookie ? [cand.cookie, ""] : [""];
-          for (let a = 0; a < attempts.length; a++) {
-            clean();
-            sp = new shaka.Player();
-            const activeCookie = attempts[a];
-            let activeTok = activeCookie;
-            const ck = cand.clearKeys || {};
-            sp.configure({
-              drm: Object.keys(ck).length ? { clearKeys: ck } : {},
-              streaming: { lowLatencyMode: true, rebufferingGoal: 2, bufferingGoal: 20, retryParameters: { maxAttempts: 2, baseDelay: 300, backoffFactor: 2, timeout: 7000 } },
-              manifest: { retryParameters: { maxAttempts: 1, baseDelay: 300, backoffFactor: 2, timeout: 7000 } }
-            });
-            const net = sp.getNetworkingEngine && sp.getNetworkingEngine();
-            if (net) {
-              net.registerRequestFilter(function (type, req) {
-                if ((type !== 0 && type !== 1) || !req.uris || !req.uris[0]) return;
-                const u = req.uris[0];
-                if (u.includes("allinonereborn") || !sameScope(u, cand.url)) return;
-                if (!activeTok) return;
-                req.uris[0] = withTok(u, activeTok, false);
-              });
-            }
-            if (net) {
-              net.registerResponseFilter(function (type, resp) {
-                if (type === 0 && resp.uri) {
-                  try {
-                    if (!resp.uri.includes("allinonereborn") && sameScope(resp.uri, cand.url)) {
-                      const learned = hdneaOf(resp.uri);
-                      if (learned) activeTok = learned;
-                    }
-                  } catch (e) {}
-                }
-                if (type !== 0 || !resp.data || !Object.keys(ck).length) return;
-                try {
-                  let xml = new TextDecoder().decode(resp.data);
-                  if (!/<MPD[\s>]/i.test(xml)) return;
-                  const kids = Array.from(xml.matchAll(/default_KID\s*=\s*"([^"]+)"/gi)).map(function (m) { return m[1].replace(/-/g, "").toLowerCase(); });
-                  const ckEntries = Object.entries(ck);
-                  if (ckEntries.length === 1 && kids.length > 0 && !ck[kids[0]]) {
-                    const extra = Object.assign({}, ck);
-                    kids.forEach(function (kHex) { extra[kHex] = ckEntries[0][1]; });
-                    sp.configure({ drm: { clearKeys: extra } });
-                  }
-                  xml = xml.replace(/<ContentProtection\b[^>]*schemeIdUri="urn:uuid:(?:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed|9a04f079-9840-4286-ab92-e65be0885f95)"[^>]*>[\s\S]*?<\/ContentProtection>/gi, "");
-                  xml = xml.replace(/<ContentProtection\b[^>]*schemeIdUri="urn:uuid:(?:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed|9a04f079-9840-4286-ab92-e65be0885f95)"[^>]*\/>/gi, "");
-                  resp.data = new TextEncoder().encode(xml).buffer;
-                } catch {}
-              });
-            }
-            try {
-              await sp.attach(v);
-              const rootUrl = activeCookie ? withTok(cand.url, activeCookie, true) : cand.url;
-              await Promise.race([sp.load(rootUrl), new Promise(function (_, rej) { setTimeout(function () { rej(new Error("direct-timeout")); }, 8000); })]);
-              v.play().catch(function () { v.muted = true; mu.textContent = "Unmute"; v.play().catch(function () {}); });
-              // A manifest that loads but never renders must fail over, not trap the embed.
-              if (await waitDirectFrames(6000)) return true;
-            } catch {}
-          }
-        }
-      } catch {}
-      return false;
-    }
-    // One direct attempt per boot. It used to be tried, then tried again after the probe
-    // failed, which spent seven seconds re-learning a fact we already had -- on someone else's
-    // page, in a frame with no other content.
-    var directTried = false;
-    async function tryDirectOnce() {
-      if (directTried) return false;
-      directTried = true;
-      var got = await tryDirectPlay();
-      if (!got) st.textContent = "Direct connection did not open. Trying our relay…";
-      return got;
-    }
-    async function boot() {
-      directTried = false; lastRelayError = "";
-      clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
-      armWatchdog();
-      // Only the Jio CDN needs the viewer's own address. An AK TV channel that cannot play
-      // through our relay falls back to the browser below, on its own evidence.
-      if (ch.source === "jio" || /^jio:/i.test(String(ch.id || ""))) {
-        if (await tryDirectOnce()) return;
-      }
-      // Ask for the container the catalogue advertised. Probing ".ts" unconditionally
-      // made every DASH channel look like MPEG-TS, so the embed could never play one.
-      const wantDash = String(ch.container || "").toLowerCase() === "dash";
-      const probeExt = wantDash ? ".mpd" : ".ts";
-      const c = new AbortController(); const tm = setTimeout(() => c.abort(), 8000);
-      try {
-        const r = await fetch(sUrl(probeExt, true), { signal: c.signal }); clearTimeout(tm);
-        if (!r.ok) {
-          const j = await r.json().catch(() => ({})); c.abort();
-          lastRelayError = j.error || "";
-          /*
-           * The relay's own recipe first.
-           *
-           * The route answers a refusal with the exact address it could not use, and for an AK TV
-           * reshare that address is already resolved: the reseller's playlist.php redirect has
-           * been followed server-side to the token-signed CDN manifest behind it. Handing the
-           * browser the redirector instead -- which is what this did -- asks the reseller for the
-           * stream *with the host page as its Origin*, and the answer to that is 403. The player
-           * then sat there while the one address that could have worked was already in hand.
-           */
-          const recipe = j.directPlay;
-          if (recipe && recipe.url) {
-            st.textContent = "Trying " + (recipe.label || "the direct source") + "…";
-            if (recipe.container === "hls") {
-              startHls(recipe.cookie ? withTok(recipe.url, recipe.cookie, true) : recipe.url, recipe.cookie, recipe.url);
-              if (await waitDirectFrames(7000)) return true;
-            } else if (window.shaka) {
-              startDash(recipe.url);
-              if (await waitDirectFrames(7000)) return true;
-            }
-          }
-          if (await tryDirectOnce()) return;
-          // Last resort: the catalogue's own direct address. For a reseller redirector this is the
-          // request that gets refused, but some entries are plain CDN links and work.
-          if (ch.directUrl) { startHls(ch.directUrl); return; }
-          st.textContent = lastRelayError || ("HTTP " + r.status); rt.style.display = "inline-block"; return;
-        }
-        const kind = (r.headers.get("x-stream-container") || "").toLowerCase(); c.abort();
-        if (kind === "dash") startDash(sUrl(".mpd"));
-        else if (kind === "hls") startHls(sUrl(".m3u8"));
-        else startTs(sUrl(".ts"), true);
-      } catch { clearTimeout(tm); if (await tryDirectOnce()) return; if (wantDash) startDash(sUrl(".mpd")); else startTs(sUrl(".ts"), true); }
-    }
-    function hideIfPlaying() {
-      if ((v.videoWidth > 0 && v.videoHeight > 0 && !v.paused) || (!v.paused && v.currentTime > 0.6)) {
-        ov.classList.add("hide");
-      }
-    }
-    v.onplaying = () => {
-      pl.textContent = "Pause";
-      hideIfPlaying();
-    };
-    v.onloadeddata = hideIfPlaying;
-    v.onresize = hideIfPlaying;
-    v.ontimeupdate = hideIfPlaying;
-    let deadTimer = null;
-    function armWatchdog() {
-      clearTimeout(deadTimer);
-      deadTimer = setTimeout(() => {
-        if (v.videoWidth > 0 && v.videoHeight > 0) return;
-        if (rt.style.display !== "none") return;
-        st.textContent = "No video after 12 seconds. The stream was refused, or this channel's format is not supported here.";
-        rt.style.display = "inline-block"; ov.classList.remove("hide");
-      }, 12000);
-    }
-    v.onpause = () => { pl.textContent = "Play"; };
-    pl.onclick = () => v.paused ? v.play() : v.pause();
-    mu.onclick = () => { v.muted = !v.muted; mu.textContent = v.muted ? "Unmute" : "Mute"; };
-    document.getElementById("rl").onclick = boot; rt.onclick = boot;
-    document.getElementById("fs").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.getElementById("stage").requestFullscreen();
-    boot();
-  </script>
-</body>
-</html>`;
-}
 
-/**
- * A single sentence, in the player's frame, for a request that cannot be a player.
- *
- * It exists so "the catalogue has not loaded yet" reaches a viewer inside an iframe as words
- * rather than as JSON they never see.
- */
-function renderEmbedNoticeHtml(
-  title: string,
-  detail: string,
-  href: string,
-  linkLabel: string,
-  origin: string,
-  /**
-   * A path to poll for the thing that was missing. A cold catalogue is a *temporary* fact, and a
-   * visitor on someone else's site cannot be asked to press Reload in our frame: the notice has to
-   * heal itself the moment the playlist answers, and admit defeat out loud if it never does.
-   */
-  retryPath?: string,
-): string {
-  const esc = (v: string) => v.replace(/[<>&"]/g, "");
-  const retryScript = retryPath
-    ? `
-  <script>
-    (function () {
-      var tries = 0, MAX = 10, GAP = 3000;
-      var note = document.getElementById("retry-note");
-      function attempt() {
-        tries++;
-        fetch(${JSON.stringify(retryPath)} + (${JSON.stringify(retryPath)}.indexOf("?") >= 0 ? "&" : "?") + "limit=1", { cache: "no-store" })
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (j) {
-            var list = j && (j.channels || j.sources);
-            if (list && list.length) { location.reload(); return; }
-            if (tries < MAX) { setTimeout(attempt, GAP); return; }
-            if (note) note.textContent = "The playlist is not answering. This channel cannot load right now — try again later.";
-          })
-          .catch(function () {
-            if (tries < MAX) setTimeout(attempt, GAP);
-            else if (note) note.textContent = "The playlist is not answering. This channel cannot load right now — try again later.";
-          });
-      }
-      setTimeout(attempt, 1200);
-    })();
-  </script>`
-    : "";
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="referrer" content="no-referrer" />
-  <title>${esc(title)} · STREAMR</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; }
-    body { display: flex; align-items: center; justify-content: center; background: #05040b; color: #f6f7fc; font-family: system-ui, sans-serif; padding: 20px; text-align: center; }
-    .card { max-width: 420px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
-    .brand { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; margin-bottom: 6px; }
-    .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
-    h1 { font-size: 16px; }
-    p { font-size: 13px; color: #b4bbd0; line-height: 1.5; }
-    a.go { display: inline-block; margin-top: 6px; padding: 9px 18px; border-radius: 999px; background: #00ecf7; color: #05121a; font-size: 12px; font-weight: 800; text-decoration: none; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <a class="brand" href="${esc(origin)}/" target="_top" rel="noopener"><img src="${esc(origin)}/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
-    <h1>${esc(title)}</h1>
-    <p>${esc(detail)}</p>
-    <p id="retry-note" style="font-size:12px;color:#7d8497">Trying again…</p>
-    <a class="go" href="${esc(href)}" target="_top">${esc(linkLabel)}</a>
-  </div>${retryScript}
-</body>
-</html>`;
-}
 
-/**
- * The answer for a channel id that a catalogue does not contain.
- *
- * The old behaviour was a player shell named after the id, which spent ~22 seconds trying a
- * direct connection and a probe before admitting nothing existed -- a shared link that could
- * never work, presented as a spinner. An id that is not in the playlist is knowable at render
- * time, so saying it at render time is free.
- */
-function renderMissingEmbedHtml(rawId: string, origin: string): string {
-  const prefix = /^(?:jio|tg|st|xt):/i.exec(rawId)?.[1]?.toLowerCase() ?? "";
-  const section = prefix === "jio" ? "jio" : prefix === "st" ? "maxtv" : "tgtv";
-  const label = section === "jio" ? "JioTV" : section === "maxtv" ? "maxTV" : "AK TV";
-  const safe = rawId.replace(/[<>&"]/g, "");
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="referrer" content="no-referrer" />
-  <title>Channel not found · STREAMR</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; }
-    body { display: flex; align-items: center; justify-content: center; background: #05040b; color: #f6f7fc; font-family: system-ui, sans-serif; padding: 20px; text-align: center; }
-    .card { max-width: 440px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
-    .brand { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; margin-bottom: 6px; }
-    .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
-    h1 { font-size: 16px; }
-    p { font-size: 13px; color: #b4bbd0; line-height: 1.5; }
-    code { color: #00ecf7; word-break: break-all; }
-    a.go { display: inline-block; margin-top: 6px; padding: 9px 18px; border-radius: 999px; background: #00ecf7; color: #05121a; font-size: 12px; font-weight: 800; text-decoration: none; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <a class="brand" href="${origin}/" target="_top" rel="noopener"><img src="${origin}/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
-    <h1>This channel is not in the ${label} playlist</h1>
-    <p>The link asks for <code>${safe}</code>, and the ${label} catalogue returned no channel by that id or name.</p>
-    <p>Playlists get re-sourced, and ids built from them change when they do. Pick the channel from the list instead and it will play immediately.</p>
-    <a class="go" href="${origin}/embed/${section}" target="_top">Browse ${label} channels</a>
-  </div>
-</body>
-</html>`;
-}
 
 /**
  * The copy-paste page: `/embed`.
@@ -5102,6 +4571,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     path.startsWith("/api/live/stream/") ||
     path === "/api/live/channels" ||
     path === "/api/public/channels" ||
+    path.startsWith("/api/public/channels/") ||
     (path.startsWith("/embed/") && !/^\/embed\/(?:tgtv|jio|maxtv)\/?$/i.test(path));
   if (needsCatalogue) void warmCatalogue(env, request);
 
@@ -5939,9 +5409,9 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   if (path.startsWith("/embed/")) {
     const rawId = decodeURIComponent(path.slice("/embed/".length)).replace(/\/+$/, "");
 
-    // "The AK TV section" -- player plus that source's channel list -- needs one URL, not an id
-    // per channel. A source name is therefore answered before any catalogue is touched: the page
-    // fetches its own list from the browser, so the host's iframe paints immediately.
+    // The AK TV section -- player plus that source's channel list -- is a document, and it is
+    // served here: it fetches its own list from the browser, so the host's iframe paints
+    // immediately without waiting on any catalogue.
     const section = /^(tgtv|jio|maxtv)$/i.exec(rawId)?.[1]?.toLowerCase();
     if (section === "tgtv" || section === "jio" || section === "maxtv") {
       return new Response(renderPlaylistEmbedHtml(section, publicOrigin), {
@@ -5950,40 +5420,16 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       });
     }
 
-    // An embed is loaded by a third-party page, so it must answer promptly and it must not
-    // depend on a source it does not use: the id prefix names the catalogue, and a budget
-    // keeps a slow one from holding the frame open on someone else's site.
-    const pool = await withBudget(loadCatalogueForId(cfg, rawId, false), STREAM_CATALOGUE_BUDGET_MS, []);
-    const ch = findChannelByAnyId(pool, rawId);
-    const headers = corsEmbedHeaders({
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store",
-    });
-    if (!ch) {
-      if (pool.length === 0) {
-        // The catalogue did not arrive at all: worth another attempt. Saying so in the frame
-        // beats a spinner that resolves into nothing.
-        return new Response(
-          renderEmbedNoticeHtml(
-            "The channel list is still loading",
-            "This player could not load the catalogue in time. It is retrying by itself — no need to reload.",
-            `${publicOrigin}/embed/tgtv`,
-            "Browse AK TV",
-            publicOrigin,
-            `${publicOrigin}/api/public/channels`,
-          ),
-          { status: 200, headers },
-        );
-      }
-      // The catalogue loaded and does not contain this channel: nothing to retry.
-      return new Response(renderMissingEmbedHtml(rawId, publicOrigin), { status: 200, headers });
-    }
-    // `?colour=` themes the player for the site embedding it. Invalid values are ignored here
-    // rather than passed through: an unreadable LIVE badge is worse than a default one.
-    return new Response(renderStandaloneEmbedHtml(toDto(ch, publicOrigin), url.searchParams.get("colour")), {
-      status: 200,
-      headers,
-    });
+    /*
+     * Anything else under /embed/ is one channel, and it is the app's own player route.
+     *
+     * Returning null hands the request to the router, where `/embed/$channel` renders the shared
+     * player component. That is the point: an embed used to be a second, hand-written player that
+     * drifted from the real one -- `/live/tg:0-9-pictures` played while `/embed/2524` sat on
+     * "connecting" for the same channel, because only one of them had learned to use the resolved
+     * direct address. A fix now lands once.
+     */
+    return null;
   }
 
   return null;

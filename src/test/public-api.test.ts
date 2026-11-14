@@ -77,17 +77,24 @@ describe("?colour=", () => {
     expect(accentInk("#0000ff")).toBe("#ffffff");
   });
 
-  it("themes the embed it is asked for", async () => {
+  /*
+   * `?colour=` used to be baked into the server's HTML string. The channel embed is a route now, so
+   * the theme is applied by the component -- and the *only* thing that has to stay true is that the
+   * value a host site passes reaches the frame. See embed-player-surface.test.tsx for the render.
+   */
+  it("is applied by the player, from the address bar, not by the server", async () => {
     stub();
-    const { text } = await get("/embed/2523?colour=FF6600");
-    expect(text).toContain("--accent: #ff6600");
-    expect(text).toContain("--accent-ink: #000000");
-  });
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const res = await maybeHandleLiveRequest(
+      new Request("https://player.example/embed/2523?colour=FF6600"),
+      { TGTV_PLAYLIST_URL: "https://tg.example/playlist.m3u" },
+    );
 
-  it("keeps the default when the value is not a colour", async () => {
-    stub();
-    const { text } = await get("/embed/2523?colour=nope");
-    expect(text).toContain("--accent: #00ecf7");
+    // The gateway no longer renders this document at all: the router does, and the component reads
+    // `?colour=` on mount. Asserting HTML here would be asserting the design we deleted.
+    expect(res).toBeNull();
+    expect(parseAccent("FF6600")).toBe("#ff6600");
+    expect(accentInk("#ff6600")).toBe("#000000");
   });
 });
 

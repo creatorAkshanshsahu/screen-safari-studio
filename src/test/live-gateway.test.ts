@@ -29,24 +29,22 @@ describe("Live TV & OG Embed Gateway", () => {
 
   // `st:1001` is a seed channel: it resolves without any network, so these two assert the
   // player's own contract rather than the "id not found" page.
-  it("serves standalone iframe player HTML on /embed/:id without X-Frame-Options block", async () => {
+  it("hands one-channel embeds to the app's own player route", async () => {
+    // `/embed/<id>` used to be a second, hand-written player in a server string, and it drifted:
+    // the app learned to use the relay's resolved direct address and the embed did not, so
+    // `/live/tg:0-9-pictures` played while `/embed/2524` sat on "connecting" for the same channel.
+    // Returning null hands the request to the router, where the shared player renders.
     const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/st%3A1001"), undefined);
+    expect(res).toBeNull();
+  });
+
+  it("still serves the section embed, which is a document rather than a player", async () => {
+    const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/tgtv"), undefined);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-security-policy")).toContain("frame-ancestors *");
     const html = await res!.text();
-    expect(html).toContain("/vendor/mpegts.js");
-  });
-
-  it("embed page can play DASH channels, not just HLS and MPEG-TS", async () => {
-    const res = await maybeHandleLiveRequest(new Request("https://streamr.lovable.app/embed/st%3A1001"), undefined);
-    const html = await res!.text();
-    // Shaka has to be on the page: without it the embed has no way to open an MPD.
-    expect(html).toContain("/vendor/shaka-player.compiled.js");
-    expect(html).toContain("startDash");
-    // The probe must ask for the container the catalogue named. Hard-coding ".ts" is
-    // exactly what left every DASH channel unplayable inside an embed.
-    expect(html).toContain("wantDash");
-    expect(html).toContain('probeExt = wantDash ? ".mpd" : ".ts"');
+    // The section page carries the channel list and boots the player itself.
+    expect(html).toContain("/api/live/channels?source=");
   });
 });
