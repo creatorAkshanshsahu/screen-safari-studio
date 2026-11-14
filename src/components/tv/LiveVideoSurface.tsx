@@ -3,6 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { DirectPlayCandidate } from "@/lib/live-gateway";
 import { extractHdneaParam, isHlsPlaylistUrl, sameTokenScope, withHdneaToken } from "@/lib/direct-token";
+import { describeHlsFatal, describeShakaStall } from "@/lib/playback-faults";
 
 export interface AudioTrackOption {
   index: number;
@@ -223,6 +224,12 @@ export function LiveVideoSurface({
    * no error at all, so it must be reported as a key fault rather than guessed at.
    */
   const keyMatchRef = useRef<string | null>(null);
+  /**
+   * Why the last browser-direct attempt stalled: the player's code, and whether the channel
+   * even advertised a key. Without this the 18s watchdog had nothing to go on and blamed the
+   * network, which is the one explanation a wrong key never recovers from.
+   */
+  const directStallRef = useRef<{ code?: number; hadKeys: boolean } | null>(null);
 
   const reportError = (msg: string) => {
     specificErrorRef.current = true;
@@ -285,8 +292,17 @@ export function LiveVideoSurface({
             return;
           }
           setHasError(true);
+          // The player usually told us why (Shaka 3xxx = decode, 6xxx = DRM) and we were
+          // discarding it in favour of "switch token/server" — advice a wrong key can never
+          // benefit from. Also the case that matters for kids channels: a playlist that
+          // advertises no key at all.
+          const stall = directStallRef.current;
           setStatusMsg(
-            "Direct CDN stream is taking too long to deliver video frames. Press Retry to switch token/server.",
+            describeShakaStall({
+              ...(stall?.code !== undefined ? { code: stall.code } : {}),
+              ...(stall ? { hadKeys: stall.hadKeys } : {}),
+              ...(activeSource ? { source: activeSource } : {}),
+            }).message,
           );
           return;
         }
@@ -625,7 +641,14 @@ export function LiveVideoSurface({
           const refused = fatalStatus !== undefined && fatalStatus >= 400;
           killShaka(player);
           // A fast HTTP refusal (403/450) is worth one bare-URL retry; a stall is not.
-          return refused && Date.now() - loadStart < 8000 ? "refused" : "stalled";
+          if (!refused || Date.now() - loadStart >= 8000) {
+            directStallRef.current = {
+              ...(fatalCode !== undefined ? { code: fatalCode } : {}),
+              hadKeys: Object.keys(normalizedKeys).length > 0,
+            };
+            return "stalled";
+          }
+          return "refused";
         }
         if (cancelled) {
           killShaka(player);
@@ -639,7 +662,12 @@ export function LiveVideoSurface({
         const framed = await waitForFirstFrame(6000, () => fatalStatus !== undefined && fatalStatus >= 400);
         if (cancelled || !framed) {
           killShaka(player);
-          return fatalStatus !== undefined && fatalStatus >= 400 ? "refused" : "stalled";
+          if (fatalStatus !== undefined && fatalStatus >= 400) return "refused";
+          directStallRef.current = {
+            ...(fatalCode !== undefined ? { code: fatalCode } : {}),
+            hadKeys: Object.keys(normalizedKeys).length > 0,
+          };
+          return "stalled";
         }
 
         // Frames are rendering: report any *later* mid-stream interruption for real.
@@ -706,6 +734,7 @@ export function LiveVideoSurface({
           });
           hlsRef.current = hls;
           let fatal = false;
+          let fatalDetail: unknown = null;
           const syncTracks = () => {
             const list = hls.audioTracks || [];
             const opts: AudioTrackOption[] = list.map((t, idx) => ({
@@ -727,7 +756,10 @@ export function LiveVideoSurface({
           hls.on(HlsCtor.Events.AUDIO_TRACKS_UPDATED, syncTracks);
           hls.on(HlsCtor.Events.ERROR, (_ev, data) => {
             const d = data as { fatal?: boolean } | undefined;
-            if (d?.fatal) fatal = true;
+            if (d?.fatal) {
+              fatal = true;
+              if (fatalDetail === null) fatalDetail = data;
+            }
           });
           hls.loadSource(signedHls);
           hls.attachMedia(el);
@@ -744,13 +776,9 @@ export function LiveVideoSurface({
           hls.on(HlsCtor.Events.ERROR, (_ev, data) => {
             const d = data as { fatal?: boolean } | undefined;
             if (d?.fatal && !cancelled) {
-              reportError(
-                activeSource === "jio"
-                  ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
-                  : activeSource === "tgtv"
-                    ? "This AK TV stream was interrupted. Press Retry to reconnect."
-                    : "Live HLS stream interrupted. Press Retry to request a fresh stream token.",
-              );
+              // `data` carries `details` and `response.code`; reporting only that it was fatal
+              // produced one sentence for every possible HLS failure.
+              reportError(describeHlsFatal(data, activeSource ?? "maxtv").message);
             }
           });
           return true;
@@ -876,13 +904,19 @@ export function LiveVideoSurface({
           const numeric = payload.find((d): d is number => typeof d === "number");
           const status = code === 1001 ? numeric : undefined;
           const firstUri = uris?.[0];
-          reportError(
-            status
-              ? `The CDN refused a segment (HTTP ${status}).${firstUri ? ` ${firstUri.split("?")[0]}` : ""}`
-              : code === 6001 || code === 6002
-                ? "This channel is DRM protected and the key was rejected."
-                : `Playback failed${code ? ` (Shaka error ${code})` : ""}. Press Retry.`,
-          );
+          if (status) {
+            reportError(
+              `The CDN refused a segment (HTTP ${status}).${firstUri ? ` ${firstUri.split("?")[0]}` : ""}`,
+            );
+            return;
+          }
+          // 6xxx is DRM/EME and 3xxx is decode; neither is a connection problem, so neither
+          // gets "Press Retry" as though another attempt could change the answer.
+          const fault = describeShakaStall({
+            ...(typeof code === "number" ? { code } : {}),
+            ...(activeSource ? { source: activeSource } : {}),
+          });
+          reportError(fault.kind === "unknown" ? `Playback failed${code ? ` (Shaka error ${code})` : ""}. Press Retry.` : fault.message);
         });
 
         void (async () => {
@@ -935,34 +969,21 @@ export function LiveVideoSurface({
         hls.on(HlsCtor.Events.AUDIO_TRACKS_UPDATED, syncTracks);
         hls.on(HlsCtor.Events.ERROR, (_ev, data) => {
           const d = data as { fatal?: boolean } | undefined;
-          if (d?.fatal && !cancelled) {
-            if (!triedDirectFallback) {
-              void (async () => {
-                if (await tryBrowserDirect(false)) return;
-                if (!cancelled && directUrl && url !== directUrl) {
-                  startHls(directUrl, true);
-                  return;
-                }
-                if (!cancelled) {
-                  reportError(
-                    activeSource === "jio"
-                      ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
-                      : activeSource === "tgtv"
-                        ? "This AK TV stream was interrupted. Press Retry to reconnect."
-                        : "Live HLS stream interrupted. Press Retry to request a fresh stream token.",
-                  );
-                }
-              })();
-              return;
-            }
-            reportError(
-              activeSource === "jio"
-                ? "This JioTV stream was interrupted. Press Retry to reload it with a fresh CDN token."
-                : activeSource === "tgtv"
-                  ? "This AK TV stream was interrupted. Press Retry to reconnect."
-                  : "Live HLS stream interrupted. Press Retry to request a fresh stream token.",
-            );
+          if (!d?.fatal || cancelled) return;
+          // Captured before the async fallbacks, whose awaits can outlive the payload.
+          const fault = describeHlsFatal(data, activeSource ?? "maxtv").message;
+          if (!triedDirectFallback) {
+            void (async () => {
+              if (await tryBrowserDirect(false)) return;
+              if (!cancelled && directUrl && url !== directUrl) {
+                startHls(directUrl, true);
+                return;
+              }
+              if (!cancelled) reportError(fault);
+            })();
+            return;
           }
+          reportError(fault);
         });
       } else if (videoRef.current.canPlayType("application/vnd.apple.mpegurl")) {
         videoRef.current.src = url;
