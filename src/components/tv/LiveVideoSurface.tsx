@@ -1035,10 +1035,12 @@ export function LiveVideoSurface({
       if (cancelled) return;
 
       const forceRefresh = localRetry > 0 || reloadNonce > 0;
-      const preferDirectFirst =
-        activeSource === "jio" ||
-        activeSource === "tgtv" ||
-        /^(?:jio|tg):/i.test(channelId);
+      // Jio's CDN refuses datacentre addresses by ASN, so it has to be the browser. The AK TV
+      // playlist is a third-party reshare: its hosts refuse *the browser* -- 403 on the manifest,
+      // which is what the AK TV channel report showed -- and accept a server that sends the
+      // headers the playlist declared. So AK TV goes through the relay first and keeps the
+      // browser-direct attempt as its fallback, not the other way round.
+      const preferDirectFirst = activeSource === "jio" || /^jio:/i.test(channelId);
 
       // JioTV and AK TV streams must play directly from the viewer's browser IP because
       // Cloudflare Worker datacenter egress IPs receive HTTP 450/451 from cdn.jio.com.
