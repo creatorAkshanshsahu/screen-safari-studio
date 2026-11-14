@@ -66,6 +66,17 @@ describe("embedding by channel id", () => {
     expect(html).toContain('alt="STREAMR"');
     // The badge must still be clickable inside a stage that ignores pointer events.
     expect(html).toMatch(/\.brand \{[^}]*pointer-events: auto/);
+
+    // Over the channel, not inside a bar. The loading/error overlay is the state a viewer sees
+    // when nothing else is on screen, and it paints over anything at a lower level.
+    const brandZ = Number(/\.brand \{[^}]*z-index: (\d+)/.exec(html)?.[1]);
+    const overlayZ = Number(/\.ov \{[^}]*z-index: (\d+)/.exec(html)?.[1]);
+    expect(brandZ).toBeGreaterThan(overlayZ);
+    expect(html).toMatch(/\.brand \{[^}]*position: absolute/);
+    // Directly under the stage rather than inside the top bar, which the overlay covers.
+    const topBar = /<div class="top">([\s\S]*?)<\/div>/.exec(html)?.[1] ?? "";
+    expect(topBar).not.toContain("brand");
+    expect(html).toMatch(/<div class="stage" id="stage">[\s\S]*class="brand"/);
   });
 
   it("still renders for an id it cannot find, so the embed never shows a blank page", async () => {
