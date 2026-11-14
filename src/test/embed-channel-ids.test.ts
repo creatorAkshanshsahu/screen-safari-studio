@@ -115,6 +115,31 @@ describe("embedding by channel id", () => {
     expect(html).toContain("Copy");
   });
 
+  it("says a missing channel is missing, on the first frame, instead of spinning", async () => {
+    // The reported URL: /embed/tg%3Aset-hd.sonyliv against a playlist that does not list it.
+    // The old shell spent ~22s trying a direct connection and a probe before admitting it.
+    stubNetwork();
+    const res = await embed("tg:set-hd.sonyliv");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+
+    expect(html).toContain("not in the AK TV playlist");
+    expect(html).toContain("tg:set-hd.sonyliv");
+    expect(html).toContain("/embed/tgtv");
+    // No player shell, no probe: nothing here can ever play, so nothing may try.
+    expect(html).not.toContain("/api/live/stream/");
+    expect(html).not.toContain("Connecting to");
+  });
+
+  it("still resolves a channel the playlist spells with a provider suffix", async () => {
+    stubNetwork();
+    const res = await embed("tg:discoverykids");
+    const html = await res.text();
+    // Present in the stubbed playlist as Discovery Kids, id tg:3436 -- the key finds it.
+    expect(html).toContain("Discovery Kids");
+    expect(html).not.toContain("not in the AK TV playlist");
+  });
+
   it("still renders for an id it cannot find, so the embed never shows a blank page", async () => {
     stubNetwork();
     const res = await embed("tg:does-not-exist");

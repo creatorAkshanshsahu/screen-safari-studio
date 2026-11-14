@@ -87,6 +87,34 @@ Notes:
   `?muted=1` to the `src` and the player starts muted.
 - `aspect-ratio:16/9` on the iframe keeps it responsive; the player fills whatever box you give it.
 
+### Ids, and why a link can stop working
+
+An `id` is built from the playlist's own `tvg-id` — `tg:<tvg-id>`. Playlists get re-sourced, and
+when they do, those ids change. A link you shared last month can therefore point at nothing.
+
+The player resolves **all four** of these to the same channel, so a link only has to be roughly
+right:
+
+| Form | Example |
+|---|---|
+| catalogue id | `tg:set-hd.sonyliv` |
+| playlist id, no prefix | `set-hd.sonyliv` |
+| name key (durable) | `tg:sony-set-hd` |
+| the name, typed | `tg:sony set hd` |
+
+The durable form is the **name key**, which every channel record now carries as `key`:
+
+```
+GET https://PLAYER/api/live/channels?source=tgtv&filter=all
+→ { "id": "tg:1001", "key": "tg:star-plus-hd", "name": "Star Plus HD", … }
+```
+
+`/embed/tg:star-plus-hd` keeps working when `tg:1001` becomes `tg:7788`, because the key does not
+depend on the playlist. Use `key` for links you expect to last.
+
+If an id matches nothing, the player says so on the first frame and offers the channel list —
+it does not sit on a spinner.
+
 ### Where the ids come from
 
 | Prefix | Source | Example |

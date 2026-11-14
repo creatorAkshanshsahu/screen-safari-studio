@@ -31,6 +31,15 @@ export interface DirectPlayCandidate {
 
 export interface LiveChannelDto {
   id: string;
+  /**
+   * A name-derived identity that survives the playlist being re-sourced.
+   *
+   * `id` is `tg:<tvg-id>`, which belongs to whoever maintains the playlist: re-source it, or
+   * tidy its attributes, and every link anyone shared points at a channel that no longer exists
+   * -- silently, as a spinner. `key` is built from the channel's own name instead, and every
+   * entry point resolves either form.
+   */
+  key: string;
   source: "maxtv" | "starshare" | "jio" | "tgtv";
   name: string;
   category: string;
@@ -2505,7 +2514,7 @@ async function loadOwnEntry(cfg: GatewayConfig, rawId: string): Promise<LiveChan
   const id = rawId.toLowerCase();
   if (!id.startsWith("tg:") && !id.startsWith("jio:")) return null;
   const pool = id.startsWith("tg:") ? await loadTgTvCached(cfg, false) : await loadJioCached(cfg, false);
-  return pool.find((c) => c.id === rawId || c.rawId === rawId) ?? null;
+  return findChannelByAnyId(pool, rawId);
 }
 
 /**
@@ -2839,6 +2848,82 @@ async function loadTgTvCached(cfg: GatewayConfig, force = false): Promise<LiveCh
     tgtvCache.error = e instanceof Error ? e.message : String(e);
     return tgtvCache.items;
   }
+}
+
+const SOURCE_PREFIX: Record<string, string> = {
+  maxtv: "st",
+  jio: "jio",
+  tgtv: "tg",
+  starshare: "xt",
+};
+
+/** "Sony SET HD" -> "sony-set-hd". Stable across playlist edits in a way `tvg-id` is not. */
+export function channelSlug(name: string): string {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * `tvg-id` values sometimes carry a provider domain (`set-hd.sonyliv`); the host never does.
+ *
+ * The tail must start with a letter, so a numeric id is never truncated, and it may be longer
+ * than a real TLD -- these are brand names, not domains: `sonyliv` is seven characters, which a
+ * TLD-shaped pattern rejects.
+ */
+function stripProviderSuffix(value: string): string {
+  return value.replace(/\.[a-z][a-z0-9-]{1,11}$/i, "");
+}
+
+/** The durable identity of a channel: its source plus a slug of its name. */
+export function channelKey(ch: { source: string; name: string }): string {
+  return `${SOURCE_PREFIX[ch.source] ?? "st"}:${channelSlug(ch.name)}`;
+}
+
+/**
+ * Resolve a channel by anything a URL might reasonably contain.
+ *
+ * Links get shared, copied between playlists, and rebuilt by hand, so a 404 on a near-miss is a
+ * bad answer when an exact one is usually intended. In order: the catalogue id, the raw playlist
+ * id, the stable key, the same id with its provider domain stripped, and finally the slug of the
+ * channel's name. Every step is an equality test on a normalised value -- never a prefix match,
+ * because "SET HD" and "SET HD Movies" must not be confused for one another.
+ */
+export function findChannelByAnyId<T extends { id: string; rawId: string; name: string; source: string }>(
+  items: T[],
+  rawId: string,
+): T | null {
+  const want = String(rawId || "").trim();
+  if (!want || items.length === 0) return null;
+  const lc = want.toLowerCase();
+
+  const byId = items.find((c) => c.id === want) ?? items.find((c) => c.id.toLowerCase() === lc);
+  if (byId) return byId;
+
+  const byRaw = items.find((c) => c.rawId === want) ?? items.find((c) => c.rawId.toLowerCase() === lc);
+  if (byRaw) return byRaw;
+
+  const byKey = items.find((c) => channelKey(c).toLowerCase() === lc);
+  if (byKey) return byKey;
+
+  // "tg:set-hd", "set-hd.sonyliv", "set-hd" are all the same channel to a person.
+  const bare = lc.replace(/^(?:tg|jio|st|xt):/, "");
+  const bareBare = stripProviderSuffix(bare);
+  const byPlaylistId = items.find((c) => {
+    const rid = c.rawId.toLowerCase();
+    return rid === bare || rid === bareBare || stripProviderSuffix(rid) === bareBare;
+  });
+  if (byPlaylistId) return byPlaylistId;
+
+  const byName = items.find((c) => channelSlug(c.name) === bareBare);
+  if (byName) return byName;
+
+  // Last step: hyphens are punctuation a person may or may not type, so "discoverykids" and
+  // "discovery-kids" are the same request. Still an equality test -- "set" never matches "set-hd".
+  const compact = (v: string) => v.replace(/-/g, "");
+  const wanted = compact(bareBare);
+  return items.find((c) => compact(channelSlug(c.name)) === wanted) ?? null;
 }
 
 /**
@@ -4125,11 +4210,23 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       } catch {}
       return false;
     }
+    // One direct attempt per boot. It used to be tried, then tried again after the probe
+    // failed, which spent seven seconds re-learning a fact we already had -- on someone else's
+    // page, in a frame with no other content.
+    var directTried = false;
+    async function tryDirectOnce() {
+      if (directTried) return false;
+      directTried = true;
+      var got = await tryDirectPlay();
+      if (!got) st.textContent = "Direct connection did not open. Trying our relay…";
+      return got;
+    }
     async function boot() {
+      directTried = false;
       clean(); ov.classList.remove("hide"); rt.style.display = "none"; st.textContent = "Connecting to " + ch.name + "…";
       armWatchdog();
       if (ch.source === "jio" || ch.source === "tgtv" || /^(?:jio|tg):/i.test(String(ch.id || ""))) {
-        if (await tryDirectPlay()) return;
+        if (await tryDirectOnce()) return;
       }
       // Ask for the container the catalogue advertised. Probing ".ts" unconditionally
       // made every DASH channel look like MPEG-TS, so the embed could never play one.
@@ -4140,7 +4237,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         const r = await fetch(sUrl(probeExt, true), { signal: c.signal }); clearTimeout(tm);
         if (!r.ok) {
           const j = await r.json().catch(() => ({})); c.abort();
-          if (await tryDirectPlay()) return;
+          if (await tryDirectOnce()) return;
           if (ch.directUrl) { startHls(ch.directUrl); return; }
           st.textContent = j.error || ("HTTP " + r.status); rt.style.display = "inline-block"; return;
         }
@@ -4148,7 +4245,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         if (kind === "dash") startDash(sUrl(".mpd"));
         else if (kind === "hls") startHls(sUrl(".m3u8"));
         else startTs(sUrl(".ts"), true);
-      } catch { clearTimeout(tm); if (await tryDirectPlay()) return; if (wantDash) startDash(sUrl(".mpd")); else startTs(sUrl(".ts"), true); }
+      } catch { clearTimeout(tm); if (await tryDirectOnce()) return; if (wantDash) startDash(sUrl(".mpd")); else startTs(sUrl(".ts"), true); }
     }
     function hideIfPlaying() {
       if ((v.videoWidth > 0 && v.videoHeight > 0 && !v.paused) || (!v.paused && v.currentTime > 0.6)) {
@@ -4167,9 +4264,9 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
       clearTimeout(deadTimer);
       deadTimer = setTimeout(() => {
         if (v.videoWidth > 0 && v.videoHeight > 0) return;
-        st.textContent = "The stream started but no video arrived. Segments were refused or the format is unsupported.";
+        st.textContent = "No video after 12 seconds. The stream was refused, or this channel's format is not supported here.";
         rt.style.display = "inline-block"; ov.classList.remove("hide");
-      }, 25000);
+      }, 12000);
     }
     v.onpause = () => { pl.textContent = "Play"; };
     pl.onclick = () => v.paused ? v.play() : v.pause();
@@ -4178,6 +4275,95 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     document.getElementById("fs").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.getElementById("stage").requestFullscreen();
     boot();
   </script>
+</body>
+</html>`;
+}
+
+/**
+ * A single sentence, in the player's frame, for a request that cannot be a player.
+ *
+ * It exists so "the catalogue has not loaded yet" reaches a viewer inside an iframe as words
+ * rather than as JSON they never see.
+ */
+function renderEmbedNoticeHtml(
+  title: string,
+  detail: string,
+  href: string,
+  linkLabel: string,
+  origin: string,
+): string {
+  const esc = (v: string) => v.replace(/[<>&"]/g, "");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>${esc(title)} · STREAMR</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body { display: flex; align-items: center; justify-content: center; background: #05040b; color: #f6f7fc; font-family: system-ui, sans-serif; padding: 20px; text-align: center; }
+    .card { max-width: 420px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+    .brand { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; margin-bottom: 6px; }
+    .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
+    h1 { font-size: 16px; }
+    p { font-size: 13px; color: #b4bbd0; line-height: 1.5; }
+    a.go { display: inline-block; margin-top: 6px; padding: 9px 18px; border-radius: 999px; background: #00ecf7; color: #05121a; font-size: 12px; font-weight: 800; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <a class="brand" href="${esc(origin)}/" target="_top" rel="noopener"><img src="${esc(origin)}/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
+    <h1>${esc(title)}</h1>
+    <p>${esc(detail)}</p>
+    <a class="go" href="${esc(href)}" target="_top">${esc(linkLabel)}</a>
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * The answer for a channel id that a catalogue does not contain.
+ *
+ * The old behaviour was a player shell named after the id, which spent ~22 seconds trying a
+ * direct connection and a probe before admitting nothing existed -- a shared link that could
+ * never work, presented as a spinner. An id that is not in the playlist is knowable at render
+ * time, so saying it at render time is free.
+ */
+function renderMissingEmbedHtml(rawId: string, origin: string): string {
+  const prefix = /^(?:jio|tg|st|xt):/i.exec(rawId)?.[1]?.toLowerCase() ?? "";
+  const section = prefix === "jio" ? "jio" : prefix === "st" ? "maxtv" : "tgtv";
+  const label = section === "jio" ? "JioTV" : section === "maxtv" ? "maxTV" : "AK TV";
+  const safe = rawId.replace(/[<>&"]/g, "");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Channel not found · STREAMR</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body { display: flex; align-items: center; justify-content: center; background: #05040b; color: #f6f7fc; font-family: system-ui, sans-serif; padding: 20px; text-align: center; }
+    .card { max-width: 440px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+    .brand { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; margin-bottom: 6px; }
+    .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
+    h1 { font-size: 16px; }
+    p { font-size: 13px; color: #b4bbd0; line-height: 1.5; }
+    code { color: #00ecf7; word-break: break-all; }
+    a.go { display: inline-block; margin-top: 6px; padding: 9px 18px; border-radius: 999px; background: #00ecf7; color: #05121a; font-size: 12px; font-weight: 800; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <a class="brand" href="${origin}/" target="_top" rel="noopener"><img src="${origin}/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
+    <h1>This channel is not in the ${label} playlist</h1>
+    <p>The link asks for <code>${safe}</code>, and the ${label} catalogue returned no channel by that id or name.</p>
+    <p>Playlists get re-sourced, and ids built from them change when they do. Pick the channel from the list instead and it will play immediately.</p>
+    <a class="go" href="${origin}/embed/${section}" target="_top">Browse ${label} channels</a>
+  </div>
 </body>
 </html>`;
 }
@@ -4420,8 +4606,10 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
     /^https:\/\//i.test(ch.cmd) &&
     !ch.cookie &&
     !ch.drm;
+  const key = channelKey(ch);
   return {
     id: ch.id,
+    key,
     source: ch.source,
     name: ch.name,
     category: displayCategoryName(ch.category),
@@ -4517,7 +4705,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
 
     if (!channelName && rawId) {
       const pool = await getChannelsBySource(cfg, "all", false);
-      const hit = pool.find((c) => c.id === rawId || c.rawId === rawId);
+      const hit = findChannelByAnyId(pool, rawId);
       if (hit) channelName = hit.name;
     }
 
@@ -4986,7 +5174,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       isProbe ? STREAM_PROBE_BUDGET_MS : STREAM_CATALOGUE_BUDGET_MS,
       [],
     );
-    const ch = pool.find((c) => c.id === rawId || c.rawId === rawId);
+    const ch = findChannelByAnyId(pool, rawId);
     if (!ch) {
       // An empty pool means the catalogue never arrived, which is a different problem from an
       // id that is genuinely absent — and the player should be told which. 504 rather than 503:
@@ -5162,24 +5350,30 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     // depend on a source it does not use: the id prefix names the catalogue, and a budget
     // keeps a slow one from holding the frame open on someone else's site.
     const pool = await withBudget(loadCatalogueForId(cfg, rawId, false), STREAM_CATALOGUE_BUDGET_MS, []);
-    const ch = pool.find((c) => c.id === rawId || c.rawId === rawId);
-    const dto = ch
-      ? toDto(ch, publicOrigin)
-      : {
-          id: rawId,
-          source: "maxtv" as const,
-          name: rawId,
-          category: "Live TV",
-          rawCategory: "Live TV",
-          logo: "",
-          embedUrl: `${publicOrigin}${path}`,
-          iframeCode: "",
-          streamUrl: `${publicOrigin}/api/live/stream/${encodeURIComponent(rawId)}.ts`,
-        };
-    return new Response(renderStandaloneEmbedHtml(dto), {
-      status: 200,
-      headers: corsEmbedHeaders({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
+    const ch = findChannelByAnyId(pool, rawId);
+    const headers = corsEmbedHeaders({
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
     });
+    if (!ch) {
+      if (pool.length === 0) {
+        // The catalogue did not arrive at all: worth another attempt. Saying so in the frame
+        // beats a spinner that resolves into nothing.
+        return new Response(
+          renderEmbedNoticeHtml(
+            "The channel list is still loading",
+            "This player could not load the catalogue in time. Reload in a moment and the channel will resolve.",
+            `${publicOrigin}/embed/tgtv`,
+            "Browse AK TV",
+            publicOrigin,
+          ),
+          { status: 200, headers },
+        );
+      }
+      // The catalogue loaded and does not contain this channel: nothing to retry.
+      return new Response(renderMissingEmbedHtml(rawId, publicOrigin), { status: 200, headers });
+    }
+    return new Response(renderStandaloneEmbedHtml(toDto(ch, publicOrigin)), { status: 200, headers });
   }
 
   return null;
