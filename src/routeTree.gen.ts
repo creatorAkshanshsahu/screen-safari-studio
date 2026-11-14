@@ -13,6 +13,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as LiveRouteImport } from './routes/live'
 import { Route as MoviesRouteImport } from './routes/movies'
 import { Route as SeriesRouteImport } from './routes/series'
+import { Route as LiveChannelRouteImport } from './routes/live_.$channel'
 import { Route as WatchIdRouteImport } from './routes/watch.$id'
 
 const IndexRoute = IndexRouteImport.update({
@@ -35,6 +36,11 @@ const SeriesRoute = SeriesRouteImport.update({
   path: '/series',
   getParentRoute: () => rootRouteImport,
 } as any)
+const LiveChannelRoute = LiveChannelRouteImport.update({
+  id: '/live_/$channel',
+  path: '/live/$channel',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const WatchIdRoute = WatchIdRouteImport.update({
   id: '/watch/$id',
   path: '/watch/$id',
@@ -46,6 +52,7 @@ export interface FileRoutesByFullPath {
   '/live': typeof LiveRoute
   '/movies': typeof MoviesRoute
   '/series': typeof SeriesRoute
+  '/live/$channel': typeof LiveChannelRoute
   '/watch/$id': typeof WatchIdRoute
 }
 export interface FileRoutesByTo {
@@ -53,6 +60,7 @@ export interface FileRoutesByTo {
   '/live': typeof LiveRoute
   '/movies': typeof MoviesRoute
   '/series': typeof SeriesRoute
+  '/live/$channel': typeof LiveChannelRoute
   '/watch/$id': typeof WatchIdRoute
 }
 export interface FileRoutesById {
@@ -61,14 +69,23 @@ export interface FileRoutesById {
   '/live': typeof LiveRoute
   '/movies': typeof MoviesRoute
   '/series': typeof SeriesRoute
+  '/live_/$channel': typeof LiveChannelRoute
   '/watch/$id': typeof WatchIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/live' | '/movies' | '/series' | '/watch/$id'
+  fullPaths:
+    '/' | '/live' | '/movies' | '/series' | '/live/$channel' | '/watch/$id'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/live' | '/movies' | '/series' | '/watch/$id'
-  id: '__root__' | '/' | '/live' | '/movies' | '/series' | '/watch/$id'
+  to: '/' | '/live' | '/movies' | '/series' | '/live/$channel' | '/watch/$id'
+  id:
+    | '__root__'
+    | '/'
+    | '/live'
+    | '/movies'
+    | '/series'
+    | '/live_/$channel'
+    | '/watch/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -76,6 +93,7 @@ export interface RootRouteChildren {
   LiveRoute: typeof LiveRoute
   MoviesRoute: typeof MoviesRoute
   SeriesRoute: typeof SeriesRoute
+  LiveChannelRoute: typeof LiveChannelRoute
   WatchIdRoute: typeof WatchIdRoute
 }
 
@@ -109,6 +127,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SeriesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/live_/$channel': {
+      id: '/live_/$channel'
+      path: '/live/$channel'
+      fullPath: '/live/$channel'
+      preLoaderRoute: typeof LiveChannelRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/watch/$id': {
       id: '/watch/$id'
       path: '/watch/$id'
@@ -124,6 +149,7 @@ const rootRouteChildren: RootRouteChildren = {
   LiveRoute: LiveRoute,
   MoviesRoute: MoviesRoute,
   SeriesRoute: SeriesRoute,
+  LiveChannelRoute: LiveChannelRoute,
   WatchIdRoute: WatchIdRoute,
 }
 export const routeTree = rootRouteImport

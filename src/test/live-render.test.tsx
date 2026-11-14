@@ -12,8 +12,8 @@ import { LivePlayerContent } from "@/routes/live";
 const payload = {
   ok: true,
   channels: [
-    { id: "st:1003", source: "maxtv", name: "Sports18 1 HD", category: "SPORTS | INDIA", rawCategory: "SPORTS", logo: "", embedUrl: "", iframeCode: "", streamUrl: "" },
-    { id: "st:1013", source: "maxtv", name: "Colors HD", category: "ENTERTAINMENT", rawCategory: "ENT", logo: "", embedUrl: "", iframeCode: "", streamUrl: "" },
+    { id: "tg:1", key: "tg:sports18-1-hd", number: 1, source: "tgtv", name: "Sports18 1 HD", category: "SPORTS | INDIA", rawCategory: "SPORTS", logo: "", embedUrl: "", iframeCode: "", streamUrl: "" },
+    { id: "tg:2", key: "tg:colors-hd", number: 2, source: "tgtv", name: "Colors HD", category: "ENTERTAINMENT", rawCategory: "ENT", logo: "", embedUrl: "", iframeCode: "", streamUrl: "" },
   ],
   categories: ["SPORTS | INDIA", "ENTERTAINMENT"],
 };
@@ -47,23 +47,29 @@ describe("Live route", () => {
     await waitFor(() => expect(screen.getAllByText(/2 Channels/).length).toBeGreaterThan(0));
   });
 
-  it("offers JioTV as a source, not just a static maxTV label", async () => {
+  it("offers AK TV and nothing else", async () => {
     renderLive();
-    await waitFor(() => expect(screen.getAllByText("JioTV").length).toBeGreaterThan(0));
-    // "Both" merges the two catalogues; it is not a stand-in for a Jio button.
-    expect(screen.getAllByText("Both").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("maxTV").length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getAllByText("AK TV").length).toBeGreaterThan(0));
+    // maxTV and JioTV are gone from the product, not merely hidden behind a default.
+    expect(screen.queryAllByText("maxTV")).toHaveLength(0);
+    expect(screen.queryAllByText("JioTV")).toHaveLength(0);
+    expect(screen.queryAllByText("Both")).toHaveLength(0);
   });
 
-  it("requests the jio source when the JioTV tab is chosen", async () => {
+  it("asks only for the AK TV catalogue", async () => {
     const fetchMock = vi.mocked(fetch);
     renderLive();
-    const tab = await waitFor(() => screen.getAllByText("JioTV")[0]!);
-    tab.click();
     await waitFor(() => {
       const urls = fetchMock.mock.calls.map((c) => String(c[0]));
-      expect(urls.some((u) => u.includes("source=jio"))).toBe(true);
+      expect(urls.some((u) => u.includes("source=tgtv"))).toBe(true);
+      expect(urls.some((u) => u.includes("source=maxtv") || u.includes("source=jio"))).toBe(false);
     });
+  });
+
+  it("shows each channel's number, which is how a viewer names one", async () => {
+    renderLive();
+    await waitFor(() => expect(screen.getAllByText("Colors HD").length).toBeGreaterThan(0));
+    expect(screen.getAllByText("2").length).toBeGreaterThan(0);
   });
 
   it("keeps a search box available below the lg breakpoint", async () => {
@@ -82,8 +88,9 @@ describe("Live route", () => {
     // Scope to the guide buttons: the player header deliberately keeps showing the
     // active channel so the video is not interrupted by a search for something else.
     await waitFor(() => {
-      expect(screen.queryAllByRole("button", { name: "Sports18 1 HD" }).length).toBe(0);
-      expect(screen.getAllByRole("button", { name: "Colors HD" }).length).toBeGreaterThan(0);
+      // The accessible name now starts with the channel number, so match on the name itself.
+      expect(screen.queryAllByRole("button", { name: /Sports18 1 HD/ }).length).toBe(0);
+      expect(screen.getAllByRole("button", { name: /Colors HD/ }).length).toBeGreaterThan(0);
       expect(screen.getAllByText(/1 Channels/).length).toBeGreaterThan(0);
     });
   });

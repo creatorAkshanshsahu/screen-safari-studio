@@ -23,9 +23,9 @@ export const Route = createFileRoute("/live")({
     meta: [
       { title: "Live TV — Streamr" },
       { name: "referrer", content: "no-referrer" },
-      { name: "description", content: "Watch maxTV & StarShare live channels with Hindi audio & OG embed codes." },
+      { name: "description", content: "Watch AK TV live channels with Hindi audio, channel numbers and embed codes." },
       { property: "og:title", content: "Live TV — Streamr" },
-      { property: "og:description", content: "Watch maxTV & StarShare live channels with Hindi audio & OG embed codes." },
+      { property: "og:description", content: "Watch AK TV live channels with Hindi audio, channel numbers and embed codes." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
@@ -33,10 +33,16 @@ export const Route = createFileRoute("/live")({
   component: LivePlayerContent,
 });
 
-export function LivePlayerContent() {
-  // maxTV leads, with JioTV and AK TV available both as first-class sources and automatic fallbacks.
-  const [source, setSource] = useState<"maxtv" | "jio" | "tgtv" | "all">("maxtv");
-  const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("hindi");
+/**
+ * AK TV is the only source. maxTV and JioTV are gone from the product: they asked for a portal
+ * account and a CDN that refuses datacentre addresses, and between them they accounted for every
+ * failure this app has had. What is left is one playlist we do not have to fight.
+ */
+const SOURCE = "tgtv" as const;
+
+export function LivePlayerContent({ initialChannelId }: { initialChannelId?: string } = {}) {
+  const source = SOURCE;
+  const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("all");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
   const [query, setQuery] = useState("");
   const [channels, setChannels] = useState<LiveChannelDto[]>([]);
@@ -57,9 +63,10 @@ export function LivePlayerContent() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const requested = new URLSearchParams(window.location.search).get("ch");
+    // A pasted link wins: /live/143, /live/tg:1001 and /live?ch=… are all the same request.
+    const requested = initialChannelId || new URLSearchParams(window.location.search).get("ch");
     if (requested) setActiveId(requested);
-  }, []);
+  }, [initialChannelId]);
 
   const loadCatalogue = useCallback(
     async (force = false) => {
@@ -111,6 +118,21 @@ export function LivePlayerContent() {
     () => channels.find((c) => c.id === activeId) ?? visibleChannels[0] ?? channels[0] ?? null,
     [channels, visibleChannels, activeId],
   );
+
+  /**
+   * Keep the address bar pointing at the channel on screen.
+   *
+   * `replaceState` rather than navigation: the player is already showing this channel, and a
+   * route change would tear down the video element and start again. The point is only that
+   * copying the URL hands someone the channel you are watching.
+   */
+  useEffect(() => {
+    if (typeof window === "undefined" || !activeId) return;
+    const target = `/live/${encodeURIComponent(activeId)}`;
+    if (window.location.pathname !== target) {
+      window.history.replaceState(null, "", target + window.location.search);
+    }
+  }, [activeId]);
 
   const stepChannel = (delta: number) => {
     const pool = visibleChannels.length > 0 ? visibleChannels : channels;
@@ -184,7 +206,12 @@ export function LivePlayerContent() {
           </Link>
           <span className="rounded bg-live px-2.5 py-0.5 text-xs font-bold tracking-widest text-white">LIVE</span>
           <div>
-            <p className="font-display text-lg font-bold md:text-2xl">{activeChannel?.name ?? "Loading Live TV…"}</p>
+            <p className="font-display text-lg font-bold md:text-2xl">
+              {activeChannel?.number !== undefined && (
+                <span className="mr-2 tabular-nums text-accent">{activeChannel.number}</span>
+              )}
+              {activeChannel?.name ?? "Loading Live TV…"}
+            </p>
             <p className="text-xs text-muted-foreground">
               {activeChannel
                 ? `${activeChannel.source.toUpperCase()} · ${activeChannel.category} · ${containerKind}`
@@ -196,27 +223,7 @@ export function LivePlayerContent() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {/* This used to be a static "maxTV" pill, so the backup playlist could not be
-              chosen at all — it only appeared when the portal happened to fail. */}
-          <div className="glass flex rounded-full p-1 text-xs font-semibold">
-            {(
-              [
-                ["maxtv", "maxTV"],
-                ["jio", "JioTV"],
-                ["tgtv", "AK TV"],
-                ["all", "Both"],
-              ] as const
-            ).map(([val, label]) => (
-              <button
-                key={val}
-                type="button"
-                onClick={() => setSource(val)}
-                className={`rounded-full px-3 py-1 transition ${source === val ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:text-foreground"}`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
+          <div className="glass rounded-full px-3 py-1 text-xs font-bold text-accent">AK TV</div>
 
           <div className="glass flex rounded-full p-1 text-xs font-semibold">
             {(
@@ -247,24 +254,13 @@ export function LivePlayerContent() {
         </div>
       </div>
 
-      {/* Say plainly where the list came from; never let a dead seed look like a working catalogue. */}
-      {(portalError || ((servedBy === "jio" || servedBy === "tgtv") && source === "maxtv") || ((source === "jio" || source === "tgtv") && !loading)) && (
+      {/* One source, so there is nothing to fall back from: say the list is short or dead, or
+          say nothing at all. */}
+      {(portalError || backupError || (!loading && visibleChannels.length === 0)) && (
         <div className="absolute left-4 right-4 top-20 z-30 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs md:left-8 md:right-auto md:max-w-xl">
-          {servedBy === "jio" && source === "maxtv" && (
-            <p className="font-bold text-accent">maxTV unreachable — playing the JioTV backup playlist ({visibleChannels.length} channels).</p>
-          )}
-          {servedBy === "tgtv" && source === "maxtv" && (
-            <p className="font-bold text-accent">maxTV &amp; JioTV unreachable — playing the AK TV live playlist ({visibleChannels.length} channels).</p>
-          )}
-          {portalError && (
-            <p className="font-bold text-accent">No live source reachable — these {visibleChannels.length} sample channels will not play.</p>
-          )}
+          <p className="font-bold text-accent">AK TV returned no channels.</p>
           <p className="mt-0.5 text-muted-foreground">
-            {portalError ??
-              (source === "jio" ? backupError : null) ??
-              ((source === "jio" || source === "tgtv") && visibleChannels.length === 0
-                ? "This playlist returned no channels. Press Refresh to try again."
-                : "Live playlist connected.")}
+            {portalError ?? backupError ?? "The playlist answered but listed nothing. Press Refresh to try again."}
           </p>
         </div>
       )}
@@ -325,8 +321,8 @@ export function LivePlayerContent() {
                 onClick={() => setActiveId(ch.id)}
                 className={`flex h-auto w-full items-center justify-start gap-3 rounded-xl p-2.5 text-left transition ${selected ? "bg-primary text-primary-foreground" : "hover:bg-secondary"}`}
               >
-                <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-background/40 font-display text-xs font-bold">
-                  {ch.name.slice(0, 2).toUpperCase()}
+                <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-background/40 font-display text-xs font-bold tabular-nums">
+                  {ch.number ?? ch.name.slice(0, 2).toUpperCase()}
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-bold">{ch.name}</span>
@@ -353,7 +349,7 @@ export function LivePlayerContent() {
           {[
             { key: "iframe", label: "1. Channel <iframe> Embed", value: activeChannel.iframeCode },
             { key: "api", label: "2. Channels JSON API (CORS enabled)", value: apiUrl },
-            { key: "m3u", label: "3. Dynamic maxTV M3U Playlist", value: m3uUrl },
+            { key: "m3u", label: "3. AK TV M3U Playlist", value: m3uUrl },
             { key: "sdk", label: "4. Full Live TV Grid + Player Widget", value: sdkCode },
           ].map((item) => (
             <div key={item.key} className="space-y-1 rounded-xl border border-border bg-background/80 p-3">
@@ -497,6 +493,7 @@ export function LivePlayerContent() {
                 onClick={() => setActiveId(ch.id)}
                 className={`h-auto shrink-0 rounded-xl px-3 py-1.5 text-left text-xs font-bold ${activeChannel?.id === ch.id ? "bg-primary text-primary-foreground" : "glass"}`}
               >
+                {ch.number !== undefined && <span className="mr-1.5 tabular-nums opacity-60">{ch.number}</span>}
                 {ch.name}
               </Button>
             ))}

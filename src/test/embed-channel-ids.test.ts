@@ -131,6 +131,31 @@ describe("embedding by channel id", () => {
     expect(html).not.toContain("Connecting to");
   });
 
+  it("opens a channel by its number, because a number is what gets shared", async () => {
+    stubNetwork();
+    // The stubbed AK TV playlist lists exactly one channel, so it is number 1.
+    const res = await embed("1");
+    const html = await res.text();
+    expect(html).toContain("Discovery Kids");
+    expect(html).not.toContain("not in the AK TV playlist");
+  });
+
+  it("serves only AK TV: a request that names no source must not reach a portal", async () => {
+    const net = stubNetwork();
+    const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const res = (await maybeHandleLiveRequest(
+      new Request("https://player.example/api/live/channels"),
+      {},
+    ))!;
+    const json = (await res.json()) as { channels: Array<{ source: string; key: string; number?: number }> };
+    expect(json.channels.length).toBeGreaterThan(0);
+    expect(json.channels.every((c) => c.source === "tgtv")).toBe(true);
+    // Every channel is individually addressable and numbered.
+    expect(json.channels[0]!.key).toBe("tg:discovery-kids");
+    expect(json.channels[0]!.number).toBe(1);
+    expect(net.urls.some((u) => u.includes("action="))).toBe(false);
+  });
+
   it("still resolves a channel the playlist spells with a provider suffix", async () => {
     stubNetwork();
     const res = await embed("tg:discoverykids");

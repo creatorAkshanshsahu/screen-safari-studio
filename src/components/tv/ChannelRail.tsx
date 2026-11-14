@@ -8,7 +8,7 @@ export function ChannelRail() {
   const [liveItems, setLiveItems] = useState<LiveChannelDto[]>([]);
 
   useEffect(() => {
-    fetch("/api/live/channels?source=maxtv&filter=hindi&limit=16")
+    fetch("/api/live/channels?source=tgtv&filter=all&limit=16")
       .then((r) => r.json())
       .then((d: { channels?: LiveChannelDto[] }) => {
         if (d.channels && d.channels.length > 0) setLiveItems(d.channels);
@@ -20,7 +20,7 @@ export function ChannelRail() {
     <section className="space-y-3">
       <div className="flex items-center justify-between px-4 md:px-12">
         <h2 className="flex items-center gap-3 text-lg font-semibold md:text-2xl">
-          <Radio className="size-5 text-live" /> Live TV · maxTV
+          <Radio className="size-5 text-live" /> Live TV · AK TV
         </h2>
         <Link to="/live" className="text-sm font-semibold text-muted-foreground">
           Full Guide &amp; OG Embeds →
@@ -30,12 +30,15 @@ export function ChannelRail() {
         {liveItems.length > 0
           ? liveItems.map((ch) => (
               <a
-                href={`/live?ch=${encodeURIComponent(ch.id)}`}
+                href={`/live/${encodeURIComponent(ch.number ?? ch.id)}`}
                 key={ch.id}
                 className="tv-focus w-64 shrink-0 rounded-lg border border-border bg-card p-5 transition hover:border-accent md:w-72"
               >
                 <div className="mb-4 flex items-center justify-between gap-2">
-                  <span className="truncate font-display text-lg font-bold">{ch.name}</span>
+                  <span className="truncate font-display text-lg font-bold">
+                    {ch.number !== undefined && <span className="mr-2 tabular-nums text-accent">{ch.number}</span>}
+                    {ch.name}
+                  </span>
                   <Play className="size-5 shrink-0 text-accent" />
                 </div>
                 <p className="mb-1 text-xs font-bold text-live">LIVE · {ch.source.toUpperCase()}</p>
