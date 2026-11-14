@@ -84,7 +84,9 @@ describe("maxTV Stalker portal", () => {
     expect(catalogueCall.headers["Cookie"]).toContain(
       `mac=${encodeURIComponent("00:1A:79:EE:03:9F")}`,
     );
-    expect(catalogueCall.headers["Cookie"]).toContain("timezone=Europe/London");
+    // `Asia/Kolkata` is what the working Android client sends; we had London, a leftover
+    // from the first port of this code.
+    expect(catalogueCall.headers["Cookie"]).toContain("timezone=Asia/Kolkata");
     expect(catalogueCall.headers["User-Agent"]).toContain("MAG200");
   });
 

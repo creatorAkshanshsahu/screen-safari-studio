@@ -372,6 +372,23 @@ function isStalkerExpired(body: string): boolean {
   return msg.includes("authorization failed") || msg.includes("not valid") || (msg.includes("token") && msg.includes("expire"));
 }
 
+/**
+ * Whether a `get_profile` answer actually settled the device.
+ *
+ * A portal says yes with an object of profile fields and no with an empty `js`, `false`, or an
+ * error string -- all of them HTTP 200. Treating any 200 as success is what made a refused
+ * profile indistinguishable from a completed one.
+ */
+function stalkerProfileSettled(body: string): boolean {
+  if (stalkerError(body)) return false;
+  if (isStalkerExpired(body)) return false;
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return false;
+  const js = root["js"];
+  if (!js || typeof js !== "object" || Array.isArray(js)) return false;
+  return Object.keys(js as Record<string, unknown>).length > 0;
+}
+
 /** `get_all_channels`: the `js.data` array of `{id, name, cmd, tv_genre_id, logo}`. */
 function stalkerChannels(body: string): StalkerChannel[] {
   const js = stalkerJs(body);
@@ -472,9 +489,13 @@ const stalkerSession: {
   endpoint: string | null;
   token: string | null;
   profiled: boolean;
+  /** How many times `get_profile` has been sent this session; a refusal must not become a loop. */
+  profileAttempts: number;
+  /** Why the last `get_profile` did not settle, when it did not. */
+  profileError: string | null;
   /** The identity that last answered; pinned so later calls keep the same MAC and portal. */
   account: StalkerAccount | null;
-} = { endpoint: null, token: null, profiled: false, account: null };
+} = { endpoint: null, token: null, profiled: false, profileAttempts: 0, profileError: null, account: null };
 
 /**
  * The identity the app would use for this configuration.
@@ -535,7 +556,10 @@ function stalkerAccount(cfg: GatewayConfig): StalkerAccount {
 
 function stalkerHeaders(_cfg: GatewayConfig, account: StalkerAccount, auth: boolean): Record<string, string> {
   const h: Record<string, string> = {
-    Cookie: `mac=${encodeURIComponent(account.mac)}; stb_lang=en; timezone=Europe/London`,
+    // `Asia/Kolkata` is what `StalkerPortal.kt` sends. We had `Europe/London` here, a divergence
+    // left over from the first port; a portal is entitled to refuse a device whose stated zone
+    // contradicts its registration, and "no stream address, no reason" is a plausible answer.
+    Cookie: `mac=${encodeURIComponent(account.mac)}; stb_lang=en; timezone=Asia/Kolkata`,
     "User-Agent": MAG_USER_AGENT,
     "X-User-Agent": MAG_DEVICE_UA,
     Accept: "*/*",
@@ -670,12 +694,14 @@ async function stalkerRequest(
   const account = stalkerAccount(cfg);
   if (!stalkerSession.token || !stalkerSession.endpoint) await stalkerHandshake(cfg);
 
-  if (!stalkerSession.profiled && stalkerSession.endpoint) {
-    stalkerSession.profiled = true;
-    // Some portals answer get_profile only after a second step they do not advertise; the token is
-    // what the catalogue calls need, so a refusal here is not fatal.
+  if (!stalkerSession.profiled && stalkerSession.endpoint && stalkerSession.profileAttempts < 2) {
+    // `profiled` used to be set *before* the call, so one failure disabled the attempt for the
+    // rest of the session. A portal that only mints links for a profiled device then answers
+    // `create_link` with an empty `js` and no complaint -- which reads as "no stream address,
+    // gave no reason" and is exactly what the viewer saw. Attempt twice, and remember why not.
+    stalkerSession.profileAttempts += 1;
     try {
-      await stalkerRaw(
+      const profileBody = await stalkerRaw(
         cfg,
         account,
         stalkerSession.endpoint,
@@ -699,8 +725,16 @@ async function stalkerRequest(
         },
         true,
       );
-    } catch {
-      // non-fatal on portals that do not enforce get_profile
+      if (stalkerProfileSettled(profileBody)) {
+        stalkerSession.profiled = true;
+        stalkerSession.profileError = null;
+      } else {
+        stalkerSession.profileError = portalSaid(profileBody);
+      }
+    } catch (e) {
+      // Still not fatal -- the catalogue works without it -- but it is recorded, because a
+      // portal that refuses links usually refused this first.
+      stalkerSession.profileError = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
     }
   }
 
@@ -863,21 +897,67 @@ function rewriteStalkerLoopback(raw: string, portal: string): string {
   }
 }
 
-async function createLinkOnce(
-  cfg: GatewayConfig,
-  cmd: string,
-): Promise<{ url: string | null; said: string | null }> {
-  const body = await stalkerRequest(cfg, "itv", "create_link", {
-    cmd,
-    series: "",
-    forced_storage: "",
-    disable_ad: "0",
-    download: "0",
-    force_ch_link_check: "0",
-  });
+const CREATE_LINK_PARAMS = (cmd: string): Record<string, string> => ({
+  cmd,
+  series: "",
+  forced_storage: "",
+  disable_ad: "0",
+  download: "0",
+  force_ch_link_check: "0",
+});
+
+type LinkAnswer = { url: string | null; said: string | null; raw: string };
+
+function readLinkAnswer(cfg: GatewayConfig, cmd: string, body: string): LinkAnswer {
   const raw = extractStalkerStreamUrl(stalkerLink(body) ?? "") || extractStalkerStreamUrl(cmd);
-  const url = raw ? rewriteStalkerLoopback(raw, stalkerAccount(cfg).portal) : null;
-  return { url, said: stalkerError(body) };
+  return {
+    url: raw ? rewriteStalkerLoopback(raw, stalkerAccount(cfg).portal) : null,
+    said: stalkerError(body),
+    // The portal's own words, or the first of its body. Without this a silent refusal is
+    // reported as "gave no reason" while the reason sits in the response we already have.
+    raw: portalSaid(body),
+  };
+}
+
+async function createLinkOnce(cfg: GatewayConfig, cmd: string): Promise<LinkAnswer> {
+  const body = await stalkerRequest(cfg, "itv", "create_link", CREATE_LINK_PARAMS(cmd));
+  return readLinkAnswer(cfg, cmd, body);
+}
+
+/**
+ * `create_link` with the session token in the cookie as well as the header.
+ *
+ * Panels built on the older middleware read the token from `Cookie: …; token=…` and answer an
+ * empty `js` when they only find a bearer header. One extra request is a small price for the
+ * channels this unlocks, and it only runs after the ordinary call has failed.
+ */
+async function createLinkWithTokenCookie(cfg: GatewayConfig, cmd: string): Promise<LinkAnswer | null> {
+  const base = stalkerSession.endpoint;
+  if (!base || !stalkerSession.token) return null;
+  const account = stalkerAccount(cfg);
+  const headers = stalkerHeaders(cfg, account, true);
+  headers["Cookie"] = `${headers["Cookie"]}; token=${stalkerSession.token}`;
+  const target = buildStalkerUrl(base, "itv", "create_link", CREATE_LINK_PARAMS(cmd));
+  try {
+    const body = await fetchTextTimeout(target, headers, 7000);
+    recordPortal({
+      at: Date.now(),
+      action: "create_link (token in cookie)",
+      address: portalAddress(base),
+      status: 200,
+      said: portalSaid(body),
+    });
+    return readLinkAnswer(cfg, cmd, body);
+  } catch (e) {
+    recordPortal({
+      at: Date.now(),
+      action: "create_link (token in cookie)",
+      address: portalAddress(base),
+      status: e instanceof StalkerError && e.status !== null ? e.status : 0,
+      said: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
+    });
+    return null;
+  }
 }
 
 /** The playable URL for one channel handle. */
@@ -893,19 +973,34 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
   stalkerSession.token = null;
   stalkerSession.endpoint = null;
   stalkerSession.profiled = false;
+  stalkerSession.profileAttempts = 0;
   stalkerSession.account = null;
   await stalkerHandshake(cfg);
   const retried = await createLinkOnce(cfg, cmd);
   if (retried.url) return retried.url;
 
+  // Older middleware wants the token in the cookie; it answers an empty `js` otherwise.
+  const cookieToken = await createLinkWithTokenCookie(cfg, cmd);
+  if (cookieToken?.url) return cookieToken.url;
+
   // Report what actually happened rather than a sentence that reads like a network fault. A
-  // silent portal and a refusal that names a reason are different problems, and the trace in
-  // `/api/live/diagnose?source=maxtv` shows the exchange either way.
+  // silent portal, a refusal that names a reason, and a device the portal never profiled are
+  // three different problems, and they used to arrive as the same four words.
+  const blamed = retried.said ?? cookieToken?.said ?? first.said;
+  if (blamed) throw new StalkerError(null, blamed);
+
+  const answered = [retried.raw, cookieToken?.raw, first.raw].find(
+    (r) => r && r !== "(empty body)",
+  );
+  const profileNote = stalkerSession.profiled
+    ? ""
+    : ` The device was never profiled either (${stalkerSession.profileError ?? "get_profile did not complete"}), which is what a portal does before refusing links.`;
   throw new StalkerError(
     null,
-    retried.said ??
-      first.said ??
-      "The portal accepted the request but returned no stream address for this channel, and gave no reason. Open /api/live/diagnose?source=maxtv to see the exchange.",
+    `The portal accepted the request but returned no stream address for this channel.` +
+      (answered ? ` It answered: ${answered}` : " Its answer was empty.") +
+      profileNote +
+      " Full exchange: /api/live/diagnose?source=maxtv",
   );
 }
 
@@ -4789,7 +4884,7 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     try {
       const resolved = await resolveMaxtvLink(cfg, ch.cmd || "");
       const acct = stalkerAccount(cfg);
-      const magCookie = `mac=${encodeURIComponent(acct.mac)}; stb_lang=en; timezone=Europe%2FLondon`;
+      const magCookie = `mac=${encodeURIComponent(acct.mac)}; stb_lang=en; timezone=Asia%2FKolkata`;
       return await proxyMediaStream(
         resolved,
         "mag",

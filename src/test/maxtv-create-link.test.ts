@@ -82,14 +82,62 @@ describe("maxTV create_link recovery", () => {
     expect(body.error ?? "").not.toContain("no stream address");
   });
 
-  it("reports a silent refusal as silent, not as a network fault", async () => {
+  it("quotes the portal's actual answer instead of claiming it gave none", async () => {
     stubPortal(() => ({ status: 200, body: JSON.stringify({ js: {} }) }));
 
     const res = await streamResponse();
     expect(res!.status).toBe(502);
     const body = (await res!.json()) as { error: string };
-    expect(body.error).toContain("gave no reason");
+    // `{"js":{}}` is the whole answer. Saying "gave no reason" while holding this was worse
+    // than useless: it is the shape of the refusal, and it belongs in the message.
+    expect(body.error).toContain('{"js":{}}');
     expect(body.error).toContain("diagnose?source=maxtv");
+    expect(body.error).not.toContain("gave no reason");
+  });
+
+  it("mentions an unprofiled device, which is what a portal does before refusing links", async () => {
+    // get_profile fails outright; the catalogue still works, so play continues to create_link.
+    vi.stubGlobal("fetch", async (url: string) => {
+      const u = String(url);
+      if (u.includes("action=get_profile")) return new Response("", { status: 500 });
+      if (u.includes("action=handshake")) return new Response(JSON.stringify({ js: { token: "T1" } }), { status: 200 });
+      if (u.includes("action=get_all_channels")) return new Response(CATALOGUE, { status: 200 });
+      if (u.includes("action=get_genres")) return new Response(JSON.stringify({ js: [] }), { status: 200 });
+      if (u.includes("action=create_link")) return new Response(JSON.stringify({ js: {} }), { status: 200 });
+      return new Response("", { status: 404 });
+    });
+
+    const res = await streamResponse();
+    const body = (await res!.json()) as { error: string };
+    expect(body.error).toContain("never profiled");
+  });
+
+  it("retries the link call with the token in the cookie, and plays what that returns", async () => {
+    // Older middleware reads the token from the cookie and answers an empty `js` to a bearer
+    // header alone. The cookie attempt is the last thing standing between this channel and play.
+    let cookieTokenCalls = 0;
+    vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
+      const u = String(url);
+      const cookie = String((init?.headers ?? {})["Cookie"] ?? "");
+      if (u.includes("action=handshake")) return new Response(JSON.stringify({ js: { token: "T1" } }), { status: 200 });
+      if (u.includes("action=get_profile")) return new Response(JSON.stringify({ js: { id: "1" } }), { status: 200 });
+      if (u.includes("action=get_all_channels")) return new Response(CATALOGUE, { status: 200 });
+      if (u.includes("action=get_genres")) return new Response(JSON.stringify({ js: [] }), { status: 200 });
+      if (u.includes("action=create_link")) {
+        if (cookie.includes("token=T1")) {
+          cookieTokenCalls += 1;
+          return new Response(
+            JSON.stringify({ js: { cmd: "ffmpeg http://cdn.example/101/index.m3u8" } }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ js: {} }), { status: 200 });
+      }
+      return new Response("", { status: 404 });
+    });
+
+    await streamResponse();
+    expect(cookieTokenCalls).toBe(1);
   });
 
   it("rewrites a loopback placeholder onto the portal's own host", async () => {
