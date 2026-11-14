@@ -1142,8 +1142,23 @@ export function LiveVideoSurface({
         }}
         className="h-full w-full object-contain"
       />
+      {/*
+        The same mark the embed carries, in the same corner, so a channel looks like ours
+        wherever it plays. z-40 keeps it above the status overlay below (z-30) for the reason
+        that has now bitten twice: branding that disappears while the stream is loading or
+        failing is not branding, it is a detail.
+      */}
+      <a
+        href="/"
+        title="Watch more live TV on STREAMR"
+        aria-label="STREAMR"
+        className="absolute bottom-3 right-3 z-40 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/70 px-2 py-1 text-[10px] font-extrabold tracking-[0.14em] text-white no-underline transition-colors hover:border-brand hover:bg-black/85 focus-visible:border-brand focus-visible:outline-none"
+      >
+        <img src="/favicon.png" alt="" width={16} height={16} className="size-4 rounded-[4px]" />
+        <span>STREAMR</span>
+      </a>
       {statusMsg && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/65 p-6 text-center">
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/65 p-6 text-center">
           <p className="max-w-md text-sm text-muted-foreground">{statusMsg}</p>
           {hasError && (
             <Button variant="secondary" onClick={() => setLocalRetry((n) => n + 1)} className="glass rounded-full px-5">

@@ -3844,15 +3844,13 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     .bot { position: absolute; bottom: 0; inset-inline: 0; padding: 12px 16px; display: flex; justify-content: space-between; gap: 8px; background: linear-gradient(0deg, rgba(0,0,0,.85), transparent); }
     button, select { background: rgba(16,14,30,.85); color: #fff; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
     button:hover, select:hover { border-color: #00ecf7; }
-    /* The way back to the site, laid over the channel itself.
-       A channel embedded on someone else's page is our branding on their page, so the badge is
-       a layer of its own above the controls (2), the connecting/error overlay (4) and the top
-       bar -- not a label inside any of them. It sat inside the top bar until now, which meant
-       the loading and error overlays painted straight over it: branding disappeared at exactly
-       the moment the frame was visible and nothing else was. */
-    .top { z-index: 2; }
-    .bot { z-index: 2; }
-    .brand { position: absolute; top: 10px; right: 12px; z-index: 30; display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); box-shadow: 0 2px 10px rgba(0,0,0,.55); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; pointer-events: auto; transition: border-color .15s ease, background .15s ease; }
+    /* The way back to the site: bottom-right corner, beside Fullscreen, over the channel.
+       It lives in the control row but carries its own z-index, and neither .top nor .bot may
+       set one -- an absolute element with z-index:auto does not open a stacking context, so the
+       badge's 30 is compared against the overlay's 4 directly. Give the row a z-index and the
+       loading/error overlay covers the badge again, which is how branding went missing the
+       first time. */
+    .brand { position: relative; z-index: 30; pointer-events: auto; flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.86); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; transition: border-color .15s ease, background .15s ease; }
     .brand:hover, .brand:focus-visible { border-color: #00ecf7; background: rgba(8,7,17,.94); outline: none; }
     .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
     .ov { position: absolute; inset: 0; z-index: 4; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: rgba(5,4,11,.74); text-align: center; padding: 20px; }
@@ -3865,7 +3863,6 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
     <div class="top">
       <div><span class="live">LIVE</span><strong id="nm"></strong></div>
     </div>
-    <a class="brand" href="/" target="_top" rel="noopener" title="Watch more live TV on STREAMR"><img src="/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
     <div class="ov" id="ov"><div id="st" style="font-size:13px;color:#b4bbd0;">Connecting to live stream…</div><button id="rt" style="display:none;">Reload Stream</button></div>
     <div class="bot">
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -3874,7 +3871,10 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
         <button id="rl">Reload</button>
         <select id="au" style="display:none;"></select>
       </div>
-      <div><button id="fs">Fullscreen</button></div>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+        <a class="brand" href="/" target="_top" rel="noopener" title="Watch more live TV on STREAMR"><img src="/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
+        <button id="fs">Fullscreen</button>
+      </div>
     </div>
   </div>
   <script src="/vendor/mpegts.js"></script>
@@ -4183,6 +4183,100 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
 }
 
 /**
+ * The copy-paste page: `/embed`.
+ *
+ * Everyone who embeds starts with the same problem -- the snippet needs a domain, and the domain
+ * is not knowable from inside the code. Written from the request's own origin, this page hands
+ * back snippets that already contain the address the reader is looking at. Open it on the
+ * production site and the code is production code; open it in a preview and it is preview code.
+ * No placeholder to edit and no chance of shipping a localhost URL.
+ */
+function renderEmbedKitHtml(origin: string): string {
+  const sections: Array<{ source: string; label: string }> = [
+    { source: "tgtv", label: "AK TV" },
+    { source: "jio", label: "JioTV" },
+    { source: "maxtv", label: "maxTV" },
+  ];
+  const box = (id: string, code: string) => `
+    <div class="row">
+      <textarea id="${id}" readonly rows="${code.split("\n").length}" spellcheck="false">${code
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")}</textarea>
+      <button onclick="copy('${id}', this)">Copy</button>
+    </div>`;
+  const sectionCard = (source: string, label: string) =>
+    `<section>
+      <h2>${label} — player and channel list</h2>
+      <p>One iframe. Their visitors click a channel and it plays inside their page.</p>
+      ${box(
+        `sec-${source}`,
+        `<iframe src="${origin}/embed/${source}" title="${label} · STREAMR" width="100%" height="600" style="border:0;border-radius:12px;background:#080711" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`,
+      )}
+    </section>`;
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Embed STREAMR · Live TV</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px 20px 60px; background: #080711; color: #f6f7fc; font-family: system-ui, sans-serif; line-height: 1.5; }
+    .wrap { max-width: 820px; margin: 0 auto; }
+    .brand { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; color: #fff; font-weight: 800; letter-spacing: .14em; font-size: 13px; margin-bottom: 18px; }
+    .brand img { width: 26px; height: 26px; border-radius: 6px; display: block; }
+    h1 { font-size: 22px; margin: 0 0 6px; }
+    h2 { font-size: 14px; margin: 26px 0 4px; color: #00ecf7; letter-spacing: .06em; text-transform: uppercase; }
+    p { margin: 0 0 10px; color: #b4bbd0; font-size: 13px; }
+    .origin { background: #121022; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 10px 14px; font-size: 13px; margin: 14px 0 4px; word-break: break-all; }
+    .origin b { color: #00ecf7; }
+    .row { display: flex; gap: 8px; align-items: flex-start; }
+    textarea { flex: 1; background: #0d0b18; color: #d8deef; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 10px 12px; font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
+    button { background: #00ecf7; color: #05121a; border: 0; border-radius: 10px; padding: 10px 16px; font-size: 12px; font-weight: 800; cursor: pointer; white-space: nowrap; }
+    button:active { transform: translateY(1px); }
+    code { color: #00ecf7; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="brand" href="/"><img src="/favicon.png" alt="" />STREAMR</a>
+    <h1>Embed your live TV</h1>
+    <p>Everything below already points at the address you are reading this on, so it can be pasted as-is.</p>
+    <div class="origin"><b>Your player address:</b> ${origin}</div>
+    ${sections.map((x) => sectionCard(x.source, x.label)).join("")}
+    <section>
+      <h2>One channel</h2>
+      <p>Replace the id with any channel id from <code>/api/live/channels?source=tgtv&amp;filter=all</code>.</p>
+      ${box(
+        "one",
+        `<iframe src="${origin}/embed/tg%3A3436" title="STREAMR" width="100%" style="aspect-ratio:16/9;border:0;border-radius:12px;background:#000" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`,
+      )}
+    </section>
+    <section>
+      <h2>In a script, for sites that allow it</h2>
+      <p>Player plus a searchable channel grid, drawn into the host page's own layout.</p>
+      ${box(
+        "sdk",
+        `<div id="ak-tv"></div>\n<script src="${origin}/embed-sdk.js" data-target="#ak-tv" data-source="tgtv" data-filter="all"></script>`,
+      )}
+    </section>
+    <p style="margin-top:26px;font-size:12px;color:#7d8497;">Every player carries a small STREAMR badge in its bottom-right corner that links back to <a href="/" style="color:#00ecf7;">${origin}</a>.</p>
+  </div>
+  <script>
+    function copy(id, btn) {
+      const el = document.getElementById(id);
+      el.select();
+      const done = () => { const was = btn.textContent; btn.textContent = "Copied"; setTimeout(() => { btn.textContent = was; }, 1400); };
+      if (navigator.clipboard) navigator.clipboard.writeText(el.value).then(done, () => document.execCommand("copy"));
+      else { document.execCommand("copy"); done(); }
+    }
+  </script>
+</body>
+</html>`;
+}
+
+/**
  * A whole section: the player and the channel list for one source, in a single document.
  *
  * `/embed/tg:3436` is a channel and needs to know which one. A site owner who wants "the AK TV
@@ -4394,6 +4488,10 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   const isHandled =
     path.startsWith("/api/live/") ||
     path.startsWith("/embed/") ||
+    // The copy-paste page: someone who wants to embed goes here first, and it must answer on
+    // the bare path too, not just under a slash.
+    path === "/embed" ||
+    path === "/embed/" ||
     path === "/embed-sdk.js";
 
   if (!isHandled) return null;
@@ -5037,6 +5135,13 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
     } catch (e) {
       return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Failed to resolve maxTV link" });
     }
+  }
+
+  if (path === "/embed" || path === "/embed/") {
+    return new Response(renderEmbedKitHtml(publicOrigin), {
+      status: 200,
+      headers: corsEmbedHeaders({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
+    });
   }
 
   if (path.startsWith("/embed/")) {

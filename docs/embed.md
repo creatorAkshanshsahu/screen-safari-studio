@@ -11,7 +11,14 @@ They all play from the **viewer's own IP** where the source allows it, they work
 (WordPress, Wix, Shopify, Squarespace, plain HTML), and every player carries a small **STREAMR**
 badge over the video that opens your site when clicked.
 
-Replace `PLAYER` below with your deployed domain, e.g. `streamr.lovable.app`.
+### Get the URLs without editing anything
+
+Open **`/embed`** on your deployed site — e.g. `https://your-domain/embed`. That page prints every
+snippet below **already pointing at the domain you opened it on**, each with a Copy button. Open
+it on production and the code is production code; open it in a preview and it is preview code.
+There is no `PLAYER` placeholder to edit, and no way to accidentally ship a localhost URL.
+
+Replace `PLAYER` below with your deployed domain if you are copying from this file instead.
 
 ---
 
@@ -152,8 +159,9 @@ https://PLAYER/api/live/playlist.m3u?source=tgtv&filter=all
 
 ## The STREAMR mark
 
-Every embedded player shows a small STREAMR badge **over the channel itself**, in the top-right
-corner of the video. The SDK picker shows one under its channel grid too.
+Every embedded player shows a small STREAMR badge **over the channel itself**, in the
+**bottom-right corner**, immediately left of the Fullscreen button. The SDK picker shows one under
+its channel grid too.
 
 - It is a layer of its own, above the controls, the top bar and the "Connecting…"/error overlay,
   so it stays visible while the stream is loading or when it fails — the moments when the frame
