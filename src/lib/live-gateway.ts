@@ -1048,31 +1048,56 @@ function parseClearKeys(body: string): ClearKeyPair[] {
   return out;
 }
 
-/** `cenc:default_KID` values from an MPD, normalised to base64url (the form ClearKey uses). */
+export type ClearKeyMatch = {
+  keys: ClearKeyPair[];
+  /**
+   * `exact` — an advertised key id is one the manifest declares, so the keys are used verbatim.
+   * `relabelled` — one advertised key, no id match: it is re-labelled onto the manifest's ids
+   *   (the v.4.9 app's behaviour; a single key is more likely to be mis-spelled than wrong).
+   * `unmatched` — no id match and not a single key: nothing is guessed, and the caller should
+   *   surface that the key set cannot be the one this manifest needs.
+   */
+  status: "exact" | "relabelled" | "unmatched";
+};
+
 /**
  * Reconcile a key document with the manifest's declared key ids.
  *
  * If none of the advertised ids appear in the manifest and there is exactly one key, the
  * key is relabelled onto each id the manifest declares. Fewer than one, or several
  * disagreeing keys, are left alone: guessing there would decrypt the wrong track.
+ *
+ * The reported `status` exists because this function cannot tell "the catalogue spells the
+ * id differently" from "the catalogue's key belongs to another channel" — both look like one
+ * key that matches nothing. Relabelling the second case yields a licence the CDM accepts and
+ * a content key that decrypts nothing, which is a black screen with no error at all. Callers
+ * surface `relabelled`/`unmatched` so that possibility is visible instead of silent.
  */
-function matchClearKeys(keys: ClearKeyPair[], kids: string[]): ClearKeyPair[] {
-  if (keys.length === 0 || kids.length === 0) return keys;
-  if (keys.some((k) => kids.includes(k.kid))) return keys;
-  if (keys.length !== 1) return keys;
+export function matchClearKeys(keys: ClearKeyPair[], kids: string[]): ClearKeyMatch {
+  if (keys.length === 0) return { keys, status: "unmatched" };
+  if (kids.length === 0) return { keys, status: "unmatched" };
+  // Both sides are hex here — `defaultKids` used to hand back base64url, which made this test
+  // impossible to satisfy and silently re-labelled every single-key channel, hiding a wrong key.
+  // A catalogue may also spell a key id as a UUID with dashes, so compare canonical forms.
+  const canon = (v: string) => v.trim().replace(/-/g, "").toLowerCase();
+  const kidSet = new Set(kids.map(canon));
+  if (keys.some((k) => kidSet.has(canon(k.kid)))) return { keys, status: "exact" };
+  if (keys.length !== 1) return { keys, status: "unmatched" };
   const only = keys[0]!.k;
-  return kids.map((kid) => ({ kid, k: only }));
+  return { keys: kids.map((kid) => ({ kid, k: only })), status: "relabelled" };
 }
 
-function defaultKids(mpd: string): string[] {
+/**
+ * Every `cenc:default_KID` the manifest declares, as lowercase hex — the same representation
+ * `toHex16` gives the catalogue's keys, so the two can actually be compared.
+ */
+export function defaultKids(mpd: string): string[] {
   const out = new Set<string>();
   const re = /cenc:default_KID\s*=\s*["']([0-9a-fA-F-]{32,36})["']/g;
   for (const m of mpd.matchAll(re)) {
-    const hex = m[1]!.replace(/-/g, "");
+    const hex = m[1]!.replace(/-/g, "").toLowerCase();
     if (hex.length !== 32) continue;
-    const bytes = new Uint8Array(16);
-    for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-    out.add(toBase64Url(bytes));
+    out.add(hex);
   }
   return [...out];
 }
@@ -2963,7 +2988,8 @@ function corsEmbedHeaders(extra: Record<string, string> = {}): Record<string, st
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Range, Content-Type, Accept, Origin",
-    "Access-Control-Expose-Headers": "Content-Type, X-Stream-Container, X-Clear-Keys",
+    "Access-Control-Expose-Headers":
+      "Content-Type, X-Stream-Container, X-Clear-Keys, X-Clear-Key-Match",
     "Content-Security-Policy": "frame-ancestors *;",
     ...extra,
   };
@@ -3311,10 +3337,26 @@ async function proxyMediaStream(
     // document and the MPD disagree, the session decrypts nothing and the viewer sees a
     // black screen with no error at all. A single advertised key is therefore relabelled
     // onto the manifest's key id rather than dropped, exactly as the v.4.9 app does.
-    const matched = matchClearKeys(clearKeys ?? [], defaultKids(mpdText));
+    const keyMatch = matchClearKeys(clearKeys ?? [], defaultKids(mpdText));
+    const matched = keyMatch.keys;
+    // Matching happens in hex; the header keeps its published base64url key id, because that
+    // is the form EME and Shaka name an init-data key with (and the shape `parseKeyHeader`
+    // in the player already accepts).
+    const headerKeyId = (kid: string): string => {
+      const hex = toHex16(kid);
+      if (!hex) return kid;
+      const bytes = new Uint8Array(16);
+      for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+      return toBase64Url(bytes);
+    };
     const keyHeader = matched.length
-      ? { "X-Clear-Keys": matched.map((k) => `${k.kid}:${k.k}`).join(",") }
-      : {};
+      ? {
+          "X-Clear-Keys": matched.map((k) => `${headerKeyId(k.kid)}:${k.k}`).join(","),
+          // Visible to the player and to `/api/live/diagnose`: "relabelled" and "unmatched"
+          // are the two states that decrypt to a black screen without raising an error.
+          "X-Clear-Key-Match": keyMatch.status,
+        }
+      : { "X-Clear-Key-Match": "none" };
     // Hand over a manifest whose every reference points back at us. Untouched, the
     // player would walk straight out to the CDN and lose the UA that keeps it alive.
     const rewritten = await rewriteDashManifestWeb(
