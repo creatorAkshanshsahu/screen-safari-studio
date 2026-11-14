@@ -71,22 +71,27 @@ describe("Live route", () => {
     // the filter pills on a phone -- covering the controls it was telling you to use.
     renderLive();
     await waitFor(() => expect(screen.getAllByText("Colors HD").length).toBeGreaterThan(0));
-    const page = document.body;
-    const floating = [...page.querySelectorAll("button")].filter((b) =>
+    const floating = [...document.body.querySelectorAll("button")].filter((b) =>
       /Tap to Unmute Live Audio/.test(b.textContent ?? ""),
     );
     expect(floating).toHaveLength(0);
-    // The cue lives on the control that performs it.
-    expect(screen.getAllByText(/Unmute|Mute/).length).toBeGreaterThan(0);
+
+    // Sound is handled by the player's own control, inside the player's box. When the browser
+    // refuses the sound there is a chip -- a chip in the corner, never a veil over the picture.
+    const muteControl = screen.getByLabelText(/Mute|Unmute/);
+    const stage = document.body.querySelector(".aspect-video")!;
+    expect(stage.contains(muteControl)).toBe(true);
+    expect(screen.queryByLabelText("Play with sound")).toBeNull();
   });
 
-  it("keeps branding in the header row, where it cannot cover anything", async () => {
+  it("keeps branding inside the player's box, where it cannot cover the guide", async () => {
     renderLive();
     await waitFor(() => expect(screen.getAllByText("AK TV").length).toBeGreaterThan(0));
     const brand = screen.getAllByTitle("STREAMR home");
     expect(brand.length).toBeGreaterThan(0);
-    // In the header, not absolutely positioned over the player.
-    for (const el of brand) expect(el.className).not.toContain("absolute");
+    // The mark sits over the picture's own corner -- and nowhere else on the page.
+    const stage = document.body.querySelector(".aspect-video")!;
+    for (const el of brand) expect(stage.contains(el)).toBe(true);
   });
 
   it("shows each channel's number, which is how a viewer names one", async () => {
@@ -98,9 +103,10 @@ describe("Live route", () => {
   it("keeps a search box available below the lg breakpoint", async () => {
     renderLive();
     await waitFor(() => expect(screen.getAllByText("Colors HD").length).toBeGreaterThan(0));
-    // Two boxes: one in the desktop drawer, one in the compact rail. The rail is the
-    // only one that exists on a phone, and its absence is what hid search there.
-    expect(screen.getAllByPlaceholderText(/Search/i).length).toBeGreaterThanOrEqual(2);
+    // One box, in the guide, at every width: the desktop drawer is gone rather than duplicated, so
+    // the thing a phone needs cannot be the thing a phone does not get.
+    expect(screen.getAllByPlaceholderText(/Search/i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByLabelText("Search channels")).toBeTruthy();
   });
 
   it("filters the guide as the search query is typed", async () => {
@@ -138,6 +144,8 @@ describe("Live route with an empty catalogue", () => {
     // The old copy said "Connecting to maxTV portal…" forever, which read as a hung
     // connection when the real problem was an empty catalogue.
     await waitFor(() => expect(screen.queryByText(/Connecting to maxTV portal/)).toBeNull());
-    expect(screen.getAllByText(/No channels available from this source/).length).toBeGreaterThan(0);
+    // Two places, on purpose: the channel's own line says "No channel", and the guide says why.
+    expect(screen.getAllByText(/No channel/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/AK TV returned no channels/).length).toBeGreaterThan(0);
   });
 });

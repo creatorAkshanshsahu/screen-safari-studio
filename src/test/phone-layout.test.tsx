@@ -12,12 +12,16 @@ import { LivePlayerContent } from "@/routes/live";
 /**
  * "overlay issue is still these for player and we can select other channel if one failed."
  *
- * The player used to be the whole viewport on a phone, with the channel chooser a full screen
- * below it. Every overlay we added therefore landed on something, and a refused channel felt like
- * a trap: no way to reach the next one without scrolling past a black void.
+ * The player used to be the whole viewport, with the channel chooser a full screen below it. Every
+ * overlay added on top therefore landed on something, and a refused channel felt like a trap.
  *
- * The fix is geometric rather than cosmetic: on a phone the player owns a 16:9 box, and the
- * header, the controls and the chooser follow it in normal flow.
+ * Two things fixed it, and both still have to hold:
+ *
+ *   1. **Geometry.** The player owns a 16:9 box in normal flow at every breakpoint -- the reference
+ *      site's shape. Everything else (title, guide, filters) follows it in the document.
+ *   2. **Containment.** The player's own chrome -- transport bar, sound chip, STREAMR mark -- lives
+ *      inside that box. Nothing the player draws may land on the guide, and the guide is reachable
+ *      without scrolling past a black void.
  */
 
 const payload = {
@@ -46,49 +50,52 @@ function renderLive() {
   return render(<RouterProvider router={router as never} />);
 }
 
-describe("the phone layout", () => {
-  it("gives the player its own 16:9 box instead of the whole viewport", async () => {
+const stageOf = (container: HTMLElement) => container.querySelector(".aspect-video");
+
+describe("the page around the player", () => {
+  it("gives the player a 16:9 box, the way the reference site does", async () => {
     const { container } = renderLive();
     await waitFor(() => expect(container.querySelector("main")).not.toBeNull());
 
-    const main = container.querySelector("main")!;
-    // In flow on a phone; the full-bleed scene comes back at lg.
-    expect(main.classList.contains("overflow-hidden")).toBe(false);
-    expect(main.className).toContain("lg:overflow-hidden");
-
-    const stage = container.querySelector(".aspect-video");
+    const stage = stageOf(container);
     expect(stage).not.toBeNull();
-    expect(stage!.className).toContain("lg:absolute");
+    // 16:9 at every width: no breakpoint turns the player into a full-screen black wall.
+    expect(stage!.className).toContain("aspect-video");
+    expect(stage!.className).not.toContain("lg:absolute");
   });
 
   it("says the channel's title in flow, where it can wrap instead of being clipped", async () => {
     const { container } = renderLive();
-    await waitFor(() => expect(screen.getAllByText("&Pictures HD").length).toBeGreaterThan(0));
+    await waitFor(() => expect(container.querySelector("h1")).not.toBeNull());
 
-    const title = screen.getAllByText("&Pictures HD")[0]!;
+    const title = container.querySelector("h1")!;
+    expect(title.textContent).toContain("&Pictures HD");
     expect(title.className).toContain("break-words");
-    // The block that holds the title must be allowed to shrink inside the flex row, or it runs
-    // off the right edge of a 393px phone -- which is exactly what the screenshot showed.
-    expect(title.parentElement!.className).toContain("min-w-0");
+    // In the document, not floating over the picture.
+    expect(title.className).not.toContain("absolute");
   });
 
-  it("does not pin the controls over the player on a phone", async () => {
+  it("keeps every player control inside the player's own box", async () => {
     const { container } = renderLive();
-    await waitFor(() => expect(screen.getAllByRole("button", { name: /mute/i }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByLabelText(/Mute|Unmute/)).toBeTruthy());
 
-    const pinned = Array.from(container.querySelectorAll("div")).filter(
-      (el) =>
-        el.classList.contains("absolute") &&
-        el.classList.contains("inset-x-0") &&
-        el.classList.contains("bottom-0"),
+    const stage = stageOf(container)!;
+    for (const label of [/Mute|Unmute/, /Play|Pause/, "Audio and quality", "Reload stream", "Fullscreen"]) {
+      expect(stage.contains(screen.getByLabelText(label))).toBe(true);
+    }
+
+    // And no control is pinned to the page's own bottom edge, over the guide.
+    const pinnedToPage = Array.from(container.querySelectorAll("div")).filter(
+      (el) => el.classList.contains("absolute") && el.classList.contains("inset-x-0") && el.classList.contains("bottom-0"),
     );
-    expect(pinned).toHaveLength(0);
+    for (const el of pinnedToPage) expect(stage.contains(el)).toBe(true);
   });
 
   it("keeps the channel chooser in the same document, under the player", async () => {
     renderLive();
     await waitFor(() => expect(screen.getAllByPlaceholderText("Search channels…").length).toBeGreaterThan(0));
-    // The rail is reachable without a desktop-only drawer.
+    // Counted, searchable, and reachable without a desktop-only drawer.
     expect(screen.getAllByText(/2 Channels/).length).toBeGreaterThan(0);
+    expect(screen.getByLabelText("Search channels")).toBeTruthy();
   });
 });

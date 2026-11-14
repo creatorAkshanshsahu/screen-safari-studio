@@ -230,19 +230,18 @@ margins. If you ever find a site doing that, the fix is commercial, not technica
 
 ## Sound
 
-The player starts **unmuted**. That is deliberate: if you embed it with
+The picture starts **on the first frame**, and it starts muted — because a muted autoplay is the one
+form of autoplay no browser refuses. Waiting for a tap before showing anything is a frame that looks
+broken, and asking for sound first is a frame that a phone may refuse to start at all.
 
-```html
-allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-```
+Sound is negotiated immediately afterwards, from the `playing` event:
 
-you have told the browser the viewer wants to hear it, and starting muted answers that with a mute
-button the viewer has to go looking for.
-
-Browsers still refuse unmuted autoplay often enough that it has to be handled, so it is: the player
-asks for sound, and if the browser says no it mutes itself so the picture still starts, says
-**"Tap to play with sound"** across the picture, and comes back with sound on the first tap. One tap,
-one idea.
+- If the browser allows it, the stream is audible within a fraction of a second and **no UI appears
+  at all**. A host site that writes `allow="autoplay; fullscreen; encrypted-media; picture-in-picture"`
+  usually gets this.
+- If it refuses, the picture keeps playing, sound stays off, and a small **"Tap for sound"** chip
+  appears in the corner. Never a veil, never a modal, never anything over the picture: one tap and
+  the sound is on.
 
 ## The transport bar
 
@@ -250,6 +249,10 @@ The picture comes with the same bar the reference player uses, because it is the
 coming from there already knows: **play/pause · sound · quality/language · reload · fullscreen**.
 Nothing beyond that — an embed is a rectangle inside your page, so there is no guide, no filter row
 and no header to scroll past.
+
+It is not an embed-only bar. `/live/<channel>` and `/watch/<channel>` mount the *same*
+`LivePlayerStage`, so the player on the site and the player in your iframe cannot drift apart again:
+one component, two frames.
 
 Quality is whatever the source serves; the button doubles as the audio-language picker when the
 stream carries more than one.
@@ -278,6 +281,7 @@ reading it on — there is no domain to edit.
 | What | Where |
 | --- | --- |
 | One channel, full page | `/watch/143` · also `/live/143` |
+| One film / series episode | `/watch/<slug>` — a title is named by a slug, a channel by a number or a `tg:` key |
 | One channel, embeddable | `/embed/143` |
 | Player + channel list | `/embed/tgtv` |
 | Channel list JSON | `/api/public/channels?category=&q=&limit=` |
