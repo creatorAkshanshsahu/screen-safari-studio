@@ -234,3 +234,68 @@ The player says which fault it hit. The two that belong to the host page:
 
 A `403` on the player itself means the host is fetching from a `file://` page or an unsecured
 `http://` origin; embeds need `https`.
+
+## The documented surface (mirrors the reference site)
+
+Everything a host site needs, in the shape they already know from `livetgtv.lovable.app`. The kit
+page at **`/embed`** shows all of it with copy buttons, written against the origin you are
+reading it on — there is no domain to edit.
+
+| What | Where |
+| --- | --- |
+| One channel, full page | `/watch/143` · also `/live/143` |
+| One channel, embeddable | `/embed/143` |
+| Player + channel list | `/embed/tgtv` |
+| Channel list JSON | `/api/public/channels?category=&q=&limit=` |
+| One channel JSON | `/api/public/channels/143` |
+
+`/watch/<n>` and `/live/<n>` are the same player behind two doors: `/live/` is every link this app
+has already handed out, `/watch/` is the name the reference site uses and the one its documentation
+will teach people to ask for.
+
+### `?colour=`
+
+Add it to an embed or a watch URL to theme the player accent — the LIVE badge, focus rings, control
+borders and the STREAMR pill:
+
+```
+/embed/143?colour=%23FF6600
+/watch/143?colour=FF6600
+```
+
+Six hex digits, with or without `#`. Text on the accent is chosen by **contrast ratio**, not by a
+luminance guess: `#FF6600` gets black text (7:1) rather than white (3:1). Without the parameter, or
+with anything that is not six hex digits, the player keeps its default — a half-honoured garbage
+value is a player with unreadable controls, so an invalid value is *ignored*, never coerced.
+
+### `GET /api/public/channels`
+
+```json
+{ "count": 1,
+  "channels": [
+    { "id": "143", "name": "…", "category": "…", "logo": "…",
+      "embed": "https://…/embed/143", "watch": "https://…/watch/143" }
+  ] }
+```
+
+`id` is the channel number when the playlist gives one. Numbers are the identity in a URL because a
+raw id is not unique in these playlists — the same channel is listed once per reseller category.
+
+### `GET /api/public/channels/{id}`
+
+```json
+{ "id": "143", "name": "…", "category": "…",
+  "sources": ["https://…/api/live/stream/tg%3A….m3u8"],
+  "drm": { "type": "clearkey", "keyId": "…", "key": "…" },
+  "embed": "…", "watch": "…", "container": "hls" }
+```
+
+- `sources[0]` is the relay: it rewrites the playlist, signs the segments and sends whatever header
+  the host demands. `sources[1]`, when present, is the direct CDN address for players that can reach
+  it themselves.
+- `drm` appears only for encrypted channels; `keys` is included when more than one key is advertised.
+- **The manifest URL is stable, the segment URLs inside it are signed per request.** Fetch a source
+  just before playback rather than storing it — that is the one line of this page a host can get
+  wrong in a way that looks like our bug.
+- An unknown id answers `404` with the reason and a pointer to the list, because playlists get
+  re-sourced and an id built from one changes when they do.

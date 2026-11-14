@@ -3992,8 +3992,20 @@ async function proxyMediaStream(
   });
 }
 
-function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
+function renderStandaloneEmbedHtml(ch: LiveChannelDto, accent?: string | null): string {
   const boot = JSON.stringify(ch).replace(/</g, "\\u003c");
+  /*
+   * The host's colour, applied where the player's accent lives: the LIVE badge, the focus ring, the
+   * control hover border and the STREAMR pill. Everything else stays dark on purpose -- a themed
+   * player must still look like a video player, and a light background behind a dark broadcast is
+   * the one combination that makes a stream look broken.
+   */
+  const accentHex = parseAccent(accent);
+  const accentCss = accentHex
+    ? `
+    :root { --accent: ${accentHex}; --accent-ink: ${accentInk(accentHex)}; }`
+    : `
+    :root { --accent: #00ecf7; --accent-ink: #05121a; }`;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4001,16 +4013,17 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="referrer" content="no-referrer" />
   <title>${ch.name.replace(/[<>&"]/g, "")} · STREAMR Live</title>
-  <style>
+  <style>${accentCss}
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { width: 100%; height: 100%; background: #000; color: #f6f7fc; font-family: system-ui, sans-serif; overflow: hidden; }
     .stage { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: #05040b; }
     video { width: 100%; height: 100%; object-fit: contain; background: #000; }
     .top { position: absolute; top: 0; inset-inline: 0; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; background: linear-gradient(180deg, rgba(0,0,0,.78), transparent); pointer-events: none; }
-    .live { background: #ff2e63; color: #fff; font-size: 10px; font-weight: 800; letter-spacing: .14em; padding: 3px 8px; border-radius: 999px; margin-right: 8px; }
+    .live { background: var(--accent); color: var(--accent-ink); font-size: 10px; font-weight: 800; letter-spacing: .14em; padding: 3px 8px; border-radius: 999px; margin-right: 8px; }
     .bot { position: absolute; bottom: 0; inset-inline: 0; padding: 12px 16px; display: flex; justify-content: space-between; gap: 8px; background: linear-gradient(0deg, rgba(0,0,0,.85), transparent); }
     button, select { background: rgba(16,14,30,.85); color: #fff; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
-    button:hover, select:hover { border-color: #00ecf7; }
+    button:hover, select:hover { border-color: var(--accent); }
+    button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     /* The way back to the site: bottom-right corner, beside Fullscreen, over the channel.
        It lives in the control row but carries its own z-index, and neither .top nor .bot may
        set one -- an absolute element with z-index:auto does not open a stacking context, so the
@@ -4018,7 +4031,7 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
        loading/error overlay covers the badge again, which is how branding went missing the
        first time. */
     .brand { position: relative; z-index: 30; pointer-events: auto; flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.86); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; transition: border-color .15s ease, background .15s ease; }
-    .brand:hover, .brand:focus-visible { border-color: #00ecf7; background: rgba(8,7,17,.94); outline: none; }
+    .brand:hover, .brand:focus-visible { border-color: var(--accent); background: rgba(8,7,17,.94); outline: none; }
     .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
     .ov { position: absolute; inset: 0; z-index: 4; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: rgba(5,4,11,.74); text-align: center; padding: 20px; }
     .ov.hide { display: none; }
@@ -4485,85 +4498,119 @@ function renderMissingEmbedHtml(rawId: string, origin: string): string {
  * No placeholder to edit and no chance of shipping a localhost URL.
  */
 function renderEmbedKitHtml(origin: string): string {
-  const sections: Array<{ source: string; label: string }> = [
-    { source: "tgtv", label: "AK TV" },
-    { source: "jio", label: "JioTV" },
-    { source: "maxtv", label: "maxTV" },
-  ];
   const box = (id: string, code: string) => `
     <div class="row">
-      <textarea id="${id}" readonly rows="${code.split("\n").length}" spellcheck="false">${code
+      <textarea id="${id}" readonly rows="${Math.max(3, code.split("\n").length)}" spellcheck="false">${code
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")}</textarea>
       <button onclick="copy('${id}', this)">Copy</button>
     </div>`;
-  const sectionCard = (source: string, label: string) =>
-    `<section>
-      <h2>${label} — player and channel list</h2>
-      <p>One iframe. Their visitors click a channel and it plays inside their page.</p>
-      ${box(
-        `sec-${source}`,
-        `<iframe src="${origin}/embed/${source}" title="${label} · STREAMR" width="100%" height="600" style="border:0;border-radius:12px;background:#080711" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`,
-      )}
-    </section>`;
+
+  // AK TV is the only source, so it is the only section. A page that offered JioTV and maxTV to a
+  // host site would be advertising two players that no longer exist in this product.
+  const one = `<iframe src="${origin}/embed/143" title="STREAMR Live" width="100%" height="480" frameborder="0" allowfullscreen allow="autoplay; fullscreen; encrypted-media; picture-in-picture" referrerpolicy="no-referrer"></iframe>`;
+  const responsive = `<div style="position:relative;padding-top:56.25%">
+  <iframe src="${origin}/embed/143" title="STREAMR Live"
+    style="position:absolute;inset:0;width:100%;height:100%;border:0"
+    allowfullscreen allow="autoplay; fullscreen; encrypted-media" referrerpolicy="no-referrer"></iframe>
+</div>`;
+  const themed = `<iframe src="${origin}/embed/143?colour=%23FF6600" title="STREAMR Live"
+  width="100%" height="480" frameborder="0" allowfullscreen
+  allow="autoplay; fullscreen; encrypted-media; picture-in-picture"></iframe>`;
+  const grid = `<iframe src="${origin}/embed/tgtv" title="AK TV · STREAMR" width="100%" height="600" style="border:0;border-radius:12px;background:#080711" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`;
+  const sdk = `<div id="ak-tv"></div>
+<script src="${origin}/embed-sdk.js" data-target="#ak-tv" data-source="tgtv" data-filter="all"></script>`;
+  const listCurl = `curl "${origin}/api/public/channels?category=Sports&q=star"`;
+  const oneCurl = `curl "${origin}/api/public/channels/143"`;
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Embed STREAMR · Live TV</title>
+  <title>Embed AK TV · STREAMR</title>
   <style>
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 28px 20px 60px; background: #080711; color: #f6f7fc; font-family: system-ui, sans-serif; line-height: 1.5; }
+    body { margin: 0; padding: 28px 20px 60px; background: #080711; color: #f6f7fc; font-family: system-ui, sans-serif; line-height: 1.55; }
     .wrap { max-width: 820px; margin: 0 auto; }
     .brand { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; color: #fff; font-weight: 800; letter-spacing: .14em; font-size: 13px; margin-bottom: 18px; }
     .brand img { width: 26px; height: 26px; border-radius: 6px; display: block; }
-    h1 { font-size: 22px; margin: 0 0 6px; }
-    h2 { font-size: 14px; margin: 26px 0 4px; color: #00ecf7; letter-spacing: .06em; text-transform: uppercase; }
+    h1 { font-size: 24px; margin: 0 0 6px; }
+    h2 { font-size: 13px; margin: 30px 0 4px; color: #00ecf7; letter-spacing: .08em; text-transform: uppercase; }
+    h2:first-of-type { margin-top: 22px; }
     p { margin: 0 0 10px; color: #b4bbd0; font-size: 13px; }
     .origin { background: #121022; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 10px 14px; font-size: 13px; margin: 14px 0 4px; word-break: break-all; }
     .origin b { color: #00ecf7; }
     .row { display: flex; gap: 8px; align-items: flex-start; }
-    textarea { flex: 1; background: #0d0b18; color: #d8deef; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 10px 12px; font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
+    textarea { flex: 1; background: #0d0b18; color: #d8deef; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 10px 12px; font: 12px/1.55 ui-monospace, monospace; resize: vertical; min-height: 64px; }
     button { background: #00ecf7; color: #05121a; border: 0; border-radius: 10px; padding: 10px 16px; font-size: 12px; font-weight: 800; cursor: pointer; white-space: nowrap; }
     button:active { transform: translateY(1px); }
-    code { color: #00ecf7; }
+    code { color: #00ecf7; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0 4px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,.09); color: #c8cee0; }
+    th { color: #8e96ab; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; }
+    .note { border-left: 3px solid #00ecf7; padding-left: 12px; color: #9aa2b8; }
+    .foot { margin-top: 28px; font-size: 12px; color: #7d8497; }
+    .foot a { color: #00ecf7; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <a class="brand" href="/"><img src="/favicon.png" alt="" />STREAMR</a>
-    <h1>Embed your live TV</h1>
-    <p>Everything below already points at the address you are reading this on, so it can be pasted as-is.</p>
+    <h1>Embed AK TV</h1>
+    <p>Every snippet already points at the address you are reading this on, so it can be pasted as-is. No domain to edit, no placeholder to replace.</p>
     <div class="origin"><b>Your player address:</b> ${origin}</div>
-    ${sections.map((x) => sectionCard(x.source, x.label)).join("")}
-    <section>
-      <h2>One channel</h2>
-      <p>Every channel has a number. <code>/embed/143</code> is the same channel as
-      <code>/embed/tg%3A1001</code> is as <code>/embed/sony-set-hd</code> — numbers are the
-      easiest to read out, names are the ones that survive the playlist changing.</p>
-      ${box(
-        "one",
-        `<iframe src="${origin}/embed/tg%3A3436" title="STREAMR" width="100%" style="aspect-ratio:16/9;border:0;border-radius:12px;background:#000" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>`,
-      )}
-    </section>
-    <section>
-      <h2>In a script, for sites that allow it</h2>
-      <p>Player plus a searchable channel grid, drawn into the host page's own layout.</p>
-      ${box(
-        "sdk",
-        `<div id="ak-tv"></div>\n<script src="${origin}/embed-sdk.js" data-target="#ak-tv" data-source="tgtv" data-filter="all"></script>`,
-      )}
-    </section>
-    <p style="margin-top:26px;font-size:12px;color:#7d8497;">Every player carries a small STREAMR badge in its bottom-right corner that links back to <a href="/" style="color:#00ecf7;">${origin}</a>.</p>
+
+    <h2>One channel</h2>
+    <p>Replace <code>143</code> with any channel number. A name works too (<code>/embed/colors-hd</code>), and it survives the playlist being re-sourced better than a number does.</p>
+    ${box("one", one)}
+
+    <h2>Responsive 16:9</h2>
+    <p>The same player in a box that keeps its shape at any width.</p>
+    ${box("responsive", responsive)}
+
+    <h2>Player colour</h2>
+    <p>Add <code>?colour=</code> to an embed or a watch URL to theme the player's accent: the LIVE badge, the focus rings, the control borders and the STREAMR mark follow it. Six hex digits, with or without <code>#</code> (encode it as <code>%23</code> in a URL). Text on the accent turns black or white by luminance. Without the parameter &mdash; or with anything that is not six hex digits &mdash; the player keeps its default.</p>
+    ${box("themed", themed)}
+    <p><code>${origin}/watch/143?colour=FF6600</code> themes the full page the same way.</p>
+
+    <h2>Whole channel list</h2>
+    <p>One iframe holding the player and a searchable channel grid. Their visitors click a channel and it plays inside their page &mdash; they are never navigated away.</p>
+    ${box("grid", grid)}
+
+    <h2>Player and grid from a script tag</h2>
+    <p>For hosts that allow scripts. Draws into the host page's own layout.</p>
+    ${box("sdk", sdk)}
+
+    <h2>GET /api/public/channels</h2>
+    <p>Every channel with its id, name, category, logo and links. Optional <code>category</code> and <code>q</code> (name search).</p>
+    ${box("api-list", listCurl)}
+    <p class="note">Response: <code>{ "count": 1, "channels": [ { "id": "143", "name": "&hellip;", "category": "&hellip;", "logo": "&hellip;", "embed": "&hellip;", "watch": "&hellip;" } ] }</code></p>
+
+    <h2>GET /api/public/channels/{id}</h2>
+    <p>One channel resolved into playable sources, plus its ClearKey when the stream is encrypted.</p>
+    ${box("api-one", oneCurl)}
+    <p class="note">Response: <code>{ "id": "143", "name": "&hellip;", "sources": [ "&hellip;/api/live/stream/tg%3A&hellip;.m3u8" ], "drm": { "type": "clearkey", "keyId": "&hellip;", "key": "&hellip;" }, "embed": "&hellip;", "watch": "&hellip;" }</code></p>
+    <p>The manifest URL is stable. The segment URLs inside it are signed per request, so fetch a source just before playback rather than storing it.</p>
+
+    <h2>Addresses</h2>
+    <table>
+      <tr><th>What</th><th>Where</th></tr>
+      <tr><td>One channel, full page</td><td><code>/watch/143</code> &middot; also <code>/live/143</code></td></tr>
+      <tr><td>One channel, embeddable</td><td><code>/embed/143</code></td></tr>
+      <tr><td>Player and channel list</td><td><code>/embed/tgtv</code></td></tr>
+      <tr><td>Channel JSON</td><td><code>/api/public/channels/143</code></td></tr>
+    </table>
+
+    <p class="foot">Every player carries a small STREAMR badge in its bottom-right corner that links back to <a href="/">${origin}</a>.</p>
   </div>
   <script>
     function copy(id, btn) {
-      const el = document.getElementById(id);
-      el.select();
-      const done = () => { const was = btn.textContent; btn.textContent = "Copied"; setTimeout(() => { btn.textContent = was; }, 1400); };
-      if (navigator.clipboard) navigator.clipboard.writeText(el.value).then(done, () => document.execCommand("copy"));
+      var el = document.getElementById(id);
+      el.select(); el.setSelectionRange(0, 99999);
+      var done = function () { var was = btn.textContent; btn.textContent = "Copied"; setTimeout(function () { btn.textContent = was; }, 1400); };
+      if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(el.value).then(done, function () { document.execCommand("copy"); done(); }); }
       else { document.execCommand("copy"); done(); }
     }
   </script>
@@ -4751,6 +4798,43 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
 }
 
 /**
+ * A host's accent colour, from `?colour=`.
+ *
+ * Six hex digits, with or without `#` (a bare `#` never reaches a server -- it is `%23` in a URL,
+ * which `URLSearchParams` hands back decoded). Anything else is ignored rather than coerced: a
+ * half-honoured garbage value is a player with unreadable controls, and the default is better than
+ * that.
+ */
+export function parseAccent(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const value = String(raw).trim().replace(/^#/, "");
+  return /^[0-9a-f]{6}$/i.test(value) ? `#${value.toLowerCase()}` : null;
+}
+
+/**
+ * Black or white, whichever a person can actually read on that colour.
+ *
+ * Relative luminance, not an average of the channels: `#00ff00` and `#0000ff` have the same mean
+ * and wildly different brightness, so a mean picks unreadable text on one of them.
+ */
+export function accentInk(hex: string): string {
+  const h = parseAccent(hex) ?? "#000000";
+  const channel = (i: number) => {
+    const v = parseInt(h.slice(1 + i * 2, 3 + i * 2), 16) / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance = 0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2);
+  /*
+   * Whichever of black or white actually contrasts more, rather than a luminance threshold.
+   * Orange `#ff6600` is the case that shows the difference: it is dark enough that white text sits
+   * at about 3:1 -- unreadable -- while black reaches 7:1. The crossover is at luminance 0.179.
+   */
+  const onWhite = 1.05 / (luminance + 0.05);
+  const onBlack = (luminance + 0.05) / 0.05;
+  return onBlack >= onWhite ? "#000000" : "#ffffff";
+}
+
+/**
  * What a request to this stream should say it came from.
  *
  * A declared referrer wins, because the playlist is the authority on its own host. Otherwise the
@@ -4817,6 +4901,9 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
 
   const isHandled =
     path.startsWith("/api/live/") ||
+    // The documented surface a host site codes against. It is a separate prefix from the app's own
+    // plumbing, and forgetting to list it here returns null -- a 404 that looks like a bad id.
+    path.startsWith("/api/public/") ||
     path.startsWith("/embed/") ||
     // The copy-paste page: someone who wants to embed goes here first, and it must answer on
     // the bare path too, not just under a slash.
@@ -4895,6 +4982,88 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
         category: displayCategoryName(c.category),
       }));
     return jsonResponse(200, { ok: true, id: current.id, family, alternatives });
+  }
+
+  /**
+   * The public, documented surface a host site codes against.
+   *
+   * `/api/live/*` is this app's own plumbing -- it grows fields as the player needs them. This is
+   * the stable shape: a channel is an id, a name, a category, a logo and two links, and one channel
+   * also resolves into playable sources with its ClearKey. It is the same contract the reference
+   * site publishes, so code written against that one ports over.
+   */
+  if (path === "/api/public/channels" || path.startsWith("/api/public/channels/")) {
+    const single = path.startsWith("/api/public/channels/")
+      ? decodeURIComponent(path.slice("/api/public/channels/".length)).replace(/\/+$/, "")
+      : "";
+    const pool = single ? await loadCatalogueForId(cfg, single) : await getChannelsBySource(cfg, "tgtv", false);
+
+    // The identity in a URL is the number when there is one: it is what the site shows on screen,
+    // and unlike a raw id it cannot name two channels.
+    const publicId = (c: LiveChannelItem) => (c.number !== undefined ? String(c.number) : encodeURIComponent(c.id));
+    const links = (c: LiveChannelItem) => ({
+      embed: `${publicOrigin}/embed/${publicId(c)}`,
+      watch: `${publicOrigin}/watch/${publicId(c)}`,
+    });
+
+    if (single) {
+      const ch = findChannelByAnyId(pool, single);
+      if (!ch) {
+        return jsonResponse(404, {
+          ok: false,
+          error: `No channel matches "${single}". The playlist may have been re-sourced; read /api/public/channels for the current list.`,
+        });
+      }
+      const dto = toDto(ch, publicOrigin);
+      const keys = ch.drm?.keys ?? [];
+      return jsonResponse(200, {
+        id: publicId(ch),
+        name: ch.name,
+        category: displayCategoryName(ch.category),
+        logo: ch.logo,
+        // The relay first: it handles the playlist rewriting, the segments and the referrer the
+        // host demands. The direct address is offered second for players that can reach the CDN
+        // themselves, which is sometimes the only path that works at all.
+        sources: [dto.streamUrl, ...(dto.directUrl ? [dto.directUrl] : [])],
+        ...(keys.length
+          ? {
+              drm: {
+                type: "clearkey" as const,
+                keyId: keys[0]!.kid,
+                key: keys[0]!.k,
+                ...(keys.length > 1 ? { keys } : {}),
+              },
+            }
+          : {}),
+        container: dto.container ?? "hls",
+        ...(ch.number !== undefined ? { number: ch.number } : {}),
+        ...links(ch),
+        // Said plainly, because a host will cache this: the manifest above never expires, but the
+        // segment URLs inside it are signed per request, so a source must be fetched, not stored.
+        notice: "The manifest URL is stable. The segment URLs inside it are signed per request, so fetch a source just before playback instead of storing it.",
+      });
+    }
+
+    const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+    const category = (url.searchParams.get("category") || "").trim().toLowerCase();
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 5000), 1), 10000);
+    let list = pool;
+    if (category) {
+      list = list.filter(
+        (c) => displayCategoryName(c.category).toLowerCase() === category || c.category.toLowerCase() === category,
+      );
+    }
+    if (q) list = list.filter((c) => c.name.toLowerCase().includes(q));
+    list.sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.name.localeCompare(b.name));
+    const channels = list.slice(0, limit).map((c) => ({
+      id: publicId(c),
+      name: c.name,
+      category: displayCategoryName(c.category),
+      logo: c.logo,
+      ...(c.number !== undefined ? { number: c.number } : {}),
+      ...links(c),
+    }));
+    return jsonResponse(200, { count: channels.length, channels });
   }
 
   if (path === "/api/live/channels") {
@@ -5564,7 +5733,12 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
       // The catalogue loaded and does not contain this channel: nothing to retry.
       return new Response(renderMissingEmbedHtml(rawId, publicOrigin), { status: 200, headers });
     }
-    return new Response(renderStandaloneEmbedHtml(toDto(ch, publicOrigin)), { status: 200, headers });
+    // `?colour=` themes the player for the site embedding it. Invalid values are ignored here
+    // rather than passed through: an unreadable LIVE badge is worse than a default one.
+    return new Response(renderStandaloneEmbedHtml(toDto(ch, publicOrigin), url.searchParams.get("colour")), {
+      status: 200,
+      headers,
+    });
   }
 
   return null;
