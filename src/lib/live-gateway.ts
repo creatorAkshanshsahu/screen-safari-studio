@@ -4182,6 +4182,110 @@ function renderStandaloneEmbedHtml(ch: LiveChannelDto): string {
 </html>`;
 }
 
+/**
+ * A whole section: the player and the channel list for one source, in a single document.
+ *
+ * `/embed/tg:3436` is a channel and needs to know which one. A site owner who wants "the AK TV
+ * section", though, should not have to enumerate ids or add a script tag -- many hosts strip
+ * scripts and only trust an iframe. `/embed/tgtv` therefore answers with the player above a
+ * searchable list of that source's own channels, and every selection stays inside the same
+ * document, so the host page never navigates.
+ */
+function renderPlaylistEmbedHtml(source: "tgtv" | "jio" | "maxtv", origin: string): string {
+  const label = source === "tgtv" ? "AK TV" : source === "jio" ? "JioTV" : "maxTV";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>${label} · STREAMR Live</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #080711; color: #f6f7fc; font-family: system-ui, sans-serif; }
+    body { display: flex; flex-direction: column; overflow: hidden; }
+    .head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.08); }
+    .brand { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 3px; border-radius: 999px; background: rgba(8,7,17,.72); border: 1px solid rgba(255,255,255,.16); color: #fff; text-decoration: none; font-size: 10px; font-weight: 800; letter-spacing: .14em; flex-shrink: 0; }
+    .brand:hover, .brand:focus-visible { border-color: #00ecf7; outline: none; }
+    .brand img { width: 18px; height: 18px; border-radius: 5px; display: block; }
+    .kicker { font-size: 11px; font-weight: 700; letter-spacing: .16em; color: #00ecf7; flex-shrink: 0; }
+    .q { flex: 1; min-width: 60px; background: #121022; border: 1px solid rgba(255,255,255,.15); color: #fff; padding: 7px 12px; border-radius: 999px; font-size: 13px; }
+    .q:focus { outline: none; border-color: #00ecf7; }
+    .player { width: 100%; aspect-ratio: 16 / 9; background: #000; border: 0; display: block; flex-shrink: 0; }
+    .list { flex: 1; overflow: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; padding: 8px; }
+    .ch { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 10px; border: 1px solid rgba(255,255,255,.1); background: #121022; color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; text-align: left; }
+    .ch:hover { border-color: rgba(0,236,247,.55); }
+    .ch[aria-current="true"] { border-color: #00ecf7; background: #14182c; }
+    .ch img { width: 22px; height: 22px; object-fit: contain; border-radius: 4px; flex-shrink: 0; background: rgba(255,255,255,.05); }
+    .ch span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .empty { grid-column: 1 / -1; padding: 16px; text-align: center; color: #b4bbd0; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <a class="brand" href="${origin}/" target="_top" rel="noopener" title="Watch more live TV on STREAMR"><img src="${origin}/favicon.png" alt="STREAMR" width="18" height="18" /><span>STREAMR</span></a>
+    <span class="kicker">${label.toUpperCase()}</span>
+    <input class="q" id="q" type="search" placeholder="Search ${label} channels…" aria-label="Search channels" />
+  </div>
+  <iframe class="player" id="p" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen title="${label} player"></iframe>
+  <div class="list" id="g"><div class="empty">Loading ${label} channels…</div></div>
+  <script>
+    const ORIGIN = ${JSON.stringify(origin)};
+    const SOURCE = ${JSON.stringify(source)};
+    const params = new URLSearchParams(location.search);
+    const filter = params.get("filter") || "all";
+    const wanted = params.get("channel") || SOURCE + ":";
+    const p = document.getElementById("p"), g = document.getElementById("g"), q = document.getElementById("q");
+    let all = [], cur = "";
+    function play(ch) {
+      cur = ch.id;
+      p.src = ORIGIN + "/embed/" + encodeURIComponent(ch.id) + (params.get("muted") === "1" ? "?muted=1" : "");
+      draw(q.value);
+    }
+    function draw(text) {
+      const t = (text || "").toLowerCase();
+      const hits = all.filter((c) => !t || (c.name + " " + c.category).toLowerCase().includes(t));
+      g.textContent = "";
+      if (!hits.length) {
+        const d = document.createElement("div");
+        d.className = "empty";
+        d.textContent = all.length ? "No channel matches that search." : "This source did not return any channels.";
+        g.appendChild(d);
+        return;
+      }
+      for (const c of hits) {
+        const b = document.createElement("button");
+        b.className = "ch";
+        b.setAttribute("aria-current", String(c.id === cur));
+        if (c.logo) {
+          const img = document.createElement("img");
+          img.src = c.logo;
+          img.alt = "";
+          img.loading = "lazy";
+          b.appendChild(img);
+        }
+        const s = document.createElement("span");
+        s.textContent = c.name;
+        b.appendChild(s);
+        b.onclick = () => play(c);
+        g.appendChild(b);
+      }
+    }
+    q.oninput = () => draw(q.value);
+    fetch(ORIGIN + "/api/live/channels?source=" + encodeURIComponent(SOURCE) + "&filter=" + encodeURIComponent(filter))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        all = (d && d.channels) || [];
+        const start = all.find((c) => wanted !== SOURCE + ":" && (c.id === wanted || c.rawId === wanted)) || all[0];
+        if (start) play(start);
+        else draw("");
+      })
+      .catch(() => draw(""));
+  </script>
+</body>
+</html>`;
+}
+
 function renderWidgetSdkJs(): string {
   return `(function(){
   const s = document.currentScript || document.querySelector('script[src*="embed-sdk.js"]');
@@ -4936,7 +5040,19 @@ export async function maybeHandleLiveRequest(request: Request, env: unknown): Pr
   }
 
   if (path.startsWith("/embed/")) {
-    const rawId = decodeURIComponent(path.slice("/embed/".length));
+    const rawId = decodeURIComponent(path.slice("/embed/".length)).replace(/\/+$/, "");
+
+    // "The AK TV section" -- player plus that source's channel list -- needs one URL, not an id
+    // per channel. A source name is therefore answered before any catalogue is touched: the page
+    // fetches its own list from the browser, so the host's iframe paints immediately.
+    const section = /^(tgtv|jio|maxtv)$/i.exec(rawId)?.[1]?.toLowerCase();
+    if (section === "tgtv" || section === "jio" || section === "maxtv") {
+      return new Response(renderPlaylistEmbedHtml(section, publicOrigin), {
+        status: 200,
+        headers: corsEmbedHeaders({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
+      });
+    }
+
     // An embed is loaded by a third-party page, so it must answer promptly and it must not
     // depend on a source it does not use: the id prefix names the catalogue, and a budget
     // keeps a slow one from holding the frame open on someone else's site.

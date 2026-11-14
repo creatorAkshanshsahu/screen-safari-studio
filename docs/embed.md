@@ -1,19 +1,62 @@
 # Putting a STREAMR player on another website
 
-Two things you can put on someone else's page:
+Four things you can put on someone else's page, smallest effort first:
 
-- **one AK TV channel** — an `<iframe>` you can paste anywhere
-- **the whole AK TV playlist**, with a search box and a channel grid — one `<script>` line
+- **the AK TV section** — player *and* channel list — **one `<iframe>`, no ids**
+- **one channel**, by id — one `<iframe>`
+- **an in-page picker** for sites that allow scripts — one `<script>` line
+- **the raw M3U**, for VLC, Kodi or TiviMate
 
-Both play from the **viewer's own IP** where the source allows it, both work on any host
-(WordPress, Wix, Shopify, Squarespace, plain HTML), and both carry a small **STREAMR** mark in
-the top-right corner of the player that opens your site when clicked.
+They all play from the **viewer's own IP** where the source allows it, they work on any host
+(WordPress, Wix, Shopify, Squarespace, plain HTML), and every player carries a small **STREAMR**
+badge over the video that opens your site when clicked.
 
 Replace `PLAYER` below with your deployed domain, e.g. `streamr.lovable.app`.
 
 ---
 
-## 1. One channel
+## 1. The AK TV section — player **and** channel list
+
+One iframe. No script tag, no channel ids, nothing to configure:
+
+```html
+<iframe
+  src="https://PLAYER/embed/tgtv"
+  title="AK TV · STREAMR"
+  width="100%"
+  height="600"
+  style="border:0;border-radius:12px;background:#080711"
+  allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+  allowfullscreen
+  referrerpolicy="no-referrer"
+></iframe>
+```
+
+That renders the player above a searchable grid of every AK TV channel. Clicking a channel
+loads it in the player **inside the frame** — the host page never navigates, never reloads, and
+never needs to know a channel id.
+
+Give it any width; the player keeps a 16:9 box and the list fills the rest. A good default is
+`height="600"` (or `aspect-ratio` if you prefer a fixed shape).
+
+Optional URL parameters:
+
+| Parameter | Example | Effect |
+|---|---|---|
+| `filter` | `?filter=kids` | `all`, `hindi`, or `kids` |
+| `channel` | `?channel=tg%3A3436` | start on a specific channel instead of the first |
+| `muted` | `?muted=1` | start muted, for browsers that block unmuted autoplay |
+
+Swap `tgtv` for `jio` or `maxtv` and the same URL works for those sections.
+
+### If the site cannot use iframes
+
+Most page builders (Squarespace, Notion, some WordPress themes) allow iframes but strip
+`<script>`. If a site allows scripts instead, section 3 does the same thing in-page.
+
+---
+
+## 2. One channel
 
 ```html
 <iframe
@@ -50,7 +93,7 @@ embed today keeps working.
 
 ---
 
-## 2. The whole playlist, with search
+## 3. In-page picker, if scripts are allowed
 
 One line, no build step:
 
@@ -70,7 +113,7 @@ the player. `data-source` accepts `tgtv` (AK TV), `jio` (JioTV), `maxtv`, or `st
 
 ---
 
-## 3. Build your own picker
+## 4. Build your own picker
 
 If the site wants its own layout, take the channel list and build it yourself:
 
@@ -97,7 +140,7 @@ Add `&q=discovery` to search server-side, or `&limit=50` to cap the list.
 
 ---
 
-## 4. Also an M3U playlist
+## 5. Also an M3U playlist
 
 For VLC, Kodi, TiviMate, or any IPTV client:
 
