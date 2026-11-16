@@ -47,11 +47,15 @@ describe("Live route", () => {
     await waitFor(() => expect(screen.getAllByText(/2 Channels/).length).toBeGreaterThan(0));
   });
 
-  it("offers AK TV and nothing else", async () => {
+  it("offers AK TV and maxTV as separate tabs, never one mixed list", async () => {
     renderLive();
     await waitFor(() => expect(screen.getAllByText("AK TV").length).toBeGreaterThan(0));
-    // maxTV and JioTV are gone from the product, not merely hidden behind a default.
-    expect(screen.queryAllByText("maxTV")).toHaveLength(0);
+    /*
+     * Both sources exist and are chosen by the viewer, one at a time. A single "all" list is what
+     * filled this guide with Jio and maxTV channels and no way to tell which were meant to work --
+     * so there is no such tab, and the default is still AK TV.
+     */
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["AK TV", "maxTV"]);
     expect(screen.queryAllByText("JioTV")).toHaveLength(0);
     expect(screen.queryAllByText("Both")).toHaveLength(0);
   });

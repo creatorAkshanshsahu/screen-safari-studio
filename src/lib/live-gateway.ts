@@ -85,6 +85,17 @@ const AKTV_RELAY_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const CATALOGUE_TTL_MS = 15 * 60 * 1000;
 
+/**
+ * How long a list may be shown after the read that produced it stopped working.
+ *
+ * A cached catalogue is a kindness for a minute and a trap for an hour: the channel addresses in a
+ * playlist are tokens, and a list that is hours old is a guide full of channels that cannot play --
+ * reported, exactly, as "we are having old playlist which isn't playing". Past this window the
+ * stale list is withheld and the reason travels instead, so the page keeps retrying against
+ * something that can change rather than presenting a corpse as a catalogue.
+ */
+const CATALOGUE_STALE_SERVE_MS = 45 * 60 * 1000;
+
 const PREVIEW_SEED_CHANNELS: LiveChannelItem[] = [
   { id: "st:1001", rawId: "1001", source: "maxtv", name: "Star Sports 1 Hindi HD", category: "SPORTS | CRICKET", logo: "", cmd: "seed://1001" },
   { id: "st:1002", rawId: "1002", source: "maxtv", name: "Star Sports 2 HD", category: "SPORTS | CRICKET", logo: "", cmd: "seed://1002" },
@@ -1775,15 +1786,26 @@ async function loadMaxtvCached(cfg: GatewayConfig, force = false): Promise<LiveC
     memCache.maxtv = { items: live, fetchedAt: Date.now(), usingSeed: false, error: null, endpoint: endpoint ?? memCache.maxtv.endpoint };
     return live;
   } catch (e) {
-    const fallback = memCache.maxtv.items.length > 0 ? memCache.maxtv.items : PREVIEW_SEED_CHANNELS;
+    /*
+     * The seed is a list of channel *names*, not a catalogue.
+     *
+     * A previous version served `PREVIEW_SEED_CHANNELS` whenever the portal could not be read, so a
+     * viewer whose portal was down (or unconfigured) was shown a full guide of maxTV channels whose
+     * command is `seed://1001`. Not one of them could ever play, and nothing on screen said so --
+     * "the list is not empty" was doing duty for "the portal answered", which is how a placeholder
+     * became the thing people complained about.
+     *
+     * The last real catalogue is worth keeping; a fictional one is not.
+     */
+    const lastGood = memCache.maxtv.items;
     memCache.maxtv = {
-      items: fallback,
-      fetchedAt: Date.now(),
-      usingSeed: fallback === PREVIEW_SEED_CHANNELS,
+      items: lastGood,
+      fetchedAt: memCache.maxtv.fetchedAt,
+      usingSeed: lastGood.length === 0,
       error: e instanceof Error ? e.message : String(e),
       endpoint: memCache.maxtv.endpoint,
     };
-    return fallback;
+    return lastGood;
   }
 }
 
@@ -3046,7 +3068,9 @@ async function loadTgTvCached(cfg: GatewayConfig, force = false): Promise<LiveCh
       return live;
     } catch (e) {
       tgtvCache.error = e instanceof Error ? e.message : String(e);
-      return tgtvCache.items;
+      const age = Date.now() - tgtvCache.fetchedAt;
+      if (tgtvCache.items.length > 0 && age <= CATALOGUE_STALE_SERVE_MS) return tgtvCache.items;
+      return [];
     }
   })();
 
@@ -3313,15 +3337,19 @@ async function getChannelsBySource(cfg: GatewayConfig, source: string, force = f
     const combined = [...live, ...j, ...t];
     return combined.length > 0 ? combined : m;
   }
-  // Explicitly named sources -- including the default path, which `source=maxtv` still takes --
-  // keep their old chain of fallbacks. What changed is where a *sourceless* link lands: see
-  // `loadCatalogueForId`, which is the function a channel URL actually uses.
-  const maxtv = await loadMaxtvCached(cfg, force);
-  if (!memCache.maxtv.usingSeed && maxtv.length > 0) return maxtv;
-  const jio = await loadJioCached(cfg, force);
-  if (jio.length > 0) return jio;
-  const tgtv = await loadTgTvCached(cfg, force);
-  return tgtv.length > 0 ? tgtv : maxtv;
+  if (s === "maxtv") return loadMaxtvCached(cfg, force);
+  /*
+   * A named source answers for itself. Nothing else.
+   *
+   * This used to be a chain -- maxTV, then the Jio backup, then AK TV -- and the chain is the
+   * reason a viewer who asked for maxTV was shown Jio channels, and a viewer who asked for AK TV
+   * was shown a Jio catalogue wearing AK TV ids. Every one of those substitutions was invisible:
+   * the response said `servedBy: "maxtv"` while serving something else entirely.
+   *
+   * A tab that cannot load says so and stays empty. The page retries; the reason is in the JSON;
+   * `/api/live/diagnose` says what the source answered.
+   */
+  return loadMaxtvCached(cfg, force);
 }
 
 // ---------- Web Crypto HMAC Signing for HLS Segments ----------
@@ -4999,7 +5027,10 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
 
     // Report what is actually being served. A seed row can never masquerade as a working
     // catalogue, and when the backup playlist is carrying the list that is stated plainly.
-    const usingSeed = filtered.length > 0 && filtered.every((c) => String(c.cmd || "").startsWith("seed://"));
+    const usingSeed =
+      filtered.length === 0
+        ? memCache.maxtv.usingSeed
+        : filtered.every((c) => String(c.cmd || "").startsWith("seed://"));
     const hasJio = filtered.some((c) => c.source === "jio");
     const hasMaxtv = filtered.some((c) => c.source === "maxtv");
     const hasTgTv = filtered.some((c) => c.source === "tgtv");
@@ -5043,6 +5074,18 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
       tgtvError: tgtvCache.error,
       tgtvFetchedAt: tgtvCache.fetchedAt || null,
       listedAt: listed.length > 0 ? Date.now() : null,
+      /*
+       * The error for the source that was actually asked for, whichever it is. `tgtvError` answers
+       * "why is the AK TV list empty"; this answers the same question for maxTV, and a maxTV tab
+       * that is empty because nothing is configured needs to say that rather than retry forever.
+       */
+      sourceError: source === "maxtv" ? memCache.maxtv.error : tgtvCache.error,
+      sourceEndpoint: source === "maxtv" ? memCache.maxtv.endpoint : null,
+      /** True when this is a cached list being served after its refresh failed. */
+      stale: Boolean(tgtvCache.error) && listed.length > 0 && source !== "maxtv",
+      listAgeSeconds: tgtvCache.fetchedAt ? Math.round((Date.now() - tgtvCache.fetchedAt) / 1000) : null,
+      /** Whether maxTV was configured at all, or is just absent. Two different empty guides. */
+      maxTvConfigured: cfg.maxtvPortalExplicit || cfg.maxtvMacExplicit,
       /** The catalogue read is still running. Ask again; it is not stuck. */
       warming: !settled.arrived,
       categories,
