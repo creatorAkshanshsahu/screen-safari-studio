@@ -182,7 +182,12 @@ describe("TG TV direct HLS live source & fallback", () => {
 https://cdn.tgtv.example/live/ss1h/index.m3u8
 `;
 
-  it("falls back to TG TV automatically when both maxTV and JioTV are unreachable", async () => {
+  /*
+   * Was "falls back to TG TV automatically when both maxTV and JioTV are unreachable" -- one source
+   * quietly serving another's channels, under a label that said otherwise. AK TV is asked for by
+   * name now, and it answers for itself.
+   */
+  it("serves the TG playlist when AK TV is asked for by name", async () => {
     vi.stubGlobal("fetch", async (url: string) => {
       const u = String(url);
       if (u.includes("livetgtv.lovable.app")) {
@@ -193,7 +198,7 @@ https://cdn.tgtv.example/live/ss1h/index.m3u8
 
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = await maybeHandleLiveRequest(
-      new Request("https://screen-safari-studio.lovable.app/api/live/channels?source=maxtv&filter=hindi"),
+      new Request("https://screen-safari-studio.lovable.app/api/live/channels?source=tgtv&filter=hindi&refresh=1"),
       {},
     );
     const json = (await res!.json()) as {

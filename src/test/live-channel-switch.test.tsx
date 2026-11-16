@@ -93,6 +93,83 @@ describe("opening the guide on a cold instance", () => {
   });
 });
 
+describe("the maxTV tab", () => {
+  /*
+   * maxTV is a separate source with its own catalogue and its own ids, and the report that made it
+   * necessary was the opposite arrangement: one list with both sources in it, and no way to tell
+   * which entries were meant to play. Choosing the tab asks the relay for that source only, and the
+   * player switches to a channel that actually exists in it.
+   */
+  const MAXTV = {
+    ok: true,
+    servedBy: "maxtv",
+    categories: ["SPORTS"],
+    channels: [
+      {
+        id: "st:1001",
+        key: "st:1001",
+        number: 1001,
+        source: "maxtv",
+        name: "Star Sports 1 Hindi HD",
+        category: "SPORTS",
+        rawCategory: "SPORTS",
+        logo: "",
+        embedUrl: "",
+        iframeCode: "",
+        streamUrl: "/api/live/stream/st%3A1001.ts",
+        container: "mpegts",
+        drm: null,
+      },
+    ],
+  };
+
+  it("asks the relay for maxTV only, and plays what comes back", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (target: string) => {
+        const url = String(target);
+        calls.push(url);
+        const body = url.includes("source=maxtv") ? MAXTV : payload;
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      }),
+    );
+
+    renderLive();
+    await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
+    expect(ENGINE.props.at(-1)!["channelId"]).toBe("tg:pictures");
+
+    fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
+
+    await waitFor(() => expect(ENGINE.props.at(-1)!["channelId"]).toBe("st:1001"));
+    // The AK TV channel is not carried over: an id from one source means nothing in the other.
+    expect(calls.some((u) => u.includes("source=maxtv"))).toBe(true);
+    expect(screen.getByRole("tab", { name: "maxTV" }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("says maxTV is unconfigured rather than retrying at nothing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (target: string) => {
+        const url = String(target);
+        const body = url.includes("source=maxtv")
+          ? { ok: true, channels: [], categories: [], sourceError: null, maxTvConfigured: false }
+          : payload;
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      }),
+    );
+
+    renderLive();
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(2));
+    fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
+
+    await waitFor(() => expect(screen.getByText(/maxTV is not configured/)).toBeTruthy());
+    // A deployment with no portal is not a failure to retry; it is a fact to state, with the two
+    // variables that fix it.
+    expect(screen.getByText(/MAXTV_PORTAL/)).toBeTruthy();
+  });
+});
+
 describe("a channel opened from a shared link", () => {
   it("plays the channel the link named, by number", async () => {
     renderLive("2524");

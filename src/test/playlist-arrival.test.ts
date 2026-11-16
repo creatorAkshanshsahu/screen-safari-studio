@@ -113,6 +113,68 @@ describe("a playlist that does not arrive", () => {
     expect(body.cache.channels).toBe(0);
   });
 
+  it("never shows maxTV channel names it cannot play", async () => {
+    /*
+     * The guide used to be filled from `PREVIEW_SEED_CHANNELS` whenever the maxTV portal could not
+     * be read: real channel names with a `seed://` command, which is to say a guide of channels
+     * that could never play and no sign that anything was wrong. That is the "old mac tv channels"
+     * report. A source that cannot answer now says so with an empty list instead.
+     */
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 404 })));
+
+    const { text } = await get("/api/live/channels?source=maxtv&refresh=1", { MAXTV_PORTAL: "http://portal.example/c/" });
+    const body = JSON.parse(text) as {
+      channels: Array<{ name: string }>;
+      usingPreviewSeed: boolean;
+      portalError: string | null;
+      maxTvConfigured: boolean;
+    };
+
+    expect(body.channels).toEqual([]);
+    expect(body.usingPreviewSeed).toBe(true);
+    expect(body.portalError).toBeTruthy();
+  });
+
+  it("marks a cached list as stale after its refresh fails, and withholds it once it is too old", async () => {
+    /*
+     * "we are having old playlist which isn't playing": the guide was serving a list from a read
+     * that had since failed, with nothing on screen to say the list had stopped refreshing. A
+     * cached catalogue is a kindness for a while and a trap after that -- the addresses inside a
+     * playlist are tokens, and tokens expire.
+     */
+    const ok = vi.fn(async () => new Response(TG, { status: 200 }));
+    vi.stubGlobal("fetch", ok);
+    const first = JSON.parse((await get("/api/live/channels?source=tgtv&refresh=1")).text) as {
+      channels: unknown[];
+      stale?: boolean;
+    };
+    expect(first.channels).toHaveLength(1);
+    expect(first.stale).toBe(false);
+
+    // The playlist host goes down. The cached list is still young, so it is served -- flagged.
+    const realNow = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(realNow + 16 * 60 * 1000);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 503 })));
+    const second = JSON.parse((await get("/api/live/channels?source=tgtv")).text) as {
+      channels: unknown[];
+      stale?: boolean;
+      sourceError: string | null;
+    };
+    expect(second.channels).toHaveLength(1);
+    expect(second.stale).toBe(true);
+    expect(second.sourceError).toContain("503");
+
+    // Past the window it is not a list any more, it is a wall of dead links.
+    nowSpy.mockReturnValue(realNow + 90 * 60 * 1000);
+    const third = JSON.parse((await get("/api/live/channels?source=tgtv")).text) as {
+      channels: unknown[];
+      sourceError: string | null;
+    };
+    expect(third.channels).toEqual([]);
+    expect(third.sourceError).toContain("503");
+    nowSpy.mockRestore();
+  });
+
   it("reports the channels as soon as the playlist lands", async () => {
     vi.stubGlobal(
       "fetch",

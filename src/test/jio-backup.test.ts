@@ -62,9 +62,16 @@ describe("JioTV requested by name", () => {
 });
 
 describe("JioTV backup source", () => {
-  it("serves the backup catalogue when the maxTV portal does not answer", async () => {
+  /*
+   * These used to be reached by asking for `source=maxtv` and letting the response quietly
+   * substitute the Jio playlist when the portal did not answer. That substitution is exactly what
+   * put Jio channels in front of someone who asked for maxTV, under a `servedBy: "maxtv"` label.
+   * A named source answers for itself now; the Jio catalogue is still a source, and asking for it
+   * by name gets exactly this.
+   */
+  it("serves the backup catalogue when it is asked for by name", async () => {
     stubPortalDown();
-    const data = await loadChannels();
+    const data = await loadChannels({}, "jio");
 
     expect(data.servedBy).toBe("jio");
     expect(data.usingPreviewSeed).toBe(false);
@@ -76,7 +83,7 @@ describe("JioTV backup source", () => {
 
   it("keeps the playlist's own ids, logos and groups", async () => {
     stubPortalDown();
-    const data = await loadChannels();
+    const data = await loadChannels({}, "jio");
 
     const colors = data.channels.find((c) => c.name === "Colors HD")!;
     expect(colors.id).toBe("jio:144");
@@ -87,7 +94,7 @@ describe("JioTV backup source", () => {
 
   it("resolves a relative stream path against the playlist location", async () => {
     stubPortalDown();
-    const data = await loadChannels();
+    const data = await loadChannels({}, "jio");
     // "Aaj Tak" is listed as /jiotv/300/master.m3u8 and must become absolute.
     expect(data.channels.find((c) => c.name === "Aaj Tak")).toBeTruthy();
   });
@@ -114,15 +121,24 @@ describe("JioTV backup source", () => {
     expect(data.channels.map((c) => c.name)).toEqual(["Arena Sports"]);
   });
 
-  it("reports the backup failure when both sources are down", async () => {
+  it("reports the backup failure rather than an empty list with no reason", async () => {
     vi.stubGlobal("fetch", async () => {
       throw new TypeError("fetch failed");
     });
 
+    const data = await loadChannels({}, "jio");
+
+    expect(data.channels).toEqual([]);
+    expect(data.backupError).toContain("Backup playlist");
+  });
+
+  it("does not substitute the Jio catalogue when maxTV cannot be read", async () => {
+    // The report: asking for one source and being served another. A maxTV tab with no portal
+    // configured shows nothing, and says why.
+    stubPortalDown();
     const data = await loadChannels();
 
-    expect(data.usingPreviewSeed).toBe(true);
-    expect(data.backupError).toContain("Backup playlist");
+    expect(data.channels).toEqual([]);
     expect(data.portalError).toContain("no portal at this address");
   });
 

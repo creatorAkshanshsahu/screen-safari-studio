@@ -21,14 +21,33 @@ export const Route = createFileRoute("/live")({
 });
 
 /**
- * AK TV is the only source. maxTV and JioTV are gone from the product: they asked for a portal
- * account and a CDN that refuses datacentre addresses, and between them they accounted for every
- * failure this app has had. What is left is one playlist we do not have to fight.
+ * Two sources, each answering for itself.
+ *
+ * AK TV is the playlist we do not have to fight; maxTV is a real portal account, if one is
+ * configured. They are never merged: a single list containing both is how the guide once filled
+ * with Jio and maxTV channels and no sign of which were supposed to work. A tab each, and the tab
+ * says why it is empty when it is.
  */
-const SOURCE = "tgtv" as const;
+type LiveSource = "tgtv" | "maxtv";
+const SOURCES: Array<{ id: LiveSource; label: string }> = [
+  { id: "tgtv", label: "AK TV" },
+  { id: "maxtv", label: "maxTV" },
+];
 
-export function LivePlayerContent({ initialChannelId }: { initialChannelId?: string } = {}) {
-  const source = SOURCE;
+/** "3 minutes", "2 hours" — an age a person can act on, never a raw number of seconds. */
+function formatAge(seconds: number): string {
+  if (seconds < 90) return `${Math.max(Math.round(seconds), 1)} seconds`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.round(minutes / 60);
+  return `${hours} hour${hours === 1 ? "" : "s"}`;
+}
+
+export function LivePlayerContent({
+  initialChannelId,
+  initialSource,
+}: { initialChannelId?: string; initialSource?: string } = {}) {
+  const [source, setSource] = useState<LiveSource>(initialSource === "maxtv" ? "maxtv" : "tgtv");
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("all");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
   const [query, setQuery] = useState("");
@@ -60,16 +79,53 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
   const [tgtvError, setTgtvError] = useState<string | null>(null);
   /** The relay is still reading the playlist. Ask again shortly; it is not stuck. */
   const [warming, setWarming] = useState(false);
+  /** A cached list being served after its refresh failed: usable, and worth saying out loud. */
+  const [stale, setStale] = useState(false);
+  const [listAge, setListAge] = useState<number | null>(null);
+  /** Whether maxTV has a portal configured at all, or is simply absent from this deployment. */
+  const [maxTvConfigured, setMaxTvConfigured] = useState(true);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
     // A pasted link wins: /live/143, /live/tg:1001 and /live?ch=… are all the same request.
-    const requested = initialChannelId || new URLSearchParams(window.location.search).get("ch");
+    const params = new URLSearchParams(window.location.search);
+    const requested = initialChannelId || params.get("ch");
     if (requested) {
       setRequestedId(requested);
       setActiveId(requested);
     }
-  }, [initialChannelId]);
+    // `?source=maxtv` is a link someone can share, the same way `?ch=` is.
+    if (!initialSource && params.get("source") === "maxtv") setSource("maxtv");
+  }, [initialChannelId, initialSource]);
+
+  /**
+   * Switching source is switching products: no channel id from one is valid in the other.
+   *
+   * The address bar keeps the choice (`?source=maxtv`), so a link to the maxTV guide is a link to
+   * the maxTV guide -- and `replaceState` rather than a route change, because a navigation would
+   * remount the player for a tab that is only changing what it lists.
+   */
+  const switchSource = (next: LiveSource) => {
+    if (next === source) return;
+    cancelRetry();
+    retryAttempt.current = 0;
+    staleRefresh.current = false;
+    setChannels([]);
+    setActiveId("");
+    setRequestedId("");
+    setPortalError(null);
+    setTgtvError(null);
+    setWarming(false);
+    setStale(false);
+    setSource(next);
+    if (typeof window !== "undefined" && window.location.pathname.startsWith("/live")) {
+      const params = new URLSearchParams(window.location.search);
+      if (next === "maxtv") params.set("source", "maxtv");
+      else params.delete("source");
+      const qs = params.toString();
+      window.history.replaceState(null, "", `/live${qs ? `?${qs}` : ""}`);
+    }
+  };
 
   /*
    * The guide keeps asking.
@@ -86,6 +142,8 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
   const RETRY_DELAYS_MS = [1000, 2000, 3500, 5000, 7000];
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryAttempt = useRef(0);
+  /** One automatic forced refresh per stale list, so a dead host is asked once, not in a loop. */
+  const staleRefresh = useRef(false);
   const loadRef = useRef<(force?: boolean) => Promise<void>>(async () => undefined);
 
   const cancelRetry = useCallback(() => {
@@ -121,14 +179,22 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
           backupError?: string | null;
           tgtvError?: string | null;
           warming?: boolean;
+          sourceError?: string | null;
+          sourceEndpoint?: string | null;
+          maxTvConfigured?: boolean;
+          stale?: boolean;
+          listAgeSeconds?: number | null;
         };
         const list = data.channels ?? [];
         setChannels(list);
         setCategories(data.categories ?? []);
         setPortalError(data.portalError ?? null);
         setBackupError(data.backupError ?? null);
-        setTgtvError(data.tgtvError ?? null);
+        setTgtvError(data.sourceError ?? data.tgtvError ?? null);
         setWarming(Boolean(data.warming));
+        setStale(Boolean(data.stale));
+        setListAge(data.listAgeSeconds ?? null);
+        setMaxTvConfigured(Boolean(data.maxTvConfigured));
         setSelectedCategory("");
         /*
          * Ask again while there is nothing to show. A manual refresh is the viewer taking the
@@ -137,6 +203,16 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
         if (list.length > 0) {
           retryAttempt.current = 0;
           cancelRetry();
+          if (!data.stale) staleRefresh.current = false;
+          /*
+           * A list that is being served from cache gets one attempt to be current again. One: a
+           * forced refresh that fails leaves the banner and the button, and does not start a loop
+           * against a host that is already refusing us.
+           */
+          if (data.stale && !force && !staleRefresh.current) {
+            staleRefresh.current = true;
+            setTimeout(() => void loadRef.current(true), 1500);
+          }
         } else if (force) {
           retryAttempt.current = 0;
           scheduleRetry();
@@ -349,6 +425,30 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
           </a>
         </header>
 
+        {/*
+         * One tab per source. Never one list with both in it: a merged guide is how this page once
+         * filled with Jio and maxTV entries and no way to tell which were supposed to work.
+         */}
+        <div className="mb-3 flex items-center gap-1.5" role="tablist" aria-label="Channel source">
+          {SOURCES.map((entry) => {
+            const active = entry.id === source;
+            return (
+              <button
+                key={entry.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => switchSource(entry.id)}
+                className={`rounded-full px-3 py-1.5 text-xs font-bold transition ${
+                  active ? "bg-primary text-primary-foreground" : "glass text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {entry.label}
+              </button>
+            );
+          })}
+        </div>
+
         <LivePlayerStage
           channel={stageChannel}
           variant="aspect"
@@ -388,7 +488,9 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
             )}
             {activeChannel?.name ?? (loading ? "Loading…" : "No channel")}
           </h1>
-          <span className="glass rounded-full px-2.5 py-1 text-[11px] font-bold text-accent">AK TV</span>
+          <span className="glass rounded-full px-2.5 py-1 text-[11px] font-bold text-accent">
+            {source === "maxtv" ? "maxTV" : "AK TV"}
+          </span>
           {activeChannel && (
             <span className="text-xs text-muted-foreground">
               {activeChannel.category} · {containerKind}
@@ -423,19 +525,28 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
              * error.
              */}
             <p className="font-bold text-accent">
-              {channels.length === 0 && (warming || retryAttempt.current > 0)
-                ? "AK TV returned no channels yet."
-                : "AK TV returned no channels."}
+              {source === "maxtv" && !maxTvConfigured
+                ? "maxTV is not configured."
+                : channels.length === 0 && (warming || retryAttempt.current > 0)
+                  ? `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels yet.`
+                  : `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels.`}
             </p>
             <p className="mt-0.5 text-muted-foreground">
-              {channels.length === 0 && (warming || retryAttempt.current > 0)
-                ? `Retrying by itself — attempt ${Math.max(retryAttempt.current, 1)}. The relay is reading the playlist${
-                    tgtvError ? ` (last answer: ${tgtvError})` : ""
-                  }.`
-                : (portalError ??
+              {source === "maxtv" && !maxTvConfigured ? (
+                <>
+                  This deployment has no portal to ask. Set <code>MAXTV_PORTAL</code> and{" "}
+                  <code>MAXTV_MAC</code> in the environment, then press Refresh.
+                </>
+              ) : channels.length === 0 && (warming || retryAttempt.current > 0) ? (
+                `Retrying by itself — attempt ${Math.max(retryAttempt.current, 1)}. The relay is reading the ${
+                  source === "maxtv" ? "portal" : "playlist"
+                }${tgtvError ? ` (last answer: ${tgtvError})` : ""}.`
+              ) : (
+                (portalError ??
                   tgtvError ??
                   backupError ??
-                  "The playlist answered but listed nothing. Press Refresh to try again.")}
+                  "The source answered but listed nothing. Press Refresh to try again.")
+              )}
             </p>
             <button
               type="button"
@@ -447,6 +558,34 @@ export function LivePlayerContent({ initialChannelId }: { initialChannelId?: str
               className="mt-2 rounded-full bg-accent px-3 py-1 text-[11px] font-bold text-accent-foreground"
             >
               Refresh now
+            </button>
+          </div>
+        )}
+
+        {/*
+         * A cached list is usable and not current, which is a third state between "fine" and
+         * "empty". The report was "we are having old playlist which isn't playing": the guide was
+         * showing channels from a read that had since failed, and nothing on screen said the list
+         * had stopped refreshing.
+         */}
+        {stale && listAge !== null && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-xl border border-amber-400/40 bg-amber-400/10 px-4 py-2 text-xs">
+            <p className="font-bold text-amber-300">
+              This list is {formatAge(listAge)} old and has not refreshed since.
+            </p>
+            <p className="text-muted-foreground">
+              Channels can move — if one will not play, press Refresh to re-read the playlist.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                retryAttempt.current = 0;
+                cancelRetry();
+                void loadCatalogue(true);
+              }}
+              className="ml-auto rounded-full bg-amber-400 px-3 py-1 text-[11px] font-bold text-black"
+            >
+              Refresh
             </button>
           </div>
         )}

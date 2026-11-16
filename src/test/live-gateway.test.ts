@@ -1,11 +1,38 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { maybeHandleLiveRequest } from "@/lib/live-gateway";
+
+/*
+ * The two catalogue assertions below used to be satisfied by the maxTV preview seed -- channel
+ * names with a `seed://` command, which is to say channels that could not play. A listing is now
+ * the source's own catalogue or nothing, so these assert the same contract against a real one.
+ */
+const TG_PLAYLIST = `#EXTM3U
+#EXTINF:-1 tvg-id="hindi-news" tvg-chno="12" group-title="Hindi News",A Hindi News Channel
+https://cdn.example/live/news.m3u8
+`;
+
+function stubPlaylist() {
+  vi.stubGlobal(
+    "fetch",
+    async (target: string) =>
+      String(target).includes("playlist.m3u")
+        ? new Response(TG_PLAYLIST, { status: 200 })
+        : new Response("", { status: 404 }),
+  );
+}
+
+const ENV = { TGTV_PLAYLIST_URL: "https://tg.example/playlist.m3u" };
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("Live TV & OG Embed Gateway", () => {
   it("returns CORS-enabled channel JSON on /api/live/channels", async () => {
+    stubPlaylist();
     const res = await maybeHandleLiveRequest(
-      new Request("https://streamr.lovable.app/api/live/channels?source=maxtv&filter=hindi"),
-      undefined,
+      new Request("https://streamr.lovable.app/api/live/channels?source=tgtv&filter=hindi&refresh=1"),
+      ENV,
     );
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
@@ -17,9 +44,10 @@ describe("Live TV & OG Embed Gateway", () => {
   });
 
   it("generates dynamic M3U playlist on /api/live/playlist.m3u", async () => {
+    stubPlaylist();
     const res = await maybeHandleLiveRequest(
-      new Request("https://streamr.lovable.app/api/live/playlist.m3u?source=maxtv&filter=hindi"),
-      undefined,
+      new Request("https://streamr.lovable.app/api/live/playlist.m3u?source=tgtv&filter=hindi"),
+      ENV,
     );
     expect(res).not.toBeNull();
     const text = await res!.text();

@@ -71,18 +71,37 @@ describe("manifest segment URLs never depend on the server guessing its own addr
 });
 
 describe("links handed to other machines use the public origin", () => {
+  /*
+   * These used to read the maxTV preview seed, which was a list of channel names that never
+   * resolved to a stream. The seed is gone: a listing shows channels that exist, or it shows
+   * nothing. What is being asserted here -- that the links a viewer copies carry the public origin
+   * and not the container's own -- is unchanged, so it is asserted against a real catalogue.
+   */
+  const TG = `#EXTM3U\n#EXTINF:-1 tvg-id="sports" tvg-chno="300" group-title="Sports",A Real Channel\nhttps://cdn.example/live/sports.m3u8\n`;
+
+  function stubPlaylist() {
+    vi.stubGlobal(
+      "fetch",
+      async (target: string) =>
+        String(target).includes("playlist.m3u")
+          ? new Response(TG, { status: 200 })
+          : new Response("", { status: 404 }),
+    );
+  }
+  const env = { TGTV_PLAYLIST_URL: "https://tg.example/playlist.m3u" };
+
   it("prefers the forwarded host over the internal one", async () => {
-    vi.stubGlobal("fetch", async () => new Response("", { status: 404 }));
+    stubPlaylist();
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = await maybeHandleLiveRequest(
-      new Request("http://internal:3000/api/live/channels?source=maxtv", {
+      new Request("http://internal:3000/api/live/channels?source=tgtv&refresh=1", {
         headers: {
           host: "internal:3000",
           "x-forwarded-host": "screen-safari-studio.lovable.app",
           "x-forwarded-proto": "https",
         },
       }),
-      {},
+      env,
     );
     const body = (await res!.json()) as { channels: Array<{ streamUrl?: string; embedUrl?: string }> };
     const first = body.channels[0];
@@ -91,13 +110,13 @@ describe("links handed to other machines use the public origin", () => {
   });
 
   it("never emits a localhost link to a browser that is not on localhost", async () => {
-    vi.stubGlobal("fetch", async () => new Response("", { status: 404 }));
+    stubPlaylist();
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = await maybeHandleLiveRequest(
-      new Request("http://localhost:3000/api/live/channels?source=maxtv", {
+      new Request("http://localhost:3000/api/live/channels?source=tgtv&refresh=1", {
         headers: { host: "localhost:3000", "x-forwarded-host": "telly.example", "x-forwarded-proto": "https" },
       }),
-      {},
+      env,
     );
     const body = (await res!.json()) as { channels: Array<{ streamUrl?: string }> };
     expect(body.channels[0]?.streamUrl).toContain("https://telly.example");
