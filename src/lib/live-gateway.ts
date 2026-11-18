@@ -5,6 +5,8 @@
  * (zero `node:*` imports) so `vite build` with Lovable's Nitro Cloudflare target succeeds cleanly.
  */
 
+import { MAXTV_ACCOUNT, MAXTV_ENV_VARS } from "./maxtv-account";
+
 export interface LiveChannelItem {
   /**
    * The channel's own number, for dialling it: `/embed/143`, `/live/143`.
@@ -179,13 +181,8 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
     maxtvMac: readEnv(env, "MAXTV_MAC", STALKER_DEFAULT_MAC, request),
     maxtvMacExplicit: explicit("MAXTV_MAC"),
     maxtvPortalExplicit: explicit("MAXTV_PORTAL"),
-    maxtvSerial: readEnv(env, "MAXTV_SERIAL", "92180365D21FE", request),
-    maxtvDeviceId: readEnv(
-      env,
-      "MAXTV_DEVICE_ID",
-      "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070",
-      request,
-    ),
+    maxtvSerial: readEnv(env, "MAXTV_SERIAL", STALKER_DEFAULT_SERIAL, request),
+    maxtvDeviceId: readEnv(env, "MAXTV_DEVICE_ID", STALKER_DEFAULT_DEVICE, request),
     starshareServer: readEnv(env, "STARSHARE_SERVER", "http://livebox.pro:8080", request),
     starshareFallback: readEnv(env, "STARSHARE_FALLBACK", "http://starshare.fans:8080", request),
     starshareUser: readEnv(env, "STARSHARE_USER", "", request),
@@ -312,15 +309,19 @@ interface StalkerAccount {
   deviceId: string;
 }
 
-// Working Android STB subscription identity bound to serial 92180365D21FE / deviceId 3610DEAFB5...
-const STALKER_DEFAULT_PORTAL = "http://new.maxtv.be/stalker_portal/c/";
-const STALKER_DEFAULT_MAC = "00:1A:79:EE:03:9F";
+/*
+ * The account lives in one file, `src/lib/maxtv-account.ts`, because "where do I put the maxTV
+ * credentials" should have exactly one answer. These are only its defaults; `getConfig` lets
+ * `MAXTV_PORTAL`/`MAXTV_MAC`/`MAXTV_SERIAL`/`MAXTV_DEVICE_ID` override them individually.
+ */
+const STALKER_DEFAULT_PORTAL = MAXTV_ACCOUNT.portal;
+const STALKER_DEFAULT_MAC = MAXTV_ACCOUNT.mac;
 
 /** Alternate web-embed identity; kept as a secondary fallback if the primary account is refused. */
 const STALKER_LEGACY_PORTAL = "http://new.maxtv.be/c/";
 const STALKER_LEGACY_MAC = "00:1A:79:BA:DF:D7";
-const STALKER_DEFAULT_SERIAL = "92180365D21FE";
-const STALKER_DEFAULT_DEVICE = "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070";
+const STALKER_DEFAULT_SERIAL = MAXTV_ACCOUNT.serial;
+const STALKER_DEFAULT_DEVICE = MAXTV_ACCOUNT.deviceId;
 
 /** `server/load.php` — the API every panel action is posted to. */
 const STALKER_API = "server/load.php";
@@ -5161,8 +5162,18 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
       /** True when this is a cached list being served after its refresh failed. */
       stale: Boolean(tgtvCache.error) && listed.length > 0 && source !== "maxtv",
       listAgeSeconds: tgtvCache.fetchedAt ? Math.round((Date.now() - tgtvCache.fetchedAt) / 1000) : null,
-      /** Whether maxTV was configured at all, or is just absent. Two different empty guides. */
-      maxTvConfigured: cfg.maxtvPortalExplicit || cfg.maxtvMacExplicit,
+      /**
+       * Whether there is an account to ask with, or none at all. Two different empty guides: one
+       * where the portal refused us, and one where nothing was ever configured.
+       *
+       * It is not "was it set in the environment": the account also has a home in the code
+       * (`src/lib/maxtv-account.ts`), and a deployment that edits that file has a working account
+       * while setting no variables at all. Reporting that as "not configured" told the person who
+       * had just added their credentials that they had not added them.
+       */
+      maxTvConfigured: Boolean(cfg.maxtvPortal && cfg.maxtvMac),
+      /** Where the account came from, which is what decides where to change it. */
+      maxTvAccountSource: cfg.maxtvPortalExplicit || cfg.maxtvMacExplicit ? "env" : "code",
       /** The catalogue read is still running. Ask again; it is not stuck. */
       warming: !settled.arrived,
       categories,
@@ -5404,7 +5415,7 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
           // an identity may be migrated, and it explains a mismatch that otherwise looks
           // like the portal disagreeing with what was set.
           fromEnv: { portal: cfg.maxtvPortalExplicit, mac: cfg.maxtvMacExplicit },
-          envVars: ["MAXTV_PORTAL", "MAXTV_MAC", "MAXTV_SERIAL", "MAXTV_DEVICE_ID"],
+          envVars: [...MAXTV_ENV_VARS],
         },
         identities: candidates,
         migrated:
