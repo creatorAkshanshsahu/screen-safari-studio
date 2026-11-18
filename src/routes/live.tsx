@@ -534,8 +534,10 @@ export function LivePlayerContent({
             <p className="mt-0.5 text-muted-foreground">
               {source === "maxtv" && !maxTvConfigured ? (
                 <>
-                  This deployment has no portal to ask. Set <code>MAXTV_PORTAL</code> and{" "}
-                  <code>MAXTV_MAC</code> in the environment, then press Refresh.
+                  This deployment has no portal to ask. Put the four maxTV values in{" "}
+                  <code>src/lib/maxtv-account.ts</code> — portal, MAC, serial, device id — or set{" "}
+                  <code>MAXTV_PORTAL</code> and <code>MAXTV_MAC</code> in the environment. Then
+                  press Refresh.
                 </>
               ) : channels.length === 0 && (warming || retryAttempt.current > 0) ? (
                 `Retrying by itself — attempt ${Math.max(retryAttempt.current, 1)}. The relay is reading the ${

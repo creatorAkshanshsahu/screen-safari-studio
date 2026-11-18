@@ -24,3 +24,33 @@ cd <repository-name>
 npm i
 npm run dev
 ```
+
+## Where the maxTV credentials go
+
+maxTV is a **Stalker portal**: no username, no password. A subscription is four values that
+identify the device, and all four must belong to the same account:
+
+| Value | Environment variable | Meaning |
+| --- | --- | --- |
+| portal | `MAXTV_PORTAL` | panel address, e.g. `http://new.maxtv.be/stalker_portal/c/` |
+| mac | `MAXTV_MAC` | the device the panel bills, `00:1A:79:XX:XX:XX` |
+| serial | `MAXTV_SERIAL` | box serial |
+| device id | `MAXTV_DEVICE_ID` | the long hex id that goes with the serial |
+
+**Edit them in [`src/lib/maxtv-account.ts`](src/lib/maxtv-account.ts).** That file is the one place
+they live, it needs no settings screen, and a change there deploys like any other change. Each value
+can also be overridden by the matching environment variable above — the environment wins, one value
+at a time, and `/api/live/diagnose?source=maxtv` reports `configured.fromEnv` so there is never a
+question about which one answered.
+
+Then press Refresh on the maxTV tab. If it still lists nothing, that URL is the next thing to read:
+it shows the identity in use, every portal address tried, and what the panel said to each.
+
+**A MAC in a public repository is a MAC anyone can use**, and a portal that sees two devices on one
+MAC will refuse both. If the account is not already public, set the environment variables instead of
+writing the values into the file.
+
+## Which playlist the AK TV tab reads
+
+`TGTV_PLAYLIST_URL` overrides it; the default is a working public M3U. `/api/live/diagnose?playlist=1`
+reports the address in use, the status, content type, first line and channel count of the read.
