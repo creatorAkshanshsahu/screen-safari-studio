@@ -199,7 +199,9 @@ https://cdn.tgtv.example/live/ss1h/index.m3u8
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = await maybeHandleLiveRequest(
       new Request("https://screen-safari-studio.lovable.app/api/live/channels?source=tgtv&filter=hindi&refresh=1"),
-      {},
+      // Configured, not assumed: the default playlist address is whatever is live today, and these
+      // tests stub this one.
+      { TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u" },
     );
     const json = (await res!.json()) as {
       servedBy: string;

@@ -28,9 +28,12 @@ type Body = Record<string, unknown> & { error?: string; sources?: string[]; name
 
 async function api(path: string) {
   const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
-  // No env override: the stub answers the default AK TV playlist address, which is the one a
-  // deployed instance reads when nobody configures anything.
-  const res = await maybeHandleLiveRequest(new Request(`https://player.example${path}`), {});
+  // The playlist address is configured, not assumed: the default moved when the old endpoint began
+  // answering HTTP 500 (see `getConfig`), so the stub names the address it answers for. These tests
+  // are about parsing, not about which host is live today.
+  const res = await maybeHandleLiveRequest(new Request(`https://player.example${path}`), {
+    TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u",
+  });
   if (!res) return { status: 0, body: {} as Body };
   return { status: res.status, body: (await res.json()) as Body };
 }
@@ -39,7 +42,7 @@ async function embed(id: string) {
   const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
   const res = await maybeHandleLiveRequest(
     new Request(`https://player.example/embed/${encodeURIComponent(id)}`),
-    {},
+    { TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u" },
   );
   return res;
 }
@@ -72,7 +75,9 @@ describe("embedding by channel id", () => {
   it("serves the whole AK TV section from one URL, without resolving anything first", async () => {
     const net = stubNetwork();
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
-    const res = (await maybeHandleLiveRequest(new Request("https://player.example/embed/tgtv"), {}))!;
+    const res = (await maybeHandleLiveRequest(new Request("https://player.example/embed/tgtv"), {
+    TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u",
+  }))!;
     expect(res.status).toBe(200);
     // Framing is the whole point of an embed.
     expect(res.headers.get("content-security-policy")).toContain("frame-ancestors *");
@@ -129,7 +134,7 @@ describe("embedding by channel id", () => {
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = (await maybeHandleLiveRequest(
       new Request("https://player.example/api/live/channels"),
-      {},
+      { TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u" },
     ))!;
     const json = (await res.json()) as { channels: Array<{ source: string; key: string; number?: number }> };
     expect(json.channels.length).toBeGreaterThan(0);
