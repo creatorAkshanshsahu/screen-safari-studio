@@ -374,7 +374,16 @@ class StalkerError extends Error {
   readonly status: number | null;
   readonly detail: string;
   constructor(status: number | null = null, detail = "") {
-    super(status !== null ? `The portal refused the request (HTTP ${status})` : detail || "The portal did not answer with a usable response");
+    /*
+     * The detail belongs in the message. It used to sit beside it, in a field only the code read,
+     * so every refusal reached the page as "The portal refused the request (HTTP 403)" -- the same
+     * sentence for a WAF block, a moved folder and a banned MAC.
+     */
+    super(
+      status !== null
+        ? `The portal refused the request (HTTP ${status})${detail ? ` — ${detail}` : ""}`
+        : detail || "The portal did not answer with a usable response",
+    );
     this.name = "StalkerError";
     this.status = status;
     this.detail = detail;
@@ -532,7 +541,7 @@ async function fetchTextTimeout(url: string, headers: Record<string, string>, ti
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { headers, signal: ctrl.signal });
-    if (res.status !== 200) throw new StalkerError(res.status);
+    if (res.status !== 200) throw new StalkerError(res.status, await refusalWords(res));
     return await res.text();
   } finally {
     clearTimeout(timer);
@@ -540,14 +549,53 @@ async function fetchTextTimeout(url: string, headers: Record<string, string>, ti
 }
 
 /**
+ * What a refusing host actually said, in its own words.
+ *
+ * A status code is the same sentence for every cause. A WAF turning away the network this site
+ * runs on, a panel banning a MAC, and a folder that moved all arrive as `HTTP 403`, and the three
+ * want opposite responses: wait, change the account, change the address. The body and the `Server`
+ * header are the difference, and both were being discarded with the response -- which is why a
+ * blocked deployment could only ever be told "HTTP 403" and left to guess.
+ */
+async function refusalWords(res: Response): Promise<string> {
+  let body = "";
+  try {
+    body = (await res.text()).slice(0, 4000);
+  } catch {
+    // A host is entitled to refuse us the body as well.
+  }
+  const html = /<html|<!doctype/i.test(body);
+  const title = /<title[^>]*>([^<]{0,120})<\/title>/i.exec(body)?.[1]?.trim();
+  const text = html ? "" : body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+  const server = res.headers.get("server");
+  const words = [server ? `from ${server}` : "", title || text].filter(Boolean).join(": ");
+  return words;
+}
+
+/**
  * Remember a source that recently failed outright, so the catalogue does not spend
  * eight 20-second timeouts on every page load while the host is unreachable.
  */
-const sourceBackoff: { maxtvUntil: number; maxtvReason: string | null } = {
+const sourceBackoff: { maxtvUntil: number; maxtvReason: string | null; maxtvBlocked: boolean } = {
   maxtvUntil: 0,
   maxtvReason: null,
+  maxtvBlocked: false,
 };
 const SOURCE_BACKOFF_MS = 30_000;
+
+/**
+ * The statuses a panel (or the WAF in front of it) uses to turn away a *network* -- not an
+ * account, and not a device.
+ *
+ * This distinction cost a real deployment its maxTV tab. The account was live: `get_profile`
+ * answered `id 254580` from this very worker. Then every address started answering 403, because
+ * the page's retry loop and the eight-address sweep had between them sent enough handshakes to
+ * trip the panel's anti-flood rule. The app read "all addresses refused" as "no portal", kept
+ * retrying on the viewer's behalf, and so kept the ban alive. A refusal of this kind is answered
+ * by *stopping*, for long enough that the rule forgets us.
+ */
+const BLOCKED_STATUSES = new Set([403, 429, 451]);
+const BLOCKED_BACKOFF_MS = 10 * 60_000;
 
 const stalkerSession: {
   endpoint: string | null;
@@ -707,8 +755,10 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
   const failures: string[] = [];
   let spoken: string | null = null;
   let lastErr: unknown = null;
+  /** Set when an address says we are not welcome at all: the other seven will say the same. */
+  let blocked: StalkerError | null = null;
 
-  for (const identity of stalkerAccountCandidates(cfg)) {
+  identities: for (const identity of stalkerAccountCandidates(cfg)) {
     for (const candidate of stalkerCandidates(identity.portal)) {
       try {
         const body = await stalkerRaw(cfg, identity, candidate, "stb", "handshake", { token: "", prehash: "0" }, false);
@@ -725,17 +775,46 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
         stalkerSession.profiled = false;
         sourceBackoff.maxtvUntil = 0;
         sourceBackoff.maxtvReason = null;
+        sourceBackoff.maxtvBlocked = false;
         return issued;
       } catch (e) {
         lastErr = e;
         if (e instanceof StalkerError) {
           if (e.status === null && e.detail && !spoken) spoken = e.detail;
+          if (e.status !== null && BLOCKED_STATUSES.has(e.status)) {
+            // Eight addresses, two identities, five retries: forty requests is how a temporary
+            // ban becomes a permanent one. One refusal of this kind ends the sweep.
+            blocked = e;
+            break identities;
+          }
           failures.push(`${candidate} ${e.status !== null ? `HTTP ${e.status}` : "no token"}`);
         } else {
           failures.push(`${candidate} ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }
+  }
+
+  if (blocked) {
+    /*
+     * The portal is alive; it wants nothing to do with this network. Saying "no portal at this
+     * address" here would be false -- it answered a profile call from this worker minutes ago --
+     * and would send the reader looking for a wrong portal address or an expired MAC, when the
+     * address is right and the account is fine.
+     */
+    const said = [blocked.status !== null ? `HTTP ${blocked.status}` : "", blocked.detail].filter(Boolean).join(" ");
+    const reason =
+      `The maxTV server is refusing this deployment's address (${said}). ` +
+      "That is the panel turning away the network this site runs on, not your account. " +
+      "It is left alone for ten minutes so the refusal can expire.";
+    stalkerSession.endpoint = null;
+    stalkerSession.token = null;
+    sourceBackoff.maxtvUntil = Date.now() + BLOCKED_BACKOFF_MS;
+    sourceBackoff.maxtvReason = reason;
+    sourceBackoff.maxtvBlocked = true;
+    // No status, on purpose: the sentence is the whole answer, and a remembered block re-throws
+    // the same sentence rather than a bare code.
+    throw new StalkerError(null, reason);
   }
 
   stalkerSession.endpoint = null;
@@ -932,6 +1011,11 @@ async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: Live
       stalkerSession.token = null;
       stalkerSession.profiled = false;
       stalkerSession.account = null;
+      /*
+       * A blocked address is blocked for every MAC: the second identity is the same host, and
+       * asking it again is half of the traffic that got us refused in the first place.
+       */
+      if (sourceBackoff.maxtvBlocked) break;
       // If the host itself was completely unreachable across all URLs on pass 1, don't repeat network timeouts unless identity differed.
       if (Date.now() < sourceBackoff.maxtvUntil && e instanceof StalkerError && e.detail.startsWith("no portal at this address")) {
         break;
@@ -5073,6 +5157,18 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
         : force
           ? STREAM_CATALOGUE_BUDGET_MS
           : CHANNELS_FIRST_PAINT_MS;
+    /*
+     * A person pressing Refresh is not the retry loop.
+     *
+     * The pause exists to stop the *automatic* asking that kept a ban alive. It is not a lockout:
+     * someone who decides to spend a request should get one, and it costs exactly one -- the sweep
+     * ends at the first refusal now, so a still-blocked panel answers once and says so again.
+     */
+    if (force && (source === "maxtv" || source === "all")) {
+      sourceBackoff.maxtvUntil = 0;
+      sourceBackoff.maxtvReason = null;
+      sourceBackoff.maxtvBlocked = false;
+    }
     type Listing = { arrived: boolean; value: LiveChannelItem[] };
     const settled = await withBudget<Listing>(
       getChannelsBySource(cfg, source === "all" ? "tgtv" : source, force).then(
@@ -5172,6 +5268,19 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
        * had just added their credentials that they had not added them.
        */
       maxTvConfigured: Boolean(cfg.maxtvPortal && cfg.maxtvMac),
+      /**
+       * The portal is refusing this deployment's address, not the account.
+       *
+       * The page distinguishes the two because they need opposite behaviour: a blocked address
+       * must not be retried (every retry is what keeps it blocked), while an empty portal or a
+       * dropped session is worth another attempt.
+       */
+      sourceBlocked: source === "maxtv" ? sourceBackoff.maxtvBlocked : false,
+      /** When the block is assumed to have lifted; the page can say when to try again. */
+      sourceRetryAfterSeconds:
+        source === "maxtv" && sourceBackoff.maxtvBlocked
+          ? Math.max(0, Math.round((sourceBackoff.maxtvUntil - Date.now()) / 1000))
+          : null,
       /** Where the account came from, which is what decides where to change it. */
       maxTvAccountSource: cfg.maxtvPortalExplicit || cfg.maxtvMacExplicit ? "env" : "code",
       /** The catalogue read is still running. Ask again; it is not stuck. */
@@ -5421,20 +5530,44 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
         migrated:
           candidates[0]!.mac !== cfg.maxtvMac || candidates[0]!.portal !== cfg.maxtvPortal,
       };
+      /*
+       * Reuse the token this worker already holds.
+       *
+       * Asking for a second handshake on a live session is what made this report say "the portal
+       * issued no token" about a portal that had answered 26 seconds earlier: a panel mints one
+       * token per session, and a replay gets an empty answer. The replay was not only misleading,
+       * it was traffic the panel counts.
+       */
+      const heldToken = stalkerSession.token;
       try {
-        const token = await stalkerHandshake(cfg);
-        report['handshake'] = { ok: true, endpoint: stalkerSession.endpoint, token };
+        const token = heldToken ?? (await stalkerHandshake(cfg));
+        report['handshake'] = {
+          ok: true,
+          reused: Boolean(heldToken),
+          endpoint: stalkerSession.endpoint,
+          token,
+        };
         const account = stalkerAccount(cfg);
         report['identityInUse'] = { portal: account.portal, mac: account.mac };
       } catch (e) {
-        report['handshake'] = { ok: false, error: e instanceof Error ? e.message : String(e) };
-        report['hint'] =
-          "The portal refused us. Compare identityInUse/identities with the app: an expired " +
-          "MAC answers in its own words, and the migrated identity is the live one.";
+        report['ok'] = false;
+        report['handshake'] = {
+          ok: false,
+          blocked: sourceBackoff.maxtvBlocked,
+          error: e instanceof Error ? e.message : String(e),
+        };
+        report['hint'] = sourceBackoff.maxtvBlocked
+          ? "The panel is refusing this deployment's address. The account is not the question: " +
+            "nothing about the MAC or the portal path can change a refusal aimed at our network. " +
+            "The trace shows its own words, including the Server header it answered with."
+          : "The portal refused us. Compare identityInUse/identities with the app: an expired " +
+            "MAC answers in its own words, and the migrated identity is the live one.";
         return jsonResponse(200, report);
       }
 
       const pool = await getChannelsBySource(cfg, "maxtv", false).catch(() => []);
+      // `ok` is the question actually being asked: did channels come back?
+      report['ok'] = pool.length > 0;
       report['catalogue'] = {
         channels: pool.length,
         note:

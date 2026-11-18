@@ -170,6 +170,53 @@ describe("the maxTV tab", () => {
   });
 });
 
+describe("a maxTV portal that is refusing the site", () => {
+  /**
+   * The screenshot: "maxTV returned no channels yet. Retrying by itself — attempt 1. … HTTP 403".
+   *
+   * The portal had already said no to that address; the page answered by asking again every second,
+   * and the relays behind it swept eight addresses each time. A block is the one empty guide where
+   * an automatic retry is the harm, so the page states it and stops.
+   */
+  it("states the refusal and stops the automatic retries", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (target: string) => {
+        const url = String(target);
+        calls.push(url);
+        const body = url.includes("source=maxtv")
+          ? {
+              ok: true,
+              channels: [],
+              categories: [],
+              maxTvConfigured: true,
+              sourceBlocked: true,
+              sourceRetryAfterSeconds: 540,
+              sourceError:
+                "The maxTV server is refusing this deployment's address (HTTP 403: from Apache/2.4.18 (Ubuntu)).",
+            }
+          : payload;
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      }),
+    );
+
+    renderLive();
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(2));
+    fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
+
+    await waitFor(() => expect(screen.getByText(/maxTV is refusing this site's address/)).toBeTruthy());
+    // It says the account is not the question, and when it will try again.
+    expect(screen.getByText(/the account is not the question/)).toBeTruthy();
+    expect(screen.getByText(/paused for 9 more minutes/)).toBeTruthy();
+
+    const asked = calls.filter((u) => u.includes("source=maxtv")).length;
+    // Well past the first automatic retry (1s) and the second (2s): nothing more is sent.
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    expect(calls.filter((u) => u.includes("source=maxtv")).length).toBe(asked);
+  });
+});
+
 describe("a channel opened from a shared link", () => {
   it("plays the channel the link named, by number", async () => {
     renderLive("2524");

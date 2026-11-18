@@ -84,6 +84,16 @@ export function LivePlayerContent({
   const [listAge, setListAge] = useState<number | null>(null);
   /** Whether maxTV has a portal configured at all, or is simply absent from this deployment. */
   const [maxTvConfigured, setMaxTvConfigured] = useState(true);
+  /**
+   * The portal is refusing this deployment's address rather than the account.
+   *
+   * A different problem from every other empty guide, and the only one where retrying is the
+   * harm: each attempt is another handshake to a host that has already said no, which is how a
+   * short anti-flood block turns into a long one. So this state stops the retry loop instead of
+   * feeding it.
+   */
+  const [sourceBlocked, setSourceBlocked] = useState(false);
+  const [blockedForSeconds, setBlockedForSeconds] = useState<number | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -182,6 +192,8 @@ export function LivePlayerContent({
           sourceError?: string | null;
           sourceEndpoint?: string | null;
           maxTvConfigured?: boolean;
+          sourceBlocked?: boolean;
+          sourceRetryAfterSeconds?: number | null;
           stale?: boolean;
           listAgeSeconds?: number | null;
         };
@@ -195,6 +207,8 @@ export function LivePlayerContent({
         setStale(Boolean(data.stale));
         setListAge(data.listAgeSeconds ?? null);
         setMaxTvConfigured(Boolean(data.maxTvConfigured));
+        setSourceBlocked(Boolean(data.sourceBlocked));
+        setBlockedForSeconds(data.sourceRetryAfterSeconds ?? null);
         setSelectedCategory("");
         /*
          * Ask again while there is nothing to show. A manual refresh is the viewer taking the
@@ -213,6 +227,14 @@ export function LivePlayerContent({
             staleRefresh.current = true;
             setTimeout(() => void loadRef.current(true), 1500);
           }
+        } else if (data.sourceBlocked) {
+          /*
+           * Refused, not unreachable. Every automatic attempt is another handshake at a host that
+           * has already turned us away, so there are none: the card says when to try, and the
+           * Refresh button is there for someone who does not want to wait.
+           */
+          retryAttempt.current = 0;
+          cancelRetry();
         } else if (force) {
           retryAttempt.current = 0;
           scheduleRetry();
@@ -527,9 +549,11 @@ export function LivePlayerContent({
             <p className="font-bold text-accent">
               {source === "maxtv" && !maxTvConfigured
                 ? "maxTV is not configured."
-                : channels.length === 0 && (warming || retryAttempt.current > 0)
-                  ? `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels yet.`
-                  : `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels.`}
+                : channels.length === 0 && sourceBlocked
+                  ? "maxTV is refusing this site's address."
+                  : channels.length === 0 && (warming || retryAttempt.current > 0)
+                    ? `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels yet.`
+                    : `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels.`}
             </p>
             <p className="mt-0.5 text-muted-foreground">
               {source === "maxtv" && !maxTvConfigured ? (
@@ -538,6 +562,16 @@ export function LivePlayerContent({
                   <code>src/lib/maxtv-account.ts</code> — portal, MAC, serial, device id — or set{" "}
                   <code>MAXTV_PORTAL</code> and <code>MAXTV_MAC</code> in the environment. Then
                   press Refresh.
+                </>
+              ) : channels.length === 0 && sourceBlocked ? (
+                <>
+                  The panel answered every address with a refusal, and its own words are above. That
+                  is it turning away the network this site runs on — the account is not the question,
+                  and nothing here can change its mind by asking again.
+                  {blockedForSeconds && blockedForSeconds > 0
+                    ? ` Automatic attempts are paused for ${Math.ceil(blockedForSeconds / 60)} more minute${Math.ceil(blockedForSeconds / 60) === 1 ? "" : "s"}.`
+                    : ""}{" "}
+                  Press Refresh after that to try again.
                 </>
               ) : channels.length === 0 && (warming || retryAttempt.current > 0) ? (
                 `Retrying by itself — attempt ${Math.max(retryAttempt.current, 1)}. The relay is reading the ${
