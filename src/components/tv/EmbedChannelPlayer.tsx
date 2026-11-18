@@ -36,6 +36,8 @@ interface PublicChannel {
   sources?: string[];
   container?: string;
   drm?: PublicDrm;
+  /** Which catalogue this came from. The player behaves differently for each one. */
+  source?: string;
 }
 
 export function EmbedChannelPlayer({ rawId }: { rawId: string }) {
@@ -98,12 +100,30 @@ export function EmbedChannelPlayer({ rawId }: { rawId: string }) {
       }
     : null;
 
+  /*
+   * The channel's own source, not a hard-coded one.
+   *
+   * This said `"tgtv"` for everything, so an embedded maxTV channel was rendered as an AK TV one:
+   * the player asked the relay for the AK TV path, got nothing, and the embed sat on "connecting"
+   * for a channel that was fine. The source decides how the stream is fetched (`mag` identity,
+   * `create_link`, transport stream) and it now travels with the channel from the API.
+   */
+  const KNOWN_SOURCES: ReadonlyArray<StageChannel["source"]> = ["tgtv", "maxtv", "jio", "starshare"];
+  const declared = channel?.source as StageChannel["source"] | undefined;
+  const source: StageChannel["source"] =
+    declared && KNOWN_SOURCES.includes(declared)
+      ? declared
+      : // An older API answer without `source`: the id prefix still names it.
+        /^st:/i.test(channel?.id ?? rawId)
+        ? "maxtv"
+        : "tgtv";
+
   const stage: StageChannel | null = channel
     ? {
         id: channel.id,
         name: channel.name,
         number: channel.number ?? undefined,
-        source: "tgtv",
+        source,
         directUrl: directUrl ?? undefined,
         drm: drm && drm.keys.length ? drm : null,
         container: channel.container ?? "hls",

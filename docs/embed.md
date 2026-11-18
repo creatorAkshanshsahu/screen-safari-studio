@@ -12,14 +12,16 @@ Every channel has a **number** and a **name key**. Copying the address bar while
 channel gives you its own URL, and pasting it opens that channel and nothing else — the site no
 longer lands on a default source.
 
-There is one source: **AK TV**. maxTV and JioTV are gone; a request that names no source gets
-AK TV.
+Two sources, each with its own line-up: **AK TV** (the playlist) and **maxTV** (a portal account,
+when `MAXTV_PORTAL` and `MAXTV_MAC` are configured). A request that names no source gets AK TV, and
+the two are never mixed — a guide containing both is a guide where nobody can tell which entries
+are meant to work. `?source=maxtv` asks for the other one.
 
 ---
 
 Four things you can put on someone else's page, smallest effort first:
 
-- **the AK TV section** — player *and* channel list — **one `<iframe>`, no ids**
+- **a source's section** — player *and* channel list — **one `<iframe>`, no ids** (AK TV or maxTV)
 - **one channel**, by id — one `<iframe>`
 - **an in-page picker** for sites that allow scripts — one `<script>` line
 - **the raw M3U**, for VLC, Kodi or TiviMate
@@ -283,7 +285,8 @@ reading it on — there is no domain to edit.
 | One channel, full page | `/watch/143` · also `/live/143` |
 | One film / series episode | `/watch/<slug>` — a title is named by a slug, a channel by a number or a `tg:` key |
 | One channel, embeddable | `/embed/143` |
-| Player + channel list | `/embed/tgtv` |
+| Player + channel list — AK TV | `/embed/tgtv` |
+| Player + channel list — maxTV | `/embed/maxtv` |
 | Channel list JSON | `/api/public/channels?category=&q=&limit=` |
 | One channel JSON | `/api/public/channels/143` |
 

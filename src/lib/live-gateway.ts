@@ -892,6 +892,13 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
       category: genre && genre.trim() && genre !== "*" && genre.toLowerCase() !== "all" ? genre : "maxTV",
       logo: c.logo.startsWith("/") ? `${origin}${c.logo}` : c.logo,
       cmd: c.cmd,
+      /*
+       * A Stalker `create_link` points at a transport stream, never at a manifest. Saying so lets
+       * the player probe `.ts` and load the MPEG-TS engine first, instead of asking the relay for
+       * an `.m3u8`, being answered with a transport stream anyway, and switching engines after a
+       * wasted round trip.
+       */
+      mediaType: "mp4" as const,
     };
   });
 
@@ -4450,7 +4457,8 @@ function renderEmbedKitHtml(origin: string): string {
       <tr><th>What</th><th>Where</th></tr>
       <tr><td>One channel, full page</td><td><code>/watch/143</code> &middot; also <code>/live/143</code></td></tr>
       <tr><td>One channel, embeddable</td><td><code>/embed/143</code></td></tr>
-      <tr><td>Player and channel list</td><td><code>/embed/tgtv</code></td></tr>
+      <tr><td>Player and channel list &mdash; AK TV</td><td><code>/embed/tgtv</code></td></tr>
+      <tr><td>Player and channel list &mdash; maxTV</td><td><code>/embed/maxtv</code></td></tr>
       <tr><td>Channel JSON</td><td><code>/api/public/channels/143</code></td></tr>
     </table>
 
@@ -4889,9 +4897,20 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
     const single = path.startsWith("/api/public/channels/")
       ? decodeURIComponent(path.slice("/api/public/channels/".length)).replace(/\/+$/, "")
       : "";
-    const pool = akTvOnly(
-      single ? await loadCatalogueForId(cfg, single) : await getChannelsBySource(cfg, "tgtv", false),
-    );
+    /*
+     * AK TV is the default line-up, not a filter over everybody.
+     *
+     * `akTvOnly` used to wrap both branches, so `/api/public/channels/st:101` -- the request an
+     * embed of a maxTV channel makes -- dropped the maxTV channel it had just resolved and
+     * answered 404. A host site could not embed a maxTV channel at all, and nothing said why.
+     *
+     * The list still defaults to AK TV because that is what a viewer reads there; a single id
+     * names its own source, and `?source=maxtv` asks for the other one explicitly.
+     */
+    const wantedSource = (url.searchParams.get("source") || "tgtv").toLowerCase() === "maxtv" ? "maxtv" : "tgtv";
+    const pool = single
+      ? await loadCatalogueForId(cfg, single)
+      : await getChannelsBySource(cfg, wantedSource, false);
 
     // The identity in a URL is the number when there is one: it is what the site shows on screen,
     // and unlike a raw id it cannot name two channels.
@@ -4922,6 +4941,12 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
         : null;
       return jsonResponse(200, {
         id: publicId(ch),
+        /*
+         * The source travels with the channel. An embed renders the same player for both, and the
+         * player needs to know which one it is holding: maxTV is relayed with MAG identity, AK TV
+         * carries its own address, and a `st:` channel shown as `tgtv` asks for the wrong things.
+         */
+        source: ch.source,
         name: ch.name,
         category: displayCategoryName(ch.category),
         logo: ch.logo,
