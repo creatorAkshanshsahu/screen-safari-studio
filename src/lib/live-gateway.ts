@@ -191,7 +191,21 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
     starshareUser: readEnv(env, "STARSHARE_USER", "", request),
     starsharePass: readEnv(env, "STARSHARE_PASS", "", request),
     jioPlaylistUrl: readEnv(env, "JIO_PLAYLIST_URL", "https://allinonereborn2.online/jiotv-m3u/jtv39.m3u8", request),
-    tgtvPlaylistUrl: readEnv(env, "TGTV_PLAYLIST_URL", "https://livetgtv.lovable.app/api/public/playlist.m3u", request),
+    /*
+     * The playlist we read.
+     *
+     * `livetgtv.lovable.app/api/public/playlist.m3u` was this default and now answers **HTTP 500**
+     * — its site is up (it lists 1,230 channels from `/api/public/channels`) but the M3U endpoint
+     * itself is broken, which is indistinguishable from "the playlist is down" from in here. The
+     * default is a mirror of the same line-up whose entries resolve: a plain M3U whose channel URLs
+     * are `/stream?id=<slug>` redirectors that mint a fresh Jio token per request, with the
+     * ClearKeys inline.
+     *
+     * `TGTV_PLAYLIST_URL` overrides it, so pointing this back — or anywhere else — is a
+     * configuration change, not a code change. `/api/live/diagnose?playlist=1` reports which
+     * address is in use and what it answered.
+     */
+    tgtvPlaylistUrl: readEnv(env, "TGTV_PLAYLIST_URL", "https://hjh-545.pages.dev/", request),
     // Whether that address came from configuration or from our default. It decides which one to
     // change when the playlist will not load, and the diagnostic is where that is asked.
     tgtvPlaylistFromEnv: explicit("TGTV_PLAYLIST_URL"),
@@ -1092,6 +1106,14 @@ interface ParsedM3uEntry {
   referrer: string;
   /** `#EXTHTTP:{"cookie":"…"}` — a CDN token, only for the playlist host. */
   cookie: string;
+  /**
+   * `#KODIPROP:inputstream.adaptive.manifest_type=mpd` — what the entry actually is.
+   *
+   * The URL cannot say: a `/stream?id=colorshd` redirector has no extension at all, and guessing
+   * "DASH" from that happens to be right until a host numbers its channels in the query string
+   * (`?id=143.m3u8`), at which point the guess is wrong. When the playlist states it, believe it.
+   */
+  manifestType: string;
 }
 
 const JIO_ATTR_RE = /([A-Za-z0-9_-]+)="([^"]*)"/g;
@@ -1110,6 +1132,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
   let preUserAgent = "";
   let preCookie = "";
   let preReferrer = "";
+  let preManifestType = "";
 
   const attrValue = (line: string, key: string): string => {
     const m = line.match(new RegExp(`${key}="([^"]*)"`, "i"));
@@ -1122,6 +1145,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
     preUserAgent = "";
     preCookie = "";
     preReferrer = "";
+    preManifestType = "";
   };
 
   for (let i = 0; i < lines.length; i++) {
@@ -1148,6 +1172,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
           userAgent: preUserAgent,
           cookie: preCookie,
           referrer: preReferrer,
+          manifestType: preManifestType,
         },
       };
       resetPre();
@@ -1160,6 +1185,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
         if (!l.startsWith("#")) break;
         const type = l.match(/^#KODIPROP:inputstream\.adaptive\.license_type=(\S+)/i);
         const key = l.match(/^#KODIPROP:inputstream\.adaptive\.license_key=(\S+)/i);
+        const manifest = l.match(/^#KODIPROP:inputstream\.adaptive\.manifest_type=(\S+)/i);
         const ua = l.match(/^#EXTVLCOPT:http-user-agent=(\S+)/i);
         const cookie = l.match(/^#EXTHTTP:\{"cookie":"([^"]*)"\}/i);
         // VLC's spelling, then the three JSON spellings seen in the wild.
@@ -1168,6 +1194,7 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
           l.match(/^#EXTHTTP:\{[^}]*"(?:referer|referrer|http-referer)"\s*:\s*"([^"]*)"/i);
         if (type) pending!.licenseType = type[1]!;
         if (key) pending!.licenseKey = key[1]!;
+        if (manifest) pending!.manifestType = manifest[1]!;
         if (ua) pending!.userAgent = ua[1]!;
         if (cookie) pending!.cookie = cookie[1]!;
         if (ref) pending!.referrer = ref[1]!;
@@ -1179,10 +1206,12 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
     if (line.startsWith("#")) {
       const type = line.match(/^#KODIPROP:inputstream\.adaptive\.license_type=(\S+)/i);
       const key = line.match(/^#KODIPROP:inputstream\.adaptive\.license_key=(\S+)/i);
+      const manifest = line.match(/^#KODIPROP:inputstream\.adaptive\.manifest_type=(\S+)/i);
       const ua = line.match(/^#EXTVLCOPT:http-user-agent=(\S+)/i);
       const cookie = line.match(/^#EXTHTTP:\{"cookie":"([^"]*)"\}/i);
       if (type) preLicenseType = type[1]!;
       if (key) preLicenseKey = key[1]!;
+      if (manifest) preManifestType = manifest[1]!;
       if (ua) preUserAgent = ua[1]!;
       if (cookie) preCookie = cookie[1]!;
       continue;
@@ -1206,6 +1235,21 @@ function parseM3u(text: string, baseUrl: string): ParsedM3uEntry[] {
     resetPre();
   }
   return out;
+}
+
+/**
+ * What a playlist entry is: the declared manifest type first, the URL shape second.
+ *
+ * `#KODIPROP:…manifest_type=mpd` is the playlist telling us the answer. Without it, a
+ * `/stream?id=xxx` redirector has no extension to read and is assumed to be DASH, while a
+ * `/live/143` endpoint could just as easily be a transport stream.
+ */
+function m3uMediaType(entry: ParsedM3uEntry): "hls" | "mp4" | "dash" {
+  const declared = (entry.manifestType || "").toLowerCase();
+  if (declared === "mpd" || declared === "dash") return "dash";
+  if (declared === "hls" || declared === "m3u8") return "hls";
+  if (declared === "ts" || declared === "mpegts" || declared === "mp4") return "mp4";
+  return jioMediaType(entry.url);
 }
 
 /** "dash", "hls" or "mp4" from the media URL, never from the page. */
@@ -2875,12 +2919,13 @@ const tgtvCache: { items: LiveChannelItem[]; fetchedAt: number; error: string | 
 };
 
 /**
- * The TG playlist itself — `livetgtv.lovable.app/api/public/playlist.m3u`.
+ * The TG playlist itself — `cfg.tgtvPlaylistUrl` (see its comment for why the default moved).
  *
- * This is the TG tab's real source. Its entries are TG's own plain-HTTPS HLS, with no cookie
- * and no DRM, which is exactly the shape `toDto` turns into a `directUrl`: the viewer's browser
- * plays it untouched, with no proxy in the path and no token to reconstruct. Nothing about it
- * depends on the worker's egress address.
+ * This is the TG tab's real source. Its shape is not uniform: a reshare may list TG's own
+ * plain-HTTPS HLS, which `toDto` turns into a `directUrl` the viewer's browser plays untouched, or
+ * — as the current mirror does — `/stream?id=<slug>` redirectors that answer with a token-signed
+ * Jio DASH manifest plus inline ClearKeys. The address decides nothing; `m3uMediaType` and the
+ * parsed `#KODIPROP` lines do.
  */
 /**
  * What the last playlist read actually got back.
@@ -2993,13 +3038,20 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
   return entries.map((e, i) => ({
     id: `tg:${e.tvgId || i}`,
     rawId: e.tvgId || String(i),
+    /*
+     * The number a viewer dials. `tvg-chno` when the playlist numbers its channels, otherwise
+     * position -- the same channel keeps the same number as long as the order holds, which is what
+     * makes a number worth sharing. A numeric `tvg-id` is not used here on purpose: it is an alias
+     * (`findChannelByAnyId` matches `rawId`), and giving it the number slot renumbers the guide
+     * after every playlist edit.
+     */
     number: /^\d+$/.test(e.chno) ? Number(e.chno) : i + 1,
     source: "tgtv" as const,
     name: e.name,
     category: e.group || "AK TV",
     logo: e.logo,
     cmd: e.url,
-    mediaType: jioMediaType(e.url),
+    mediaType: m3uMediaType(e),
     ...(e.userAgent ? { userAgent: e.userAgent } : {}),
     ...(e.cookie ? { cookie: e.cookie } : {}),
     ...(e.referrer ? { referrer: e.referrer } : {}),

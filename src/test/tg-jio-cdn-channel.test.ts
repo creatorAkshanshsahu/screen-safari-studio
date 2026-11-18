@@ -39,7 +39,7 @@ async function open(id: string, ext = "mpd") {
   const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
   const res = await maybeHandleLiveRequest(
     new Request(`http://localhost/api/live/stream/${encodeURIComponent(id)}.${ext}?probe=1`),
-    {},
+    { TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u" },
   );
   return res!;
 }
@@ -122,7 +122,7 @@ describe("a TG channel that lives on the Jio CDN", () => {
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     const res = await maybeHandleLiveRequest(
       new Request("http://localhost/api/live/direct-config?id=tg%3A3436&name=Discovery%20Kids"),
-      {},
+      { TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u" },
     );
     const body = (await res!.json()) as {
       candidates: Array<{ label: string; url: string; clearKeys: Record<string, string> }>;

@@ -49,7 +49,7 @@ async function catalogue(
   const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
   const res = await maybeHandleLiveRequest(
     new Request(`https://screen-safari-studio.lovable.app/api/live/channels?source=${source}&filter=all&refresh=1`),
-    {},
+    { TGTV_PLAYLIST_URL: "https://livetgtv.lovable.app/api/public/playlist.m3u" },
   );
   return (await res!.json()) as Body;
 }
