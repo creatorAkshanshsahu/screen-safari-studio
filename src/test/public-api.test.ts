@@ -164,8 +164,10 @@ describe("the /embed documentation page", () => {
     expect(text).toContain("?colour=%23FF6600");
     expect(text).toContain("/api/public/channels/143");
     expect(text).toContain("/watch/143");
-    // One source only: advertising a player that does not exist is not documentation.
+    // Every source it documents is a source that exists. JioTV is still a code path with tests,
+    // but it is not a button a host site can press, so it is not advertised here.
     expect(text).not.toContain("JioTV");
-    expect(text).not.toContain("maxTV");
+    // maxTV is, now that it has its own tab and its own section page.
+    expect(text).toContain("/embed/maxtv");
   });
 });

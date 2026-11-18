@@ -94,6 +94,27 @@ describe("an embedded channel", () => {
     expect(prop("activeSource")).toBe("tgtv");
   });
 
+  it("tells the engine which source the channel came from", async () => {
+    /*
+     * The embed used to call every channel `tgtv`. A maxTV channel rendered through an embed was
+     * therefore fetched along the AK TV path, found nothing, and sat on "connecting" while the
+     * channel itself was fine. The source now comes from the API with the channel.
+     */
+    stubApi({
+      id: "st:101",
+      source: "maxtv",
+      name: "Arena Sports",
+      category: "Sports",
+      sources: ["/api/live/stream/st%3A101.ts"],
+      container: "mp4",
+    });
+    render(<EmbedChannelPlayer rawId="st%3A101" />);
+
+    await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
+    expect(prop("channelId")).toBe("st:101");
+    expect(prop("activeSource")).toBe("maxtv");
+  });
+
   it("resolves the channel before it starts the player", async () => {
     /*
      * This ordering is load-bearing, and getting it "faster" is what broke playback.
