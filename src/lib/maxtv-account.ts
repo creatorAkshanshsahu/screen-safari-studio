@@ -33,7 +33,7 @@
  *
  * ## What this subscription's panel actually answers
  *
- * `tv.fusion4k.cc` is a plain Stalker panel whose API is *one level up* from the web-client
+ * `tv.fusion4k.cc` (the second subscription) is a plain Stalker panel whose API is *one level up* from the web-client
  * address written on the seller's card:
  *
  *   `…/stalker_portal/server/load.php`  -> 200, issues a token
@@ -41,19 +41,56 @@
  *
  * Both are tried, in that order, so the card's address is still the right thing to paste here.
  *
- * ## The spare
+ * ## Two subscriptions, two tabs
  *
- * The account this build replaced (`new.maxtv.be`, `00:1A:79:EE:03:9F`) is kept in the gateway as
- * a second identity: a whole device, with its own serial and device id. It is only asked after the
- * account above has been refused outright, and it is asked with *its* values -- a MAC lent another
- * account's serial is a device the panel has never billed.
+ * Both of these are paid for and neither has expired, so both are worth watching: the original
+ * maxTV panel and the reseller panel. They are *different devices on different portals* -- not one
+ * account written twice -- so each keeps its own serial and device id, and each is its own tab in
+ * the guide. A MAC lent another account's serial is a device the panel has never billed.
+ *
+ * The first entry is the default: a request without `?account=` gets it, and the environment
+ * variables below override it. The others are reached by naming them (`?account=fusion4k`), which
+ * is what the second tab does.
  */
-export const MAXTV_ACCOUNT = {
-  portal: "http://tv.fusion4k.cc/stalker_portal/c/",
-  mac: "00:1A:79:F5:8F:95",
-  serial: "99EB2A8128098",
-  deviceId: "01F71B517FE629CE5FB7158273354EDF361793DC5BB6C481C4957C3356040ABA",
-} as const;
+export type MaxTvAccount = {
+  /** What `?account=` calls it. Stable: links and cached catalogues are keyed by it. */
+  id: string;
+  /** What the tab says. */
+  label: string;
+  portal: string;
+  mac: string;
+  serial: string;
+  deviceId: string;
+};
+
+export const MAXTV_ACCOUNTS: readonly MaxTvAccount[] = [
+  {
+    id: "maxtv",
+    label: "maxTV",
+    portal: "http://new.maxtv.be/stalker_portal/c/",
+    mac: "00:1A:79:EE:03:9F",
+    serial: "92180365D21FE",
+    deviceId: "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070",
+  },
+  {
+    id: "fusion4k",
+    label: "fusion4k",
+    portal: "http://tv.fusion4k.cc/stalker_portal/c/",
+    mac: "00:1A:79:F5:8F:95",
+    serial: "99EB2A8128098",
+    deviceId: "01F71B517FE629CE5FB7158273354EDF361793DC5BB6C481C4957C3356040ABA",
+  },
+] as const;
+
+/** The default subscription: the one the environment variables override, and the one with no name. */
+export const MAXTV_ACCOUNT = MAXTV_ACCOUNTS[0]!;
+
+/** The subscription `?account=` named, or null when it names nothing we know. */
+export function findMaxTvAccount(id: string | null | undefined): MaxTvAccount | null {
+  const wanted = String(id ?? "").trim().toLowerCase();
+  if (!wanted) return null;
+  return MAXTV_ACCOUNTS.find((a) => a.id.toLowerCase() === wanted) ?? null;
+}
 
 /** The environment variables that override {@link MAXTV_ACCOUNT}, in the order they matter. */
 export const MAXTV_ENV_VARS = ["MAXTV_PORTAL", "MAXTV_MAC", "MAXTV_SERIAL", "MAXTV_DEVICE_ID"] as const;

@@ -47,26 +47,28 @@ describe("Live route", () => {
     await waitFor(() => expect(screen.getAllByText(/2 Channels/).length).toBeGreaterThan(0));
   });
 
-  it("offers AK TV and maxTV as separate tabs, never one mixed list", async () => {
+  it("offers one tab per paid subscription, never one mixed list", async () => {
     renderLive();
-    await waitFor(() => expect(screen.getAllByText("AK TV").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("maxTV").length).toBeGreaterThan(0));
     /*
-     * Both sources exist and are chosen by the viewer, one at a time. A single "all" list is what
-     * filled this guide with Jio and maxTV channels and no way to tell which were meant to work --
-     * so there is no such tab, and the default is still AK TV.
+     * Both subscriptions are chosen by the viewer, one at a time. A single "all" list is what
+     * filled this guide with two sources' channels and no way to tell which were meant to work --
+     * so there is no such tab. AK TV is gone from the bar: it is not what this page is for.
      */
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["AK TV", "maxTV"]);
-    expect(screen.queryAllByText("JioTV")).toHaveLength(0);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["maxTV", "fusion4k"]);
+    expect(screen.queryAllByText("AK TV")).toHaveLength(0);
     expect(screen.queryAllByText("Both")).toHaveLength(0);
   });
 
-  it("asks only for the AK TV catalogue", async () => {
+  it("asks for the one subscription the tab names", async () => {
     const fetchMock = vi.mocked(fetch);
     renderLive();
     await waitFor(() => {
       const urls = fetchMock.mock.calls.map((c) => String(c[0]));
-      expect(urls.some((u) => u.includes("source=tgtv"))).toBe(true);
-      expect(urls.some((u) => u.includes("source=maxtv") || u.includes("source=jio"))).toBe(false);
+      expect(urls.some((u) => u.includes("account=maxtv"))).toBe(true);
+      // One account per request: a list carrying both panels is exactly what this page is not.
+      expect(urls.filter((u) => u.includes("/api/live/channels") && u.includes("account=")).every((u) => !/account=.*account=/.test(u))).toBe(true);
+      expect(urls.some((u) => u.includes("source=tgtv"))).toBe(false);
     });
   });
 
@@ -90,7 +92,7 @@ describe("Live route", () => {
 
   it("keeps branding inside the player's box, where it cannot cover the guide", async () => {
     renderLive();
-    await waitFor(() => expect(screen.getAllByText("AK TV").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("maxTV").length).toBeGreaterThan(0));
     const brand = screen.getAllByTitle("STREAMR home");
     expect(brand.length).toBeGreaterThan(0);
     // The mark sits over the picture's own corner -- and nowhere else on the page.
@@ -150,6 +152,6 @@ describe("Live route with an empty catalogue", () => {
     await waitFor(() => expect(screen.queryByText(/Connecting to maxTV portal/)).toBeNull());
     // Two places, on purpose: the channel's own line says "No channel", and the guide says why.
     expect(screen.getAllByText(/No channel/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/AK TV returned no channels/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/maxTV returned no channels/).length).toBeGreaterThan(0);
   });
 });

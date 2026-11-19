@@ -83,7 +83,7 @@ describe("opening the guide on a cold instance", () => {
 
     renderLive();
     // The first answer is empty, so the page says so honestly rather than claiming to connect.
-    await waitFor(() => expect(screen.getAllByText(/AK TV returned no channels yet/).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText(/maxTV returned no channels yet/).length).toBeGreaterThan(0));
 
     // No click, no refresh: the retry brings the guide in on its own.
     await waitFor(() => expect(screen.getByRole("button", { name: /Sports18 1 HD/ })).toBeTruthy(), {
@@ -123,28 +123,30 @@ describe("the maxTV tab", () => {
     ],
   };
 
-  it("asks the relay for maxTV only, and plays what comes back", async () => {
+  it("asks for the subscription the tab names, and plays what comes back", async () => {
     const calls: string[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (target: string) => {
         const url = String(target);
         calls.push(url);
-        const body = url.includes("source=maxtv") ? MAXTV : payload;
+        // Two panels, two catalogues: the ids are the same shape and mean different channels.
+        const body = url.includes("account=fusion4k") ? payload : MAXTV;
         return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
       }),
     );
 
     renderLive();
     await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
-    expect(ENGINE.props.at(-1)!["channelId"]).toBe("tg:pictures");
+    expect(ENGINE.props.at(-1)!["channelId"]).toBe("st:1001");
+    expect(calls.some((u) => u.includes("account=maxtv"))).toBe(true);
 
-    fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
+    fireEvent.click(screen.getByRole("tab", { name: "fusion4k" }));
 
-    await waitFor(() => expect(ENGINE.props.at(-1)!["channelId"]).toBe("st:1001"));
-    // The AK TV channel is not carried over: an id from one source means nothing in the other.
-    expect(calls.some((u) => u.includes("source=maxtv"))).toBe(true);
-    expect(screen.getByRole("tab", { name: "maxTV" }).getAttribute("aria-selected")).toBe("true");
+    await waitFor(() => expect(ENGINE.props.at(-1)!["channelId"]).toBe("tg:pictures"));
+    // The first subscription's channel is not carried over: the tab chooses the panel.
+    expect(calls.some((u) => u.includes("account=fusion4k"))).toBe(true);
+    expect(screen.getByRole("tab", { name: "fusion4k" }).getAttribute("aria-selected")).toBe("true");
   });
 
   it("says maxTV is unconfigured rather than retrying at nothing", async () => {
