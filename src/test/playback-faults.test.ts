@@ -19,6 +19,20 @@ describe("describeHlsFatal", () => {
     expect(f.message).toContain("portal link");
   });
 
+  it("reads a 504 as the host's own gateway timing out, not as a link that was refused", () => {
+    const f = describeHlsFatal(
+      { fatal: true, details: "manifestLoadError", response: { code: 504 } },
+      "maxtv",
+    );
+    expect(f.kind).toBe("manifest");
+    expect(f.status).toBe(504);
+    expect(f.message).toContain("HTTP 504");
+    expect(f.message).toContain("gateway timeout");
+    expect(f.message).toContain("not this link");
+    // The advice that cannot work for an origin timeout, and that was being shown anyway.
+    expect(f.message).not.toContain("fresh portal link");
+  });
+
   it("says a body that is not a playlist is not a playlist, rather than blaming a token", () => {
     const f = describeHlsFatal({ fatal: true, details: "manifestParsingError" }, "maxtv");
     expect(f.kind).toBe("manifest");

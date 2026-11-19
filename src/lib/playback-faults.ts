@@ -70,6 +70,29 @@ export function describeHlsFatal(data: unknown, sourceName?: string): PlaybackFa
   const kind = classifyHls(detail);
 
   if (kind === "manifest") {
+    if (status && status >= 500) {
+      /*
+       * 5xx is the opposite of a refusal. The host answered "I could not produce this", not "you
+       * may not have it" -- and a 504 is a gateway waiting on an upstream that did not reply, which
+       * is the provider's own chain. Saying "refused" sent the viewer to press Retry for a fresh
+       * token over and over; a timeout at the origin is not fixed by a new token, and a bare
+       * status number never said whose server it was.
+       */
+      const why =
+        status === 504
+          ? "a gateway timeout — the host's own upstream did not answer"
+          : status === 503
+            ? "service unavailable — the host is out of capacity or restarting"
+            : "the host failed to produce it";
+      return {
+        kind,
+        ...(detail ? { detail } : {}),
+        status,
+        message:
+          `The stream's playlist came back HTTP ${status} (${why}). ` +
+          "That is the provider's server, not this link and not your account: try again in a minute.",
+      };
+    }
     if (status) {
       return {
         kind,

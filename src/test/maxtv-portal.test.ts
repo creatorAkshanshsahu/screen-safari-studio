@@ -128,8 +128,11 @@ describe("maxTV Stalker portal", () => {
     const data = await loadChannels();
 
     expect(data.channels).toHaveLength(2);
-    // The nested guess is tried once, then left alone.
-    expect(http.calls.filter((c) => c.url.includes("/stalker_portal/c/server/load.php"))).toHaveLength(1);
+    // The one level up address is the API, so it is asked first -- and the client path, which is a
+    // 404 on every panel we have reached, is not asked at all.
+    const handshakes = http.calls.filter((c) => c.url.includes("action=handshake"));
+    expect(handshakes[0]!.url).toContain("/stalker_portal/server/load.php");
+    expect(http.calls.filter((c) => c.url.includes("/stalker_portal/c/server/load.php"))).toHaveLength(0);
   });
 
   it("turns a channel handle into a playable url", async () => {
