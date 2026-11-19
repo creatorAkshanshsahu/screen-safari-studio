@@ -131,19 +131,19 @@ describe("a playlist whose URLs are redirectors and whose keys are inline", () =
     expect(text).toContain("/api/live/dashseg/");
     expect(text).not.toContain("jiotvmblive.cdn.jio.com");
   });
-  it("reads the working host with no configuration at all, because the old one answers 500", async () => {
-    // The default used to be `livetgtv.lovable.app/api/public/playlist.m3u`. That endpoint still
-    // answers HTTP 500 while the site itself is healthy, so an unconfigured deployment got an empty
-    // guide and a channel list that looked like a source problem. The default is a working mirror
-    // of the same line-up now; a stale default is the difference between "no channels" and "plays".
+  it("reads the default playlist with no configuration at all", async () => {
+    // The default has moved twice: `livetgtv.lovable.app/...m3u` answered HTTP 500, then a mirror
+    // answered, and now the playlist is the one the seller actually supplies. A stale default is
+    // the difference between "no channels" and "plays", so the address the code ships is exercised
+    // here rather than assumed.
+    const { TATATV_PLAYLIST_URL } = await import("@/lib/maxtv-account");
     const seen: string[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (target: string) => {
         const url = String(target);
         seen.push(url);
-        if (url.includes("hjh-545.pages.dev/stream")) return new Response(null, { status: 404 });
-        if (url.includes("hjh-545.pages.dev")) return new Response(PLAYLIST, { status: 200 });
+        if (url.startsWith(TATATV_PLAYLIST_URL)) return new Response(PLAYLIST, { status: 200 });
         return new Response("", { status: 500 });
       }),
     );
@@ -152,6 +152,7 @@ describe("a playlist whose URLs are redirectors and whose keys are inline", () =
     expect(status).toBe(200);
     const body = JSON.parse(text) as { channels: Array<{ name: string }> };
     expect(body.channels.map((c) => c.name)).toEqual(["Colors HD", "Star Bharat"]);
+    expect(seen.some((u) => u.startsWith(TATATV_PLAYLIST_URL))).toBe(true);
     expect(seen.some((u) => u.includes("livetgtv.lovable.app"))).toBe(false);
   });
 });

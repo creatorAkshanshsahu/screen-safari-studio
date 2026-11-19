@@ -83,7 +83,7 @@ describe("opening the guide on a cold instance", () => {
 
     renderLive();
     // The first answer is empty, so the page says so honestly rather than claiming to connect.
-    await waitFor(() => expect(screen.getAllByText(/maxTV returned no channels yet/).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText(/fusion4k returned no channels yet/).length).toBeGreaterThan(0));
 
     // No click, no refresh: the retry brings the guide in on its own.
     await waitFor(() => expect(screen.getByRole("button", { name: /Sports18 1 HD/ })).toBeTruthy(), {
@@ -131,24 +131,23 @@ describe("the maxTV tab", () => {
         const url = String(target);
         calls.push(url);
         // Two panels, two catalogues: the ids are the same shape and mean different channels.
-        const body = url.includes("account=fusion4k") ? payload : MAXTV;
+        const body = url.includes("account=maxtv") ? payload : MAXTV;
         return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
       }),
     );
 
     renderLive();
     await waitFor(() => expect(screen.getByTestId("engine")).toBeTruthy());
+    // The guide opens on fusion4k, the subscription that answers.
     expect(ENGINE.props.at(-1)!["channelId"]).toBe("st:1001");
-    expect(calls.some((u) => u.includes("account=maxtv"))).toBe(true);
 
-    fireEvent.click(screen.getByRole("tab", { name: "fusion4k" }));
+    fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
 
     await waitFor(() => expect(ENGINE.props.at(-1)!["channelId"]).toBe("tg:pictures"));
-    // The first subscription's channel is not carried over: the tab chooses the panel.
-    expect(calls.some((u) => u.includes("account=fusion4k"))).toBe(true);
-    expect(screen.getByRole("tab", { name: "fusion4k" }).getAttribute("aria-selected")).toBe("true");
+    // The first tab's channel is not carried over: the tab chooses the panel.
+    expect(calls.some((u) => u.includes("account=maxtv"))).toBe(true);
+    expect(screen.getByRole("tab", { name: "maxTV" }).getAttribute("aria-selected")).toBe("true");
   });
-
   it("says maxTV is unconfigured rather than retrying at nothing", async () => {
     vi.stubGlobal(
       "fetch",
@@ -162,10 +161,10 @@ describe("the maxTV tab", () => {
     );
 
     renderLive();
-    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(2));
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(3));
     fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
 
-    await waitFor(() => expect(screen.getByText(/maxTV is not configured/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/is not configured/)).toBeTruthy());
     // A deployment with no portal is not a failure to retry; it is a fact to state, with the two
     // variables that fix it.
     expect(screen.getByText(/MAXTV_PORTAL/)).toBeTruthy();
@@ -204,7 +203,7 @@ describe("a maxTV portal that is refusing the site", () => {
     );
 
     renderLive();
-    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(2));
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(3));
     fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
 
     await waitFor(() => expect(screen.getByText(/maxTV is refusing this site's address/)).toBeTruthy());

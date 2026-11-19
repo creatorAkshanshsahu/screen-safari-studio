@@ -5,7 +5,7 @@
  * (zero `node:*` imports) so `vite build` with Lovable's Nitro Cloudflare target succeeds cleanly.
  */
 
-import { MAXTV_ACCOUNT, MAXTV_ACCOUNTS, MAXTV_ENV_VARS, findMaxTvAccount } from "./maxtv-account";
+import { MAXTV_ACCOUNT, MAXTV_ACCOUNTS, MAXTV_ENV_VARS, TATATV_PLAYLIST_URL, findMaxTvAccount } from "./maxtv-account";
 
 export interface LiveChannelItem {
   /**
@@ -278,7 +278,7 @@ function commonConfig(
      * configuration change, not a code change. `/api/live/diagnose?playlist=1` reports which
      * address is in use and what it answered.
      */
-    tgtvPlaylistUrl: readEnv(env, "TGTV_PLAYLIST_URL", "https://hjh-545.pages.dev/", request),
+    tgtvPlaylistUrl: readEnv(env, "TGTV_PLAYLIST_URL", TATATV_PLAYLIST_URL, request),
     // Whether that address came from configuration or from our default. It decides which one to
     // change when the playlist will not load, and the diagnostic is where that is asked.
     tgtvPlaylistFromEnv: explicit("TGTV_PLAYLIST_URL"),

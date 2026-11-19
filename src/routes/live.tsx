@@ -23,27 +23,49 @@ export const Route = createFileRoute("/live")({
 /**
  * Two sources, each answering for itself.
  *
- * One tab per paid maxTV subscription. They are never merged: a single list containing both is how
- * the guide once filled with channels from two sources and no sign of which were supposed to work.
- * A tab each, and the tab says why it is empty when it is.
+ * One tab per thing that can list channels. They are never merged: a single list containing
+ * several is how the guide once filled with channels from two sources and no sign of which were
+ * supposed to work. A tab each, and the tab says why it is empty when it is.
  */
-type LiveSource = "maxtv" | "fusion4k";
+type LiveSource = "fusion4k" | "maxtv" | "tatatv";
+
 /**
  * A tab per subscription.
  *
- * Both panels are paid for, so both are one click away. They are separate tabs and separate
- * catalogues because `st:901` is a different channel on each -- which is also why the tab's name
- * travels to the relay as `?account=`.
+ * The two panels are Stalker portals, so their tabs carry `?account=` -- `st:901` is a different
+ * channel on each. `tatatv` is a plain M3U: it has no device and no token, which is why it keeps
+ * playing when a panel decides it does not like this deployment. That difference is the reason it
+ * is a tab of its own rather than a fallback behind the others.
  */
-const SOURCES: Array<{ id: LiveSource; label: string }> = [
-  { id: "maxtv", label: "maxTV" },
-  { id: "fusion4k", label: "fusion4k" },
+const SOURCES: Array<{ id: LiveSource; label: string; query: string }> = [
+  { id: "fusion4k", label: "fusion4k", query: "source=maxtv&account=fusion4k" },
+  { id: "maxtv", label: "maxTV", query: "source=maxtv&account=maxtv" },
+  { id: "tatatv", label: "tatatv", query: "source=tgtv" },
 ];
 
-const sourceLabel = (id: LiveSource): string => SOURCES.find((s) => s.id === id)?.label ?? "maxTV";
+const sourceLabel = (id: LiveSource): string => SOURCES.find((s) => s.id === id)?.label ?? "fusion4k";
 
 /** The question this tab asks the relay. The account is the subscription, the source is its kind. */
-const catalogueQuery = (id: LiveSource): string => `source=maxtv&account=${encodeURIComponent(id)}`;
+const catalogueQuery = (id: LiveSource): string =>
+  SOURCES.find((s) => s.id === id)?.query ?? "source=maxtv&account=fusion4k";
+
+/**
+ * The tab the viewer was last on, so a reload does not silently move them somewhere else.
+ *
+ * The first visit opens on the subscription that answers, not on one a panel may have stopped
+ * billing: an empty guide on arrival is the impression that is hardest to undo.
+ */
+const TAB_STORE = "streamr.live.tab";
+
+function readStoredTab(): LiveSource | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const stored = window.localStorage.getItem(TAB_STORE);
+    return SOURCES.some((s) => s.id === stored) ? (stored as LiveSource) : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * The last catalogue this browser saw, kept so a reload does not start from nothing.
@@ -99,7 +121,9 @@ export function LivePlayerContent({
   initialSource,
 }: { initialChannelId?: string; initialSource?: string } = {}) {
   const [source, setSource] = useState<LiveSource>(() =>
-    SOURCES.some((s) => s.id === initialSource) ? (initialSource as LiveSource) : "maxtv",
+    SOURCES.some((s) => s.id === initialSource)
+      ? (initialSource as LiveSource)
+      : (readStoredTab() ?? "fusion4k"),
   );
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("all");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
@@ -182,6 +206,11 @@ export function LivePlayerContent({
     setWarming(false);
     setStale(false);
     setSource(next);
+    try {
+      window.localStorage.setItem(TAB_STORE, next);
+    } catch {
+      // A refused store is not a reason to refuse the tab.
+    }
     if (typeof window !== "undefined" && window.location.pathname.startsWith("/live")) {
       const params = new URLSearchParams(window.location.search);
       params.set("account", next);
@@ -658,7 +687,7 @@ export function LivePlayerContent({
                 : channels.length > 0
                   ? `${sourceLabel(source)} could not be refreshed — showing the list you already had.`
                   : channels.length === 0 && sourceBlocked
-                  ? "maxTV is refusing this site's address."
+                  ? `${sourceLabel(source)} is refusing this site's address.`
                   : channels.length === 0 && (warming || retryAttempt.current > 0)
                     ? `${sourceLabel(source)} returned no channels yet.`
                     : `${sourceLabel(source)} returned no channels.`}
