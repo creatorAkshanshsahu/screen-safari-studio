@@ -413,6 +413,24 @@ function stalkerJs(body: string): Record<string, unknown> | null {
   return js && typeof js === "object" && !Array.isArray(js) ? (js as Record<string, unknown>) : root;
 }
 
+/**
+ * The panel's words when it answers with a bare string instead of an envelope.
+ *
+ * `{"js":"Authorization failed"}` is a real answer, and the sentence is the whole of it. Reading
+ * only `js.error`/`js.msg` found nothing here, so the refusal arrived as raw JSON -- or, worse, as
+ * "the portal gave no reason" while the reason was in the body.
+ */
+function stalkerPlainWords(body: string): string | null {
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return null;
+  const js = root["js"];
+  if (typeof js !== "string") return null;
+  const words = js.trim().slice(0, 200);
+  // A string answer that is an address or a token is not a refusal.
+  if (!words || /^(?:https?|rtsp):\/\//i.test(words) || /^[A-Za-z0-9+/=_-]{24,}$/.test(words)) return null;
+  return words;
+}
+
 /** The session token a handshake issues. */
 function stalkerToken(body: string): string | null {
   const js = stalkerJs(body);
@@ -1061,13 +1079,15 @@ const CREATE_LINK_PARAMS = (cmd: string): Record<string, string> => ({
   force_ch_link_check: "0",
 });
 
-type LinkAnswer = { url: string | null; said: string | null; raw: string };
+type LinkAnswer = { url: string | null; said: string | null; words: string; raw: string };
 
 function readLinkAnswer(cfg: GatewayConfig, cmd: string, body: string): LinkAnswer {
   const raw = extractStalkerStreamUrl(stalkerLink(body) ?? "") || extractStalkerStreamUrl(cmd);
   return {
     url: raw ? rewriteStalkerLoopback(raw, stalkerAccount(cfg).portal) : null,
     said: stalkerError(body),
+    // The sentence, when the panel wrote one, so an error reads as English rather than as JSON.
+    words: stalkerError(body) ?? stalkerPlainWords(body) ?? portalSaid(body),
     // The portal's own words, or the first of its body. Without this a silent refusal is
     // reported as "gave no reason" while the reason sits in the response we already have.
     raw: portalSaid(body),
@@ -1080,24 +1100,54 @@ async function createLinkOnce(cfg: GatewayConfig, cmd: string): Promise<LinkAnsw
 }
 
 /**
- * `create_link` with the session token in the cookie as well as the header.
+ * Where a panel may expect the session token, for `create_link` only.
  *
- * Panels built on the older middleware read the token from `Cookie: …; token=…` and answer an
- * empty `js` when they only find a bearer header. One extra request is a small price for the
- * channels this unlocks, and it only runs after the ordinary call has failed.
+ * Every one of these is a real panel. The reference MAG client sends `Authorization: Bearer`, and
+ * that is the first thing tried; but middleware built before the header existed reads the token out
+ * of the cookie, and a custom panel may reject a bearer it did not ask for with exactly the words
+ * this deployment got back — "Authorization failed", with the token perfectly valid.
+ *
+ * Trying them costs one request each, and only after the ordinary call has already failed, so a
+ * healthy panel never sees any of this.
  */
-async function createLinkWithTokenCookie(cfg: GatewayConfig, cmd: string): Promise<LinkAnswer | null> {
+type LinkShape = {
+  /** How the answer is labelled in the trace and in the error, so a refusal names its own cause. */
+  label: string;
+  auth: boolean;
+  tokenInCookie?: boolean;
+  tokenInQuery?: boolean;
+};
+
+/**
+ * The shape that last produced a link.
+ *
+ * A panel that refuses the standard one refuses it for every channel, so the second channel should
+ * not spend a refused request learning what the first one already proved.
+ */
+let preferredLinkShape: LinkShape | null = null;
+
+const LINK_SHAPES: LinkShape[] = [
+  { label: "token in a cookie", auth: true, tokenInCookie: true },
+  { label: "no Authorization header", auth: false },
+  { label: "token in the query", auth: false, tokenInQuery: true },
+  { label: "token in the query and a bearer header", auth: true, tokenInQuery: true },
+];
+
+async function createLinkShape(cfg: GatewayConfig, cmd: string, shape: LinkShape): Promise<LinkAnswer | null> {
   const base = stalkerSession.endpoint;
-  if (!base || !stalkerSession.token) return null;
+  const token = stalkerSession.token;
+  if (!base || !token) return null;
   const account = stalkerAccount(cfg);
-  const headers = stalkerHeaders(cfg, account, true);
-  headers["Cookie"] = `${headers["Cookie"]}; token=${stalkerSession.token}`;
-  const target = buildStalkerUrl(base, "itv", "create_link", CREATE_LINK_PARAMS(cmd));
+  const headers = stalkerHeaders(cfg, account, shape.auth);
+  if (shape.tokenInCookie) headers["Cookie"] = `${headers["Cookie"]}; token=${token}`;
+  const params = CREATE_LINK_PARAMS(cmd);
+  if (shape.tokenInQuery) params["token"] = token;
+  const target = buildStalkerUrl(base, "itv", "create_link", params);
   try {
     const body = await fetchTextTimeout(target, headers, 7000);
     recordPortal({
       at: Date.now(),
-      action: "create_link (token in cookie)",
+      action: `create_link (${shape.label})`,
       address: portalAddress(base),
       status: 200,
       said: portalSaid(body),
@@ -1106,7 +1156,7 @@ async function createLinkWithTokenCookie(cfg: GatewayConfig, cmd: string): Promi
   } catch (e) {
     recordPortal({
       at: Date.now(),
-      action: "create_link (token in cookie)",
+      action: `create_link (${shape.label})`,
       address: portalAddress(base),
       status: e instanceof StalkerError && e.status !== null ? e.status : 0,
       said: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
@@ -1115,45 +1165,116 @@ async function createLinkWithTokenCookie(cfg: GatewayConfig, cmd: string): Promi
   }
 }
 
-/** The playable URL for one channel handle. */
+/**
+ * The playable URL for one channel handle, asked in every shape a panel might recognise.
+ *
+ * "Authorization failed" with a token that is perfectly good is not a credential problem, it is a
+ * guess about where the panel looks for the token — and the guess was hard-coded. Each attempt is
+ * recorded, so the answer to "why will this channel not play" is the portal's own words per shape
+ * rather than one sentence that covers both a refused session and a wrong header.
+ */
 async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string> {
-  const first = await createLinkOnce(cfg, cmd);
-  if (first.url) return first.url;
+  const attempts: Array<{ label: string; words: string; said: string | null }> = [];
 
-  // A portal that answers `create_link` with an empty `js` and no error text has, in practice,
-  // dropped the session between the catalogue call and this one. `isStalkerExpired` cannot see
-  // it: the portal sends no refusal to match on, so the silent empty answer is the whole
-  // message. Handshake once and ask again — a play token is only burned once it exists, so
-  // repeating a call that produced no link costs nothing.
+  const run = async (label: string, ask: () => Promise<LinkAnswer | null>): Promise<string | null> => {
+    const answer = await ask();
+    if (!answer) return null;
+    attempts.push({ label, words: answer.words || answer.raw || "(empty body)", said: answer.said });
+    return answer.url;
+  };
+
+  // 0. Whatever worked last time, if this panel has already shown its preference.
+  const preferred = preferredLinkShape;
+  if (preferred) {
+    const known = await run(preferred.label, () => createLinkShape(cfg, cmd, preferred));
+    if (known) return known;
+  }
+
+  // 1. What a MAG sends: the bearer token from the handshake.
+  const first = await run("bearer token", () => createLinkOnce(cfg, cmd));
+  if (first) return first;
+
+  // A portal that answers with an empty `js` has, in practice, dropped the session between the
+  // catalogue call and this one: `isStalkerExpired` cannot see it, because there is no refusal to
+  // match. A new session is also the commonest cure for an expired token, and an expired token
+  // is the commonest cause of "Authorization failed".
+  const held = {
+    token: stalkerSession.token,
+    endpoint: stalkerSession.endpoint,
+    account: stalkerSession.account,
+    profiled: stalkerSession.profiled,
+    profileAttempts: stalkerSession.profileAttempts,
+  };
   stalkerSession.token = null;
   stalkerSession.endpoint = null;
   stalkerSession.profiled = false;
   stalkerSession.profileAttempts = 0;
   stalkerSession.account = null;
-  await stalkerHandshake(cfg);
-  const retried = await createLinkOnce(cfg, cmd);
-  if (retried.url) return retried.url;
+  try {
+    await stalkerHandshake(cfg);
+  } catch {
+    /*
+     * Panels that mint one token per session answer a second handshake with an empty `js` — this
+     * one does, and it is how the maxTV diagnostic came to report "the portal issued no token"
+     * about a portal that had just answered. That is a refusal to mint a *second* token, not a
+     * portal that has gone away, so the session we already had goes back and the remaining shapes
+     * get their turn. Without this, one failed refresh ended the whole ladder with "no portal at
+     * this address", which is the wrong sentence for a token problem.
+     */
+    stalkerSession.token = held.token;
+    stalkerSession.endpoint = held.endpoint;
+    stalkerSession.account = held.account;
+    stalkerSession.profiled = held.profiled;
+    stalkerSession.profileAttempts = held.profileAttempts;
+    if (!sourceBackoff.maxtvBlocked) {
+      sourceBackoff.maxtvUntil = 0;
+      sourceBackoff.maxtvReason = null;
+    }
+  }
+  const fresh = await run("a new session", () => createLinkOnce(cfg, cmd));
+  if (fresh) return fresh;
 
-  // Older middleware wants the token in the cookie; it answers an empty `js` otherwise.
-  const cookieToken = await createLinkWithTokenCookie(cfg, cmd);
-  if (cookieToken?.url) return cookieToken.url;
+  // 2. Where else the panel may be looking for that token.
+  for (const shape of LINK_SHAPES) {
+    const url = await run(shape.label, () => createLinkShape(cfg, cmd, shape));
+    if (url) {
+      preferredLinkShape = shape;
+      return url;
+    }
+    // A refusal of the whole network is not a question of shape: stop before adding to it.
+    if (sourceBackoff.maxtvBlocked) break;
+  }
 
-  // Report what actually happened rather than a sentence that reads like a network fault. A
-  // silent portal, a refusal that names a reason, and a device the portal never profiled are
-  // three different problems, and they used to arrive as the same four words.
-  const blamed = retried.said ?? cookieToken?.said ?? first.said;
-  if (blamed) throw new StalkerError(null, blamed);
+  /*
+   * A panel that names a reason has answered the question. "Channel is not available in your
+   * subscription" is complete on its own, and burying it under a list of shapes would be the same
+   * mistake in the other direction.
+   */
+  const named = attempts.find((a) => a.said)?.said;
+  if (named) throw new StalkerError(null, named);
 
-  const answered = [retried.raw, cookieToken?.raw, first.raw].find(
-    (r) => r && r !== "(empty body)",
-  );
+  /*
+   * Otherwise, report what actually happened rather than a sentence that reads like a network
+   * fault. Each shape's answer is quoted once, in the order it was tried, so "Authorization failed"
+   * arrives with the information that a bearer header, a cookie and a query token all got the same
+   * words -- which is a statement about the account, not about headers.
+   */
+  const quoted: Array<{ words: string; labels: string[] }> = [];
+  for (const attempt of attempts) {
+    const known = quoted.find((q) => q.words === attempt.words);
+    if (known) known.labels.push(attempt.label);
+    else quoted.push({ words: attempt.words, labels: [attempt.label] });
+  }
+  const told = quoted
+    .map((q) => `${q.words} (to ${q.labels.join(", ")})`)
+    .join("; ");
   const profileNote = stalkerSession.profiled
     ? ""
     : ` The device was never profiled either (${stalkerSession.profileError ?? "get_profile did not complete"}), which is what a portal does before refusing links.`;
   throw new StalkerError(
     null,
     `The portal accepted the request but returned no stream address for this channel.` +
-      (answered ? ` It answered: ${answered}` : " Its answer was empty.") +
+      (quoted.length ? ` It answered: ${told}.` : " Its answer was empty.") +
       profileNote +
       " Full exchange: /api/live/diagnose?source=maxtv",
   );
@@ -5741,6 +5862,24 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
       // status is the only thing that tells them apart from the browser console.
       if (pool.length === 0) {
         const source = /^(jio|tg|st|xt):/i.exec(rawId)?.[1]?.toLowerCase() ?? "live";
+        /*
+         * "The catalogue did not load in time" is one sentence for two situations: a read that is
+         * still running, and a read that failed and said why. It sent someone after a rate limit
+         * and a blocked address alike with "Press Retry", when the panel had already answered in
+         * words. Where the source has left an answer, that answer is the message.
+         */
+        const reason =
+          source === "st" || source === "xt"
+            ? sourceBackoff.maxtvReason
+            : source === "tg"
+              ? tgtvCache.error
+              : null;
+        if (reason) {
+          return probeAnswer(isProbe, 504, {
+            ok: false,
+            error: `The ${source} catalogue is not available: ${reason}`,
+          });
+        }
         return probeAnswer(isProbe, 504, {
           ok: false,
           error: `The ${source} catalogue did not load in time, so this channel could not be resolved. Press Retry — the catalogue keeps loading in the background.`,
