@@ -594,6 +594,49 @@ async function refusalWords(res: Response): Promise<string> {
  * Remember a source that recently failed outright, so the catalogue does not spend
  * eight 20-second timeouts on every page load while the host is unreachable.
  */
+/**
+ * Where this panel expects the session token.
+ *
+ * A Stalker panel is entitled to read the token from the bearer header (what a MAG box sends), from
+ * a `token` cookie (the older middleware), from a query parameter, or not at all -- and one of them
+ * may reject a header it never asked for with "Authorization failed", or answer an *empty channel
+ * list* rather than an error.
+ *
+ * That last shape is why this is panel-wide and not a `create_link` detail: the refusal lands on
+ * `get_all_channels` first, and an empty list is indistinguishable from "The portal lists no
+ * channels" unless the app goes looking. Once a shape is known to work, it is used for every call.
+ */
+type StalkerAuthMode = "bearer" | "cookie" | "query" | "none";
+const stalkerAuth: { mode: StalkerAuthMode; override: StalkerAuthMode | null } = {
+  mode: "bearer",
+  override: null,
+};
+
+/** The shapes to try, in order, when the standard one does not work. */
+const AUTH_MODES: Array<{ mode: StalkerAuthMode; label: string }> = [
+  { mode: "cookie", label: "token in a cookie" },
+  { mode: "none", label: "no Authorization header" },
+  { mode: "query", label: "token in the query" },
+];
+
+const authMode = (): StalkerAuthMode => stalkerAuth.override ?? stalkerAuth.mode;
+
+/** How the token is being presented, in the words the page and the diagnose report use. */
+function authModeLabel(mode: StalkerAuthMode = authMode()): string {
+  return mode === "bearer" ? "a bearer Authorization header" : (AUTH_MODES.find((m) => m.mode === mode)?.label ?? mode);
+}
+
+/** Run one portal call as if this were the panel's preferred shape, and put the shape back. */
+async function withAuthMode<T>(mode: StalkerAuthMode, run: () => Promise<T>): Promise<T> {
+  const previous = stalkerAuth.override;
+  stalkerAuth.override = mode;
+  try {
+    return await run();
+  } finally {
+    stalkerAuth.override = previous;
+  }
+}
+
 const sourceBackoff: { maxtvUntil: number; maxtvReason: string | null; maxtvBlocked: boolean } = {
   maxtvUntil: 0,
   maxtvReason: null,
@@ -696,7 +739,12 @@ function stalkerHeaders(_cfg: GatewayConfig, account: StalkerAccount, auth: bool
     // The web-client path of the active account, matching Android StalkerPortal.kt.
     Referer: `${account.portal.replace(/\/+$/, "")}/`,
   };
-  if (auth && stalkerSession.token) h["Authorization"] = `Bearer ${stalkerSession.token}`;
+  if (auth && stalkerSession.token) {
+    const mode = authMode();
+    if (mode === "bearer") h["Authorization"] = `Bearer ${stalkerSession.token}`;
+    else if (mode === "cookie") h["Cookie"] = `${h["Cookie"]}; token=${stalkerSession.token}`;
+    // "query" is added to the URL by `stalkerRaw`; "none" sends the identity and nothing else.
+  }
   return h;
 }
 
@@ -720,7 +768,13 @@ async function stalkerRaw(
 ): Promise<string> {
   // 8 candidates x 20s was up to ~160s of blank page when the host is a black hole.
   // A reachable portal answers a handshake well inside this.
-  const target = buildStalkerUrl(base, type, action, params);
+  // A panel that reads the token as a query parameter gets it there, so that every call -- not
+  // only `create_link` -- is answered the same way it answers a MAG.
+  const shaped =
+    auth && stalkerSession.token && authMode() === "query"
+      ? { ...params, token: stalkerSession.token }
+      : params;
+  const target = buildStalkerUrl(base, type, action, shaped);
   try {
     const body = await fetchTextTimeout(target, stalkerHeaders(cfg, account, auth), 7000);
     recordPortal({ at: Date.now(), action, address: portalAddress(base), status: 200, said: portalSaid(body) });
@@ -970,10 +1024,58 @@ async function fetchMaxtvCatalogueForIdentity(
   return fetchMaxtvCatalogueOnce(cfg);
 }
 
+/**
+ * One line for a channel list that came back empty.
+ *
+ * `{"js":{"data":[],"total_items":0}}` is "the portal has none"; `{"js":[]}` and `{"js":{}}` are
+ * shapes a panel uses when it is not answering the question; anything with words in it is a
+ * refusal that the app was printing as "no channels".
+ */
+function channelListAnswer(body: string): string {
+  const spoken = stalkerError(body) ?? stalkerPlainWords(body);
+  if (spoken) return spoken;
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return portalSaid(body);
+  const js = root["js"] as Record<string, unknown> | undefined;
+  if (!js || Array.isArray(js)) return "an empty list";
+  const total = js["total_items"];
+  if (Array.isArray(js["data"])) {
+    return typeof total === "number" ? `an empty list (total_items ${total})` : "an empty list";
+  }
+  return portalSaid(body);
+}
+
 async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
-  const channelsBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
+  let channelsBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
   const account = stalkerAccount(cfg);
   let listed = stalkerChannels(channelsBody);
+  /** What each shape answered when the list came back empty. */
+  const answers: string[] = [];
+
+  if (listed.length === 0) {
+    answers.push(`as a MAG — ${channelListAnswer(channelsBody)}`);
+    /*
+     * An empty list is the quietest refusal a panel makes, and it is not obviously a refusal at
+     * all: `{"js":{"data":[],"total_items":0}}` is exactly what a portal with no channels sends,
+     * and exactly what a panel that will not accept the bearer header sends too. So the shape is
+     * the thing to vary first -- before the paged fallback, which will be refused the same way.
+     */
+    for (const shape of AUTH_MODES) {
+      if (shape.mode === stalkerAuth.mode) continue;
+      const body = await withAuthMode(shape.mode, () =>
+        stalkerRequest(cfg, "itv", "get_all_channels", {}),
+      ).catch(() => null);
+      const got = body ? stalkerChannels(body) : [];
+      if (got.length > 0) {
+        // This panel reads the token somewhere else. It is the panel's habit, not this call's.
+        stalkerAuth.mode = shape.mode;
+        channelsBody = body!;
+        listed = got;
+        break;
+      }
+      answers.push(`${shape.label} — ${body ? channelListAnswer(body) : "no answer"}`);
+    }
+  }
 
   if (listed.length === 0) {
     const spoken = stalkerError(channelsBody);
@@ -982,7 +1084,18 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
     else if (spoken) throw new StalkerError(null, spoken);
   }
   if (listed.length === 0) {
-    throw new StalkerError(null, stalkerError(channelsBody) ?? "The portal lists no channels");
+    /*
+     * "The portal lists no channels" is true and useless: it is the same sentence whether the
+     * account has none, the panel refused the shape, or the answer was a refusal dressed as an
+     * empty list. The answers it gave to each shape are the difference.
+     */
+    const detail = answers.length
+      ? ` The answer did not depend on where the token went: ${answers.join("; ")}.`
+      : "";
+    throw new StalkerError(
+      null,
+      `${stalkerError(channelsBody) ?? "The portal lists no channels."}${detail}`,
+    );
   }
 
   // Genres are best effort: a portal may refuse them without refusing the channels.
@@ -1020,11 +1133,22 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
 async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
   const candidates = stalkerAccountCandidates(cfg);
   let lastErr: unknown = null;
+  /**
+   * What the panel that actually answered said.
+   *
+   * The identities are tried in turn, and the last one is often a published spare that this
+   * network cannot reach at all. Reporting that one's silence would replace a sentence the panel
+   * gave us -- "an empty list (total_items 0)" for every shape it was offered -- with "no portal at
+   * this address", which is a different claim and a false one.
+   */
+  let spokenErr: Error | null = null;
   for (let i = 0; i < candidates.length; i++) {
     try {
       return await fetchMaxtvCatalogueForIdentity(cfg, i === 0 ? undefined : candidates[i]);
     } catch (e) {
       lastErr = e;
+      if (e instanceof StalkerError && !e.detail.startsWith("no portal at this address")) spokenErr ??= e;
+      else if (e instanceof Error && !/no portal at this address/i.test(e.message)) spokenErr ??= e;
       stalkerSession.endpoint = null;
       stalkerSession.token = null;
       stalkerSession.profiled = false;
@@ -1040,7 +1164,7 @@ async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: Live
       }
     }
   }
-  throw lastErr instanceof Error ? lastErr : new StalkerError(null, "The portal lists no channels");
+  throw spokenErr ?? (lastErr instanceof Error ? lastErr : new StalkerError(null, "The portal lists no channels"));
 }
 
 /**
@@ -1099,79 +1223,25 @@ async function createLinkOnce(cfg: GatewayConfig, cmd: string): Promise<LinkAnsw
   return readLinkAnswer(cfg, cmd, body);
 }
 
-/**
- * Where a panel may expect the session token, for `create_link` only.
- *
- * Every one of these is a real panel. The reference MAG client sends `Authorization: Bearer`, and
- * that is the first thing tried; but middleware built before the header existed reads the token out
- * of the cookie, and a custom panel may reject a bearer it did not ask for with exactly the words
- * this deployment got back — "Authorization failed", with the token perfectly valid.
- *
- * Trying them costs one request each, and only after the ordinary call has already failed, so a
- * healthy panel never sees any of this.
- */
-type LinkShape = {
-  /** How the answer is labelled in the trace and in the error, so a refusal names its own cause. */
-  label: string;
-  auth: boolean;
-  tokenInCookie?: boolean;
-  tokenInQuery?: boolean;
-};
-
-/**
- * The shape that last produced a link.
- *
- * A panel that refuses the standard one refuses it for every channel, so the second channel should
- * not spend a refused request learning what the first one already proved.
- */
-let preferredLinkShape: LinkShape | null = null;
-
-const LINK_SHAPES: LinkShape[] = [
-  { label: "token in a cookie", auth: true, tokenInCookie: true },
-  { label: "no Authorization header", auth: false },
-  { label: "token in the query", auth: false, tokenInQuery: true },
-  { label: "token in the query and a bearer header", auth: true, tokenInQuery: true },
-];
-
-async function createLinkShape(cfg: GatewayConfig, cmd: string, shape: LinkShape): Promise<LinkAnswer | null> {
-  const base = stalkerSession.endpoint;
-  const token = stalkerSession.token;
-  if (!base || !token) return null;
-  const account = stalkerAccount(cfg);
-  const headers = stalkerHeaders(cfg, account, shape.auth);
-  if (shape.tokenInCookie) headers["Cookie"] = `${headers["Cookie"]}; token=${token}`;
-  const params = CREATE_LINK_PARAMS(cmd);
-  if (shape.tokenInQuery) params["token"] = token;
-  const target = buildStalkerUrl(base, "itv", "create_link", params);
-  try {
-    const body = await fetchTextTimeout(target, headers, 7000);
-    recordPortal({
-      at: Date.now(),
-      action: `create_link (${shape.label})`,
-      address: portalAddress(base),
-      status: 200,
-      said: portalSaid(body),
-    });
-    return readLinkAnswer(cfg, cmd, body);
-  } catch (e) {
-    recordPortal({
-      at: Date.now(),
-      action: `create_link (${shape.label})`,
-      address: portalAddress(base),
-      status: e instanceof StalkerError && e.status !== null ? e.status : 0,
-      said: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
-    });
-    return null;
-  }
+/** One `create_link`, asked in a particular shape, with the shape put back afterwards. */
+async function createLinkInShape(
+  cfg: GatewayConfig,
+  cmd: string,
+  mode: StalkerAuthMode,
+): Promise<LinkAnswer> {
+  return withAuthMode(mode, () => createLinkOnce(cfg, cmd));
 }
 
 /**
  * The playable URL for one channel handle, asked in every shape a panel might recognise.
  *
  * "Authorization failed" with a token that is perfectly good is not a credential problem, it is a
- * guess about where the panel looks for the token — and the guess was hard-coded. Each attempt is
+ * guess about where the panel looks for the token -- and the guess was hard-coded. Each attempt is
  * recorded, so the answer to "why will this channel not play" is the portal's own words per shape
  * rather than one sentence that covers both a refused session and a wrong header.
+ *
+ * A shape that works is kept: it is the panel's habit, not this call's, and the catalogue has the
+ * same one.
  */
 async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string> {
   const attempts: Array<{ label: string; words: string; said: string | null }> = [];
@@ -1183,16 +1253,19 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
     return answer.url;
   };
 
-  // 0. Whatever worked last time, if this panel has already shown its preference.
-  const preferred = preferredLinkShape;
-  if (preferred) {
-    const known = await run(preferred.label, () => createLinkShape(cfg, cmd, preferred));
+  // 0. Whatever this panel has already shown it wants.
+  if (stalkerAuth.mode !== "bearer") {
+    const label = AUTH_MODES.find((m) => m.mode === stalkerAuth.mode)?.label ?? stalkerAuth.mode;
+    const known = await run(label, () => createLinkInShape(cfg, cmd, stalkerAuth.mode));
     if (known) return known;
   }
 
   // 1. What a MAG sends: the bearer token from the handshake.
-  const first = await run("bearer token", () => createLinkOnce(cfg, cmd));
-  if (first) return first;
+  const first = await run("bearer token", () => createLinkInShape(cfg, cmd, "bearer"));
+  if (first) {
+    stalkerAuth.mode = "bearer";
+    return first;
+  }
 
   // A portal that answers with an empty `js` has, in practice, dropped the session between the
   // catalogue call and this one: `isStalkerExpired` cannot see it, because there is no refusal to
@@ -1214,12 +1287,11 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
     await stalkerHandshake(cfg);
   } catch {
     /*
-     * Panels that mint one token per session answer a second handshake with an empty `js` — this
+     * Panels that mint one token per session answer a second handshake with an empty `js` -- this
      * one does, and it is how the maxTV diagnostic came to report "the portal issued no token"
      * about a portal that had just answered. That is a refusal to mint a *second* token, not a
      * portal that has gone away, so the session we already had goes back and the remaining shapes
-     * get their turn. Without this, one failed refresh ended the whole ladder with "no portal at
-     * this address", which is the wrong sentence for a token problem.
+     * get their turn.
      */
     stalkerSession.token = held.token;
     stalkerSession.endpoint = held.endpoint;
@@ -1231,14 +1303,17 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
       sourceBackoff.maxtvReason = null;
     }
   }
-  const fresh = await run("a new session", () => createLinkOnce(cfg, cmd));
-  if (fresh) return fresh;
+  const fresh = await run("a new session", () => createLinkInShape(cfg, cmd, "bearer"));
+  if (fresh) {
+    stalkerAuth.mode = "bearer";
+    return fresh;
+  }
 
   // 2. Where else the panel may be looking for that token.
-  for (const shape of LINK_SHAPES) {
-    const url = await run(shape.label, () => createLinkShape(cfg, cmd, shape));
+  for (const shape of AUTH_MODES) {
+    const url = await run(shape.label, () => createLinkInShape(cfg, cmd, shape.mode));
     if (url) {
-      preferredLinkShape = shape;
+      stalkerAuth.mode = shape.mode;
       return url;
     }
     // A refusal of the whole network is not a question of shape: stop before adding to it.
@@ -1265,9 +1340,7 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
     if (known) known.labels.push(attempt.label);
     else quoted.push({ words: attempt.words, labels: [attempt.label] });
   }
-  const told = quoted
-    .map((q) => `${q.words} (to ${q.labels.join(", ")})`)
-    .join("; ");
+  const told = quoted.map((q) => `${q.words} (to ${q.labels.join(", ")})`).join("; ");
   const profileNote = stalkerSession.profiled
     ? ""
     : ` The device was never profiled either (${stalkerSession.profileError ?? "get_profile did not complete"}), which is what a portal does before refusing links.`;
@@ -4396,16 +4469,36 @@ async function proxyMediaStream(
       // Built here, not earlier: resolving a redirector costs a round trip, and it is only worth
       // spending on the path where the browser is about to be handed the address.
       const recipe = typeof refusalRecipe === "function" ? await refusalRecipe() : refusalRecipe;
-      return jsonResponse(502, {
-        ok: false,
-        error: `The stream host refused this server's address (HTTP ${status}). Playing it directly from your browser instead.`,
-        directPlay: recipe,
-      });
+      return jsonResponse(
+        502,
+        {
+          ok: false,
+          error: `The stream host refused this server's address (HTTP ${status}). Playing it directly from your browser instead.`,
+          directPlay: recipe,
+        },
+        { "X-Upstream-Status": String(status) },
+      );
     }
-    return jsonResponse(status === 404 ? 404 : 502, {
-      ok: false,
-      error: `Upstream stream returned HTTP ${status}`,
-    });
+    /*
+     * Which host said no is half the answer: a CDN refusing a spent token and a host refusing this
+     * server's address both arrive as 403, and they are fixed in opposite places.
+     */
+    let refusedBy = "";
+    try {
+      refusedBy = new URL(currentUrl).host;
+    } catch {
+      refusedBy = "";
+    }
+    return jsonResponse(
+      status === 404 ? 404 : 502,
+      {
+        ok: false,
+        error: `Upstream stream returned HTTP ${status}${refusedBy ? ` from ${refusedBy}` : ""}`,
+      },
+      // The mapped status is ours (a 502 says "the relay failed"); the host's own is the fact a
+      // caller may need -- a spent link and a blocked address are both 403 there and 502 here.
+      { "X-Upstream-Status": String(status) },
+    );
   }
 
   const reader = upRes.body.getReader();
@@ -5693,9 +5786,15 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
         channels: pool.length,
         note:
           pool.length === 0
-            ? "The handshake succeeded but no channels came back: the bulk call and the paged fallback both returned nothing. The trace shows what each said."
+            ? "The handshake succeeded but no channels came back: the bulk call and the paged fallback both returned nothing, wherever the token was put. The trace shows what each said."
             : "Channels are listed.",
       };
+      /*
+       * Where this panel reads the token is the fact a reader cannot see for themselves, and the
+       * one that has to be right before any of the rest can be: an empty catalogue and a refused
+       * link are both "wrong position" symptoms long before they are account problems.
+       */
+      report['tokenPosition'] = authModeLabel();
       const ch = pool.find((c) => c.id === id || c.rawId === id);
       if (ch?.cmd && !ch.cmd.startsWith("seed://")) {
         try {
@@ -6030,23 +6129,42 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
     }
 
     try {
-      const resolved = await resolveMaxtvLink(cfg, ch.cmd || "");
       const acct = stalkerAccount(cfg);
       const magCookie = `mac=${encodeURIComponent(acct.mac)}; stb_lang=en; timezone=Asia%2FKolkata`;
-      return await proxyMediaStream(
-        resolved,
-        "mag",
-        publicOrigin,
-        cfg.proxySecret,
-        {
-          "User-Agent": MAG_USER_AGENT,
-          Cookie: magCookie,
-          Referer: `${acct.portal.replace(/\/+$/, "")}/`,
-        },
-        undefined,
-        request.headers.get("range"),
-        { isProbe, handoffId: ch.id },
-      );
+      const open = (url: string) =>
+        proxyMediaStream(
+          url,
+          "mag",
+          publicOrigin,
+          cfg.proxySecret,
+          {
+            "User-Agent": MAG_USER_AGENT,
+            Cookie: magCookie,
+            Referer: `${acct.portal.replace(/\/+$/, "")}/`,
+          },
+          undefined,
+          request.headers.get("range"),
+          { isProbe, handoffId: ch.id },
+        );
+
+      let resolved = await resolveMaxtvLink(cfg, ch.cmd || "");
+      let answer = await open(resolved);
+      /*
+       * A Stalker link is minted per play and is not meant to be stored. The catalogue sits in a
+       * cache for fifteen minutes, and a player may open the same channel twice, so a spent or
+       * expired link is ordinary rather than exceptional -- and it arrives as 403 or 410 from the
+       * media host, which reads like a ban. One fresh `create_link` is the whole remedy.
+       */
+      const upstream = Number(answer.headers.get("x-upstream-status") ?? "0");
+      if (!isProbe && (upstream === 401 || upstream === 403 || upstream === 410)) {
+        try {
+          resolved = await resolveMaxtvLink(cfg, ch.cmd || "");
+          answer = await open(resolved);
+        } catch {
+          // Keep the first answer: it is the one that has the media host's own words in it.
+        }
+      }
+      return answer;
     } catch (e) {
       return jsonResponse(502, { ok: false, error: e instanceof Error ? e.message : "Failed to resolve maxTV link" });
     }
