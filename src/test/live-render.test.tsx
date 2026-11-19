@@ -49,15 +49,36 @@ describe("Live route", () => {
 
   it("offers one tab per paid subscription, never one mixed list", async () => {
     renderLive();
-    await waitFor(() => expect(screen.getAllByText("maxTV").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("fusion4k").length).toBeGreaterThan(0));
     /*
      * Both subscriptions are chosen by the viewer, one at a time. A single "all" list is what
      * filled this guide with two sources' channels and no way to tell which were meant to work --
      * so there is no such tab. AK TV is gone from the bar: it is not what this page is for.
      */
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["maxTV", "fusion4k"]);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["fusion4k", "maxTV", "tatatv"]);
     expect(screen.queryAllByText("AK TV")).toHaveLength(0);
     expect(screen.queryAllByText("Both")).toHaveLength(0);
+  });
+
+  it("asks for the playlist when the playlist tab is chosen", async () => {
+    /*
+     * `tatatv` is a plain M3U, not a portal: no device, no token, nothing to be refused. It is a
+     * tab of its own because it keeps playing when a panel decides it does not like this
+     * deployment -- and because its channels are not the panels' channels.
+     */
+    const fetchMock = vi.mocked(fetch);
+    renderLive();
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(3));
+    fetchMock.mockClear();
+
+    fireEvent.click(screen.getByRole("tab", { name: "tatatv" }));
+
+    await waitFor(() => {
+      const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+      expect(urls.some((u) => u.includes("/api/live/channels?source=tgtv"))).toBe(true);
+      // Not a portal call: no account is involved.
+      expect(urls.some((u) => u.includes("account="))).toBe(false);
+    });
   });
 
   it("asks for the one subscription the tab names", async () => {
@@ -65,7 +86,7 @@ describe("Live route", () => {
     renderLive();
     await waitFor(() => {
       const urls = fetchMock.mock.calls.map((c) => String(c[0]));
-      expect(urls.some((u) => u.includes("account=maxtv"))).toBe(true);
+      expect(urls.some((u) => u.includes("account=fusion4k"))).toBe(true);
       // One account per request: a list carrying both panels is exactly what this page is not.
       expect(urls.filter((u) => u.includes("/api/live/channels") && u.includes("account=")).every((u) => !/account=.*account=/.test(u))).toBe(true);
       expect(urls.some((u) => u.includes("source=tgtv"))).toBe(false);
@@ -92,7 +113,7 @@ describe("Live route", () => {
 
   it("keeps branding inside the player's box, where it cannot cover the guide", async () => {
     renderLive();
-    await waitFor(() => expect(screen.getAllByText("maxTV").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("fusion4k").length).toBeGreaterThan(0));
     const brand = screen.getAllByTitle("STREAMR home");
     expect(brand.length).toBeGreaterThan(0);
     // The mark sits over the picture's own corner -- and nowhere else on the page.
@@ -152,6 +173,6 @@ describe("Live route with an empty catalogue", () => {
     await waitFor(() => expect(screen.queryByText(/Connecting to maxTV portal/)).toBeNull());
     // Two places, on purpose: the channel's own line says "No channel", and the guide says why.
     expect(screen.getAllByText(/No channel/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/maxTV returned no channels/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/fusion4k returned no channels/).length).toBeGreaterThan(0);
   });
 });

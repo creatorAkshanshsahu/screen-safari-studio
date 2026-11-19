@@ -82,6 +82,15 @@ export const MAXTV_ACCOUNTS: readonly MaxTvAccount[] = [
   },
 ] as const;
 
+/**
+ * The playlist subscription: a plain M3U, not a portal.
+ *
+ * An M3U is a list of addresses, so there is no device, no handshake and no token -- and no
+ * "Authorization failed." either. It is the seller's other product, and the guide gives it its own
+ * tab because its channels are not the panels' channels.
+ */
+export const TATATV_PLAYLIST_URL = "https://allinonereborn2.online/playlist/ttv6t.m3u";
+
 /** The default subscription: the one the environment variables override, and the one with no name. */
 export const MAXTV_ACCOUNT = MAXTV_ACCOUNTS[0]!;
 
