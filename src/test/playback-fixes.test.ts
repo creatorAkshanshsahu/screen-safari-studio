@@ -103,7 +103,10 @@ describe("Catalogue-level maxTV identity fallback", () => {
     vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
       const u = String(url);
       const cookie = init?.headers?.["Cookie"] ?? "";
-      const isSecondary = cookie.includes(encodeURIComponent("00:1A:79:BA:DF:D7"));
+      // Any identity that is not the one this build ships with: the second identity is whatever
+      // the account file names as the spare, and it should be tried only after the first is refused.
+      const { MAXTV_ACCOUNT } = await import("@/lib/maxtv-account");
+      const isSecondary = !cookie.includes(encodeURIComponent(MAXTV_ACCOUNT.mac));
       if (u.includes("action=handshake")) {
         return new Response(JSON.stringify({ js: { token: isSecondary ? "TOK_SEC" : "TOK_PRI" } }), { status: 200 });
       }

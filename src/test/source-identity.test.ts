@@ -10,7 +10,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 //            We pinned one number, so when it moved the whole backup tab went empty and
 //            every stream fell through to a seed entry that answers 503.
 
-const PRIMARY_MAC = "00:1A:79:EE:03:9F";
 const SECONDARY_MAC = "00:1A:79:BA:DF:D7";
 
 type Call = { url: string; headers: Record<string, string> };
@@ -31,33 +30,33 @@ afterEach(() => {
 });
 
 describe("maxTV talks to the working Android STB subscription identity", () => {
-  it("uses the active 00:1A:79:EE:03:9F / stalker_portal identity by default", async () => {
+  it("uses the subscription this build ships with, not the abandoned one", async () => {
+    // The MAC, serial and device id in `maxtv-account.ts` are the account; this asserts the gateway
+    // asks with *those* rather than a neighbour's. Read from the file, so replacing the account is
+    // one edit rather than two files that can disagree.
+    const { MAXTV_ACCOUNT } = await import("@/lib/maxtv-account");
     const calls = stub(() => ({ body: JSON.stringify({ js: { token: "T1" } }) }));
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     await maybeHandleLiveRequest(new Request("http://localhost/api/live/channels?source=maxtv"), {});
     const handshake = calls.find((c) => c.url.includes("action=handshake"));
     expect(handshake).toBeDefined();
-    expect(handshake!.headers["Cookie"]).toContain(encodeURIComponent(PRIMARY_MAC));
-    expect(handshake!.headers["Cookie"]).not.toContain(encodeURIComponent(SECONDARY_MAC));
+    expect(handshake!.headers["Cookie"]).toContain(encodeURIComponent(MAXTV_ACCOUNT.mac));
+    expect(new URL(handshake!.url).host).toBe(new URL(MAXTV_ACCOUNT.portal).host);
     expect(handshake!.url).toContain("stalker_portal");
   });
 
-  it("uses an explicitly configured alternate account as given, and offers the primary one second", async () => {
-    const calls = stub((url) =>
-      url.includes("action=handshake") && url.includes("new.maxtv.be/c/")
-        ? { body: JSON.stringify({ js: {} }) }
-        : { body: JSON.stringify({ js: { token: "T1" } }) },
-    );
+  it("uses an explicitly configured account as given, rather than migrating it", async () => {
+    const calls = stub(() => ({ body: JSON.stringify({ js: { token: "T1" } }) }));
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
     await maybeHandleLiveRequest(new Request("http://localhost/api/live/channels?source=maxtv"), {
-      MAXTV_PORTAL: "http://new.maxtv.be/c/",
+      MAXTV_PORTAL: "http://other.example/c/",
       MAXTV_MAC: SECONDARY_MAC,
     });
     const handshakes = calls.filter((c) => c.url.includes("action=handshake"));
     expect(handshakes.length).toBeGreaterThan(0);
-    // First as configured.
+    // First as configured: the operator chose this account, so nothing is swapped under them.
     expect(handshakes[0]!.headers["Cookie"]).toContain(encodeURIComponent(SECONDARY_MAC));
-    expect(handshakes[0]!.url).toContain("new.maxtv.be/c/");
+    expect(new URL(handshakes[0]!.url).host).toBe("other.example");
   });
 
   it("keeps a viewer's own custom account untouched", async () => {

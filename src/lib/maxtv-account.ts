@@ -30,12 +30,29 @@
  * anyone can use — and a portal that sees two devices on one MAC starts refusing both. If the
  * account is not already public, set the variables instead and leave the values below as they are.
  * The ones below are already published; treat them as a working fallback, not a secret.
+ *
+ * ## What this subscription's panel actually answers
+ *
+ * `tv.fusion4k.cc` is a plain Stalker panel whose API is *one level up* from the web-client
+ * address written on the seller's card:
+ *
+ *   `…/stalker_portal/server/load.php`  -> 200, issues a token
+ *   `…/stalker_portal/c/server/load.php` -> 404 "Not Found"
+ *
+ * Both are tried, in that order, so the card's address is still the right thing to paste here.
+ *
+ * ## The spare
+ *
+ * The account this build replaced (`new.maxtv.be`, `00:1A:79:EE:03:9F`) is kept in the gateway as
+ * a second identity: a whole device, with its own serial and device id. It is only asked after the
+ * account above has been refused outright, and it is asked with *its* values -- a MAC lent another
+ * account's serial is a device the panel has never billed.
  */
 export const MAXTV_ACCOUNT = {
-  portal: "http://new.maxtv.be/stalker_portal/c/",
-  mac: "00:1A:79:EE:03:9F",
-  serial: "92180365D21FE",
-  deviceId: "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070",
+  portal: "http://tv.fusion4k.cc/stalker_portal/c/",
+  mac: "00:1A:79:F5:8F:95",
+  serial: "99EB2A8128098",
+  deviceId: "01F71B517FE629CE5FB7158273354EDF361793DC5BB6C481C4957C3356040ABA",
 } as const;
 
 /** The environment variables that override {@link MAXTV_ACCOUNT}, in the order they matter. */

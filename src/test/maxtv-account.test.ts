@@ -111,6 +111,9 @@ describe("the maxTV account", () => {
     expect(body.channels.map((c) => c.name)).toContain("Sky Sports 1");
     expect(body.channels.every((c) => c.source === "maxtv")).toBe(true);
     // The portal it asked is the one written in the file, not a placeholder and not a preview seed.
-    expect(seen.some((u) => u.startsWith(MAXTV_ACCOUNT.portal))).toBe(true);
+    // Its host, not its exact path: a panel's API sits one level up from the web-client address the
+    // file holds, and either address is the same portal.
+    const host = new URL(MAXTV_ACCOUNT.portal).host;
+    expect(seen.some((u) => new URL(u).host === host)).toBe(true);
   });
 });

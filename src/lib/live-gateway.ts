@@ -317,11 +317,22 @@ interface StalkerAccount {
 const STALKER_DEFAULT_PORTAL = MAXTV_ACCOUNT.portal;
 const STALKER_DEFAULT_MAC = MAXTV_ACCOUNT.mac;
 
-/** Alternate web-embed identity; kept as a secondary fallback if the primary account is refused. */
-const STALKER_LEGACY_PORTAL = "http://new.maxtv.be/c/";
-const STALKER_LEGACY_MAC = "00:1A:79:BA:DF:D7";
 const STALKER_DEFAULT_SERIAL = MAXTV_ACCOUNT.serial;
 const STALKER_DEFAULT_DEVICE = MAXTV_ACCOUNT.deviceId;
+
+/**
+ * The account this app shipped before this one — a second identity, on a different portal.
+ *
+ * It is tried only after the configured account has been refused outright, and it is a whole
+ * device: a MAC belongs to a serial and a device id, and lending it another account's pair is how
+ * a panel sees a device it has never billed. The values here are the previously published ones,
+ * so a deployment that still carries them in its environment keeps talking to the panel that
+ * issued them.
+ */
+const STALKER_LEGACY_PORTAL = "http://new.maxtv.be/stalker_portal/c/";
+const STALKER_LEGACY_MAC = "00:1A:79:EE:03:9F";
+const STALKER_LEGACY_SERIAL = "92180365D21FE";
+const STALKER_LEGACY_DEVICE = "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070";
 
 /** `server/load.php` — the API every panel action is posted to. */
 const STALKER_API = "server/load.php";
@@ -350,10 +361,12 @@ function stalkerCandidates(portalUrl: string): string[] {
     if (url.startsWith("http")) out.add(url);
   };
 
+  // The web-client path is not the API: its load.php sits one level up. Asked first, because that
+  // is where every panel we have been able to reach keeps it -- `…/c/server/load.php` is a 404 on
+  // both `new.maxtv.be` and `tv.fusion4k.cc`, and a 404 in the trace reads like a fault.
+  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/${STALKER_API}`);
   // Exactly as configured.
   add(`${configured}/${STALKER_API}`);
-  // The web-client path is not the API: its load.php sits one level up.
-  if (configured.endsWith("/c")) add(`${configured.slice(0, -2)}/${STALKER_API}`);
   add(`${configured}/portal.php`);
   // The same files on the bare host.
   add(`${origin}/stalker_portal/${STALKER_API}`);
@@ -693,8 +706,10 @@ function migrateStalkerAccount(cfg: GatewayConfig): StalkerAccount {
   return {
     portal: migratePortal ? STALKER_DEFAULT_PORTAL : cfg.maxtvPortal,
     mac: migrateMac ? STALKER_DEFAULT_MAC : cfg.maxtvMac,
-    serial: cfg.maxtvSerial,
-    deviceId: cfg.maxtvDeviceId,
+    // A MAC is billed with its serial and device id; upgrading one without the others leaves the
+    // panel looking at a device that was never registered.
+    serial: migrateMac ? STALKER_DEFAULT_SERIAL : cfg.maxtvSerial,
+    deviceId: migrateMac ? STALKER_DEFAULT_DEVICE : cfg.maxtvDeviceId,
   };
 }
 
@@ -708,10 +723,22 @@ function stalkerAccountCandidates(cfg: GatewayConfig): StalkerAccount[] {
   // The configured identity is always tried first. The other published identity is tried
   // second, whichever one that is: a portal that still honours the old account is rescued,
   // and one that has moved on is not asked twice.
+  // Each identity keeps its own serial and device id: they are the device the panel billed, and a
+  // MAC paired with another account's serial is a device the panel has never seen.
   const alternate: StalkerAccount =
     primary.mac.trim().toUpperCase() === STALKER_DEFAULT_MAC.toUpperCase()
-      ? { portal: STALKER_LEGACY_PORTAL, mac: STALKER_LEGACY_MAC, serial: primary.serial, deviceId: primary.deviceId }
-      : { portal: STALKER_DEFAULT_PORTAL, mac: STALKER_DEFAULT_MAC, serial: primary.serial, deviceId: primary.deviceId };
+      ? {
+          portal: STALKER_LEGACY_PORTAL,
+          mac: STALKER_LEGACY_MAC,
+          serial: STALKER_LEGACY_SERIAL,
+          deviceId: STALKER_LEGACY_DEVICE,
+        }
+      : {
+          portal: STALKER_DEFAULT_PORTAL,
+          mac: STALKER_DEFAULT_MAC,
+          serial: STALKER_DEFAULT_SERIAL,
+          deviceId: STALKER_DEFAULT_DEVICE,
+        };
   return stalkerSameAccount(primary, alternate) ? [primary] : [primary, alternate];
 }
 
@@ -1016,6 +1043,8 @@ async function fetchMaxtvCatalogueForIdentity(
       ...cfg,
       maxtvPortal: identity.portal,
       maxtvMac: identity.mac,
+      maxtvSerial: identity.serial,
+      maxtvDeviceId: identity.deviceId,
       maxtvPortalExplicit: true,
       maxtvMacExplicit: true,
     };
