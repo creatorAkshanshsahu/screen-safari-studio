@@ -137,6 +137,8 @@ type GatewayConfig = {
    * thing that has to change.
    */
   maxtvAccountId: string;
+  /** Whether the request named this subscription, rather than the guide defaulting to it. */
+  maxtvAccountNamed: boolean;
   /** What the tab calls it. */
   maxtvAccountLabel: string;
   maxtvPortal: string;
@@ -219,6 +221,7 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
         : readEnv(env, `MAXTV_${plain.replace("MAXTV_", "")}_${suffix}`, shipped, request);
     return {
       maxtvAccountId: named.id,
+      maxtvAccountNamed: true,
       maxtvAccountLabel: named.label,
       maxtvPortal: value("MAXTV_PORTAL", named.portal),
       maxtvMac: value("MAXTV_MAC", named.mac),
@@ -232,6 +235,7 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
 
   return {
     maxtvAccountId: MAXTV_ACCOUNT.id,
+    maxtvAccountNamed: false,
     maxtvAccountLabel: MAXTV_ACCOUNT.label,
     maxtvPortal: readEnv(env, "MAXTV_PORTAL", STALKER_DEFAULT_PORTAL, request),
     maxtvMac: readEnv(env, "MAXTV_MAC", STALKER_DEFAULT_MAC, request),
@@ -254,7 +258,7 @@ function commonConfig(
   request?: Request,
 ): Omit<
   GatewayConfig,
-  "maxtvAccountId" | "maxtvAccountLabel" | "maxtvPortal" | "maxtvMac" | "maxtvMacExplicit" | "maxtvPortalExplicit" | "maxtvSerial" | "maxtvDeviceId"
+  "maxtvAccountId" | "maxtvAccountNamed" | "maxtvAccountLabel" | "maxtvPortal" | "maxtvMac" | "maxtvMacExplicit" | "maxtvPortalExplicit" | "maxtvSerial" | "maxtvDeviceId"
 > {
   const explicit = (key: string): boolean =>
     resolveEnvSources(env, request).some((src) => typeof src[key] === "string" && (src[key] as string).trim() !== "");
@@ -548,6 +552,18 @@ function isStalkerExpired(body: string): boolean {
 }
 
 /**
+ * Whether the panel said "this session is not allowed to ask" rather than "no such channel".
+ *
+ * `{"js":"Authorization failed."}` and `{"js":"Authorization failed"}` are the same sentence, and a
+ * panel that has not settled the device says it to every action -- which is why it must be read as
+ * a session question before it is reported as a subscription one.
+ */
+function stalkerRefusesSession(body: string): boolean {
+  const said = (stalkerError(body) ?? stalkerPlainWords(body) ?? "").toLowerCase();
+  return said.includes("authorization failed") || said.includes("authorisation failed");
+}
+
+/**
  * Whether a `get_profile` answer actually settled the device.
  *
  * A portal says yes with an object of profile fields and no with an empty `js`, `false`, or an
@@ -750,6 +766,8 @@ type StalkerSession = {
   profileAttempts: number;
   /** Why the last `get_profile` did not settle, when it did not. */
   profileError: string | null;
+  /** Which `get_profile` shape is owed next; a shape that was refused is not asked twice. */
+  profileShapeIndex: number;
   /** The identity that last answered; pinned so later calls keep the same MAC and portal. */
   account: StalkerAccount | null;
   /**
@@ -765,7 +783,16 @@ type StalkerSession = {
 };
 
 function blankStalkerSession(): StalkerSession {
-  return { endpoint: null, token: null, profiled: false, profileAttempts: 0, profileError: null, account: null, generation: 0 };
+  return {
+    endpoint: null,
+    token: null,
+    profiled: false,
+    profileAttempts: 0,
+    profileError: null,
+    profileShapeIndex: 0,
+    account: null,
+    generation: 0,
+  };
 }
 
 /**
@@ -780,7 +807,17 @@ function blankStalkerSession(): StalkerSession {
 const stalkerSessions = new Map<string, StalkerSession>();
 
 function stalkerSessionFor(cfg: GatewayConfig): StalkerSession {
-  const key = cfg.maxtvAccountId;
+  /*
+   * Keyed by the subscription *and* the device it is pointed at, not by the subscription alone.
+   *
+   * A token, a settled profile and a working endpoint are facts about one panel and one MAC. When
+   * an address changes under a name that stayed the same -- a deployment pointed at a staging
+   * panel, an account file corrected -- the old session was reused against a panel that had never
+   * heard of that token, and the answer was "Authorization failed." in every position, for as long
+   * as the worker lived, with nothing to distinguish it from a dead subscription.
+   */
+  const identity = migrateStalkerAccount(cfg);
+  const key = `${cfg.maxtvAccountId}|${identity.portal.replace(/\/+$/, "")}|${identity.mac.trim().toUpperCase()}`;
   const existing = stalkerSessions.get(key);
   if (existing) return existing;
   const fresh = blankStalkerSession();
@@ -825,6 +862,16 @@ function migrateStalkerAccount(cfg: GatewayConfig): StalkerAccount {
  */
 function stalkerAccountCandidates(cfg: GatewayConfig): StalkerAccount[] {
   const primary = migrateStalkerAccount(cfg);
+  /*
+   * A tab that names its subscription gets that subscription and nothing else.
+   *
+   * The spare identity below rescues a deployment built when there was one account and the panel
+   * had moved on. With two paid subscriptions in the guide it does the opposite: the fusion4k tab
+   * hands over maxTV's MAC -- a device the fusion4k panel has never billed -- and a panel answers
+   * an un billed device with "Authorization failed." about the account, which is a lie told about
+   * the wrong subscription.
+   */
+  if (cfg.maxtvAccountNamed && findMaxTvAccount(cfg.maxtvAccountId)) return [primary];
   // The configured identity is always tried first. The other published identity is tried
   // second, whichever one that is: a portal that still honours the old account is rescued,
   // and one that has moved on is not asked twice.
@@ -986,6 +1033,13 @@ async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
     if (!issued) throw new StalkerError(null, stalkerError(body) ?? "the portal issued no token");
     stalkerSession.token = issued;
     stalkerSession.profiled = false;
+    /*
+     * A new token is a new session: the profile shapes start again from the plain one.
+     * Carrying the cursor over would make the first profile call on a fresh token ask for
+     * the second authentication step -- the one thing this app must never volunteer for.
+     */
+    stalkerSession.profileShapeIndex = 0;
+    stalkerSession.profileAttempts = 0;
     stalkerSession.generation += 1;
     return issued;
   }
@@ -1016,6 +1070,13 @@ async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
         stalkerSession.account = identity;
         stalkerSession.token = issued;
         stalkerSession.profiled = false;
+        /*
+         * A new token is a new session: the profile shapes start again from the plain one.
+         * Carrying the cursor over would make the first profile call on a fresh token ask for
+         * the second authentication step -- the one thing this app must never volunteer for.
+         */
+        stalkerSession.profileShapeIndex = 0;
+        stalkerSession.profileAttempts = 0;
         stalkerSession.generation += 1;
         sourceBackoff.maxtvUntil = 0;
         sourceBackoff.maxtvReason = null;
@@ -1071,6 +1132,128 @@ async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
   throw new StalkerError(null, detail);
 }
 
+/**
+ * The `get_profile` shapes, tried in the order that gives up the least.
+ *
+ * `auth_second_step=1` is what a MAG sends, and it is a *promise to answer a challenge*: the panel
+ * replies `{"status":2,"msg":"Authentication request"}` and holds the device unauthenticated until
+ * the second step arrives. We never performed it, so the panel did exactly what it was told --
+ * every list and every link came back "Authorization failed.", from whichever position the token
+ * was sent, and the subscription was blamed for it. A live subscription answered that way for a
+ * whole evening.
+ *
+ * `auth_second_step=0` is the same device asking for its profile without volunteering for a step
+ * it will not complete, and it is tried first. The volunteering shape stays behind it for the
+ * panels that only mint links after seeing it, and the last shape is the plainest MAG250 call
+ * there is, for panels that dislike the newer fields altogether.
+ */
+function stalkerProfileShapes(account: StalkerAccount): Array<{ label: string; params: Record<string, string> }> {
+  const identity = {
+    sn: account.serial,
+    device_id: account.deviceId,
+    device_id2: account.deviceId,
+  };
+  return [
+    {
+      label: "a plain profile",
+      params: {
+        ...identity,
+        hd: "1",
+        auth_second_step: "0",
+        prehash: "0",
+        num_banks: "2",
+        stb_type: "MAG254",
+        signature: "",
+        client_type: "STB",
+        image_version: "218",
+        video_out: "hdmi",
+        hw_version: "1.7-BD-00",
+        api_signature: "262",
+      },
+    },
+    {
+      label: "the second step",
+      params: {
+        ...identity,
+        hd: "1",
+        auth_second_step: "1",
+        prehash: "0",
+        num_banks: "2",
+        stb_type: "MAG254",
+        signature: "",
+        client_type: "STB",
+        image_version: "218",
+        video_out: "hdmi",
+        hw_version: "1.7-BD-00",
+        api_signature: "262",
+      },
+    },
+    {
+      label: "a plain MAG250",
+      params: { ...identity, prehash: "0", stb_type: "MAG250" },
+    },
+  ];
+}
+
+/** Whether a profile answer is the panel asking for the second step it was promised. */
+function stalkerWantsSecondStep(body: string): boolean {
+  const root = parseEnvelope(body);
+  if (!root || Array.isArray(root)) return false;
+  const js = root["js"];
+  if (!js || typeof js !== "object" || Array.isArray(js)) return false;
+  const status = (js as Record<string, unknown>)["status"];
+  const msg = String((js as Record<string, unknown>)["msg"] ?? "").toLowerCase();
+  return status === 2 || msg.includes("authentication request");
+}
+
+/**
+ * Settle the device, shape by shape, once.
+ *
+ * Returns whether the panel accepted a profile. A refusal is recorded rather than thrown: the
+ * catalogue is readable on some panels without it, and the sentence a viewer needs is the panel's
+ * own words, not a wrapper around them.
+ */
+async function ensureProfile(cfg: GatewayConfig, force = false): Promise<boolean> {
+  const stalkerSession = stalkerSessionFor(cfg);
+  if (stalkerSession.profiled) return true;
+  if (!stalkerSession.endpoint || !stalkerSession.token) return false;
+  if (!force && stalkerSession.profileAttempts >= 2) return false;
+  const account = stalkerAccount(cfg);
+  const shapes = stalkerProfileShapes(account);
+  while (stalkerSession.profileShapeIndex < shapes.length) {
+    const shape = shapes[stalkerSession.profileShapeIndex];
+    if (!shape) break;
+    stalkerSession.profileShapeIndex += 1;
+    stalkerSession.profileAttempts += 1;
+    try {
+      const body = await stalkerRaw(
+        cfg,
+        account,
+        stalkerSession.endpoint,
+        "stb",
+        "get_profile",
+        shape.params,
+        true,
+      );
+      if (stalkerProfileSettled(body)) {
+        stalkerSession.profiled = true;
+        stalkerSession.profileError = null;
+        return true;
+      }
+      stalkerSession.profileError = stalkerWantsSecondStep(body)
+        ? `the panel asked for a second authentication step it was promised (asked as ${shape.label})`
+        : `${portalSaid(body)} (asked as ${shape.label})`;
+    } catch (e) {
+      // Still not fatal -- the catalogue works without it -- but it is recorded, because a
+      // portal that refuses links usually refused this first.
+      stalkerSession.profileError = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
+    }
+    // A freshness problem is about the token, not the shape: ask again with a new one.
+    if (!stalkerSession.token) return false;
+  }
+  return false;
+}
+
 async function stalkerRequest(
   cfg: GatewayConfig,
   type: string,
@@ -1082,49 +1265,7 @@ async function stalkerRequest(
   const account = stalkerAccount(cfg);
   if (!stalkerSession.token || !stalkerSession.endpoint) await stalkerHandshake(cfg);
 
-  if (!stalkerSession.profiled && stalkerSession.endpoint && stalkerSession.profileAttempts < 2) {
-    // `profiled` used to be set *before* the call, so one failure disabled the attempt for the
-    // rest of the session. A portal that only mints links for a profiled device then answers
-    // `create_link` with an empty `js` and no complaint -- which reads as "no stream address,
-    // gave no reason" and is exactly what the viewer saw. Attempt twice, and remember why not.
-    stalkerSession.profileAttempts += 1;
-    try {
-      const profileBody = await stalkerRaw(
-        cfg,
-        account,
-        stalkerSession.endpoint,
-        "stb",
-        "get_profile",
-        {
-          hd: "1",
-          auth_second_step: "1",
-          prehash: "0",
-          num_banks: "2",
-          stb_type: "MAG254",
-          sn: account.serial,
-          device_id: account.deviceId,
-          device_id2: account.deviceId,
-          signature: "",
-          client_type: "STB",
-          image_version: "218",
-          video_out: "hdmi",
-          hw_version: "1.7-BD-00",
-          api_signature: "262",
-        },
-        true,
-      );
-      if (stalkerProfileSettled(profileBody)) {
-        stalkerSession.profiled = true;
-        stalkerSession.profileError = null;
-      } else {
-        stalkerSession.profileError = portalSaid(profileBody);
-      }
-    } catch (e) {
-      // Still not fatal -- the catalogue works without it -- but it is recorded, because a
-      // portal that refuses links usually refused this first.
-      stalkerSession.profileError = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
-    }
-  }
+  await ensureProfile(cfg);
 
   if (!stalkerSession.endpoint) throw new StalkerError(null, "no portal address was reached");
   const generation = stalkerSession.generation;
@@ -1142,6 +1283,17 @@ async function stalkerRequest(
    *     already answered. It used to clear the endpoint too, which turned one token into a sweep of
    *     eight addresses against a host that had done nothing wrong.
    */
+  /*
+   * `Authorization failed.` before the device was ever settled is not the token's fault.
+   *
+   * A panel that demands the second step refuses everything until `get_profile` is accepted, and
+   * its words look exactly like an expiry -- so this repeats the call only after a profile shape
+   * was actually tried, and only once per session shape budget.
+   */
+  if (!retried && !stalkerSession.profiled && stalkerRefusesSession(body)) {
+    const settled = await ensureProfile(cfg, true);
+    if (settled) return stalkerRequest(cfg, type, action, params, true);
+  }
   if (!retried && isStalkerExpired(body)) {
     if (stalkerSession.generation !== generation && stalkerSession.token) {
       return stalkerRequest(cfg, type, action, params, true);
@@ -1199,6 +1351,13 @@ async function fetchMaxtvCatalogueForIdentity(
     stalkerSession.endpoint = null;
     stalkerSession.token = null;
     stalkerSession.profiled = false;
+    /*
+     * A new token is a new session: the profile shapes start again from the plain one.
+     * Carrying the cursor over would make the first profile call on a fresh token ask for
+     * the second authentication step -- the one thing this app must never volunteer for.
+     */
+    stalkerSession.profileShapeIndex = 0;
+    stalkerSession.profileAttempts = 0;
     stalkerSession.account = identity;
     const singleCfg: GatewayConfig = {
       ...cfg,
@@ -1357,6 +1516,13 @@ async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: Live
       stalkerSession.endpoint = null;
       stalkerSession.token = null;
       stalkerSession.profiled = false;
+      /*
+       * A new token is a new session: the profile shapes start again from the plain one.
+       * Carrying the cursor over would make the first profile call on a fresh token ask for
+       * the second authentication step -- the one thing this app must never volunteer for.
+       */
+      stalkerSession.profileShapeIndex = 0;
+      stalkerSession.profileAttempts = 0;
       stalkerSession.account = null;
       /*
        * A blocked address is blocked for every MAC: the second identity is the same host, and
@@ -1491,6 +1657,13 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
    */
   stalkerSession.token = null;
   stalkerSession.profiled = false;
+  /*
+   * A new token is a new session: the profile shapes start again from the plain one.
+   * Carrying the cursor over would make the first profile call on a fresh token ask for
+   * the second authentication step -- the one thing this app must never volunteer for.
+   */
+  stalkerSession.profileShapeIndex = 0;
+  stalkerSession.profileAttempts = 0;
   stalkerSession.profileAttempts = 0;
   try {
     await stalkerHandshake(cfg);
@@ -3532,12 +3705,34 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
      */
     if (!res.ok) {
       const kind = probe.contentType ? ` (${probe.contentType})` : "";
-      throw new Error(`AK TV playlist returned HTTP ${res.status}${kind}`);
+      throw new Error(`The playlist address returned HTTP ${res.status}${kind}`);
     }
     if (!body.trimStart().startsWith("#EXTM3U")) {
+      /*
+       * A page of HTML where a playlist should be is a *robot check*, not a broken link.
+       *
+       * The seller's host sits behind one, and it answers a server with a challenge page whose
+       * first line is a doctype. Printing the doctype and the byte count described the page without
+       * naming the thing, so the next move -- "open the address in a browser, it works there" --
+       * was not obvious from the message.
+       */
+      const lowered = body.toLowerCase();
+      const challenge =
+        lowered.includes("just a moment") ||
+        lowered.includes("captcha") ||
+        lowered.includes("attention required") ||
+        lowered.includes("cf-browser-verification") ||
+        (lowered.includes("<!doctype html") && lowered.includes("<html"));
       const kind = probe.contentType ? `${probe.contentType}, ` : "";
       const head = probe.firstLine ? ` starts with ${JSON.stringify(probe.firstLine.slice(0, 40))}` : "";
-      throw new Error(`AK TV playlist did not return an M3U: ${kind}${body.length} bytes${head}`);
+      if (challenge) {
+        throw new Error(
+          `The playlist address answered a robot check, not a playlist (${kind}${body.length} bytes). ` +
+            "The host only serves browsers, and this relay is not one -- the guide cannot read it until " +
+            "the address serves the file itself, or TGTV_PLAYLIST_URL points at one that does.",
+        );
+      }
+      throw new Error(`The playlist address did not return an M3U: ${kind}${body.length} bytes${head}`);
     }
   } catch (e) {
     probe = { ...probe, error: e instanceof Error ? e.message : String(e), ms: Date.now() - started };
@@ -3547,10 +3742,10 @@ async function fetchTgPlaylistCatalogue(cfg: GatewayConfig): Promise<LiveChannel
     clearTimeout(timer);
   }
   if (!body.trimStart().startsWith("#EXTM3U")) {
-    throw new Error("AK TV playlist did not return valid M3U");
+    throw new Error("The playlist address did not return a valid M3U");
   }
   const entries = parseM3u(body, cfg.tgtvPlaylistUrl);
-  if (entries.length === 0) throw new Error("AK TV playlist listed no channels");
+  if (entries.length === 0) throw new Error("The playlist listed no channels");
   lastPlaylistProbe = { ...probe, ok: true, channels: entries.length, error: null, ms: Date.now() - started };
   return entries.map((e, i) => ({
     id: `tg:${e.tvgId || i}`,
