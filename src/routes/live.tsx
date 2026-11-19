@@ -10,9 +10,9 @@ export const Route = createFileRoute("/live")({
     meta: [
       { title: "Live TV — Streamr" },
       { name: "referrer", content: "no-referrer" },
-      { name: "description", content: "Watch AK TV live channels with Hindi audio, channel numbers and embed codes." },
+      { name: "description", content: "Watch maxTV live channels with Hindi audio, channel numbers and embed codes." },
       { property: "og:title", content: "Live TV — Streamr" },
-      { property: "og:description", content: "Watch AK TV live channels with Hindi audio, channel numbers and embed codes." },
+      { property: "og:description", content: "Watch maxTV live channels with Hindi audio, channel numbers and embed codes." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
@@ -23,16 +23,27 @@ export const Route = createFileRoute("/live")({
 /**
  * Two sources, each answering for itself.
  *
- * AK TV is the playlist we do not have to fight; maxTV is a real portal account, if one is
- * configured. They are never merged: a single list containing both is how the guide once filled
- * with Jio and maxTV channels and no sign of which were supposed to work. A tab each, and the tab
- * says why it is empty when it is.
+ * One tab per paid maxTV subscription. They are never merged: a single list containing both is how
+ * the guide once filled with channels from two sources and no sign of which were supposed to work.
+ * A tab each, and the tab says why it is empty when it is.
  */
-type LiveSource = "tgtv" | "maxtv";
+type LiveSource = "maxtv" | "fusion4k";
+/**
+ * A tab per subscription.
+ *
+ * Both panels are paid for, so both are one click away. They are separate tabs and separate
+ * catalogues because `st:901` is a different channel on each -- which is also why the tab's name
+ * travels to the relay as `?account=`.
+ */
 const SOURCES: Array<{ id: LiveSource; label: string }> = [
-  { id: "tgtv", label: "AK TV" },
   { id: "maxtv", label: "maxTV" },
+  { id: "fusion4k", label: "fusion4k" },
 ];
+
+const sourceLabel = (id: LiveSource): string => SOURCES.find((s) => s.id === id)?.label ?? "maxTV";
+
+/** The question this tab asks the relay. The account is the subscription, the source is its kind. */
+const catalogueQuery = (id: LiveSource): string => `source=maxtv&account=${encodeURIComponent(id)}`;
 
 /**
  * The last catalogue this browser saw, kept so a reload does not start from nothing.
@@ -87,7 +98,9 @@ export function LivePlayerContent({
   initialChannelId,
   initialSource,
 }: { initialChannelId?: string; initialSource?: string } = {}) {
-  const [source, setSource] = useState<LiveSource>(initialSource === "maxtv" ? "maxtv" : "tgtv");
+  const [source, setSource] = useState<LiveSource>(() =>
+    SOURCES.some((s) => s.id === initialSource) ? (initialSource as LiveSource) : "maxtv",
+  );
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("all");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
   const [query, setQuery] = useState("");
@@ -144,8 +157,9 @@ export function LivePlayerContent({
       setRequestedId(requested);
       setActiveId(requested);
     }
-    // `?source=maxtv` is a link someone can share, the same way `?ch=` is.
-    if (!initialSource && params.get("source") === "maxtv") setSource("maxtv");
+    // `?account=fusion4k` (and the older `?source=`) is a link someone can share, like `?ch=`.
+    const wanted = params.get("account") ?? params.get("source");
+    if (!initialSource && wanted && SOURCES.some((s) => s.id === wanted)) setSource(wanted as LiveSource);
   }, [initialChannelId, initialSource]);
 
   /**
@@ -170,8 +184,8 @@ export function LivePlayerContent({
     setSource(next);
     if (typeof window !== "undefined" && window.location.pathname.startsWith("/live")) {
       const params = new URLSearchParams(window.location.search);
-      if (next === "maxtv") params.set("source", "maxtv");
-      else params.delete("source");
+      params.set("account", next);
+      params.delete("source");
       const qs = params.toString();
       window.history.replaceState(null, "", `/live${qs ? `?${qs}` : ""}`);
     }
@@ -189,7 +203,14 @@ export function LivePlayerContent({
    * Backoff, a ceiling, and a stop the moment channels arrive: five attempts over about twenty
    * seconds, against a relay that answers its own read in eight.
    */
-  const RETRY_DELAYS_MS = [1000, 2000, 3500, 5000, 7000];
+  /*
+   * The guide keeps asking, and it does not stop asking.
+   *
+   * It used to give up after five tries, which turned a portal that was briefly busy into a page
+   * that needed a manual refresh -- the report was "I have to refresh every time". A retry costs a
+   * request every half minute at worst; the alternative costs the viewer the page.
+   */
+  const RETRY_DELAYS_MS = [1000, 2000, 3500, 5000, 7000, 12000, 20000, 30000];
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryAttempt = useRef(0);
   /** One automatic forced refresh per stale list, so a dead host is asked once, not in a loop. */
@@ -203,11 +224,15 @@ export function LivePlayerContent({
 
   const scheduleRetry = useCallback(() => {
     if (retryTimer.current) return;
-    const delay = RETRY_DELAYS_MS[Math.min(retryAttempt.current, RETRY_DELAYS_MS.length - 1)];
-    if (retryAttempt.current >= RETRY_DELAYS_MS.length) return;
+    const delay = RETRY_DELAYS_MS[Math.min(retryAttempt.current, RETRY_DELAYS_MS.length - 1)]!;
     retryAttempt.current += 1;
     retryTimer.current = setTimeout(() => {
       retryTimer.current = null;
+      // A hidden tab gets one question answered and then waits: nothing is being watched.
+      if (typeof document !== "undefined" && document.hidden) {
+        scheduleRetry();
+        return;
+      }
       void loadRef.current(false);
     }, delay);
   }, []);
@@ -231,7 +256,7 @@ export function LivePlayerContent({
       setLoading(true);
       try {
         const res = await fetch(
-          `/api/live/channels?source=${encodeURIComponent(source)}&filter=${encodeURIComponent(filter)}${force ? "&refresh=1" : ""}`,
+          `/api/live/channels?${catalogueQuery(source)}&filter=${encodeURIComponent(filter)}${force ? "&refresh=1" : ""}`,
         );
         const data = (await res.json()) as {
           channels?: LiveChannelDto[];
@@ -270,7 +295,8 @@ export function LivePlayerContent({
         setWarming(Boolean(data.warming));
         setStale(Boolean(data.stale));
         setListAge(data.listAgeSeconds ?? null);
-        setMaxTvConfigured(Boolean(data.maxTvConfigured));
+        // Absent is not "unconfigured": the field is a statement, and only `false` makes it one.
+        setMaxTvConfigured(data.maxTvConfigured !== false);
         setSourceBlocked(Boolean(data.sourceBlocked));
         setBlockedForSeconds(data.sourceRetryAfterSeconds ?? null);
         setSelectedCategory("");
@@ -336,6 +362,21 @@ export function LivePlayerContent({
     retryAttempt.current = 0;
     void loadCatalogue(false);
   }, [loadCatalogue]);
+
+  /*
+   * A quiet refresh every five minutes, so a page left open does not drift.
+   *
+   * Not a forced one: the relay serves its own copy while that copy is fresh and re-reads the
+   * panel when it is not, which is where the traffic belongs. This only asks the question again.
+   */
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (sourceBlocked) return;
+      void loadRef.current(false);
+    }, 5 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [sourceBlocked]);
 
   /*
    * Coming back to the tab is the cheapest possible retry: the viewer is looking again, and the
@@ -433,7 +474,7 @@ export function LivePlayerContent({
   const channelEmbedCode = activeChannel
     ? `<iframe src="${origin}/embed/${encodeURIComponent(String(activeChannel.number ?? activeChannel.id))}${accentQuery}" width="100%" height="480" frameborder="0" allowfullscreen allow="autoplay; fullscreen; encrypted-media; picture-in-picture"></iframe>`
     : "";
-  const m3uUrl = `${origin}/api/live/playlist.m3u?source=${source}&filter=${filter}`;
+  const m3uUrl = `${origin}/api/live/playlist.m3u?${catalogueQuery(source)}&filter=${filter}`;
   const sdkCode = `<div id="og-live-tv"></div>\n<script src="${origin}/embed-sdk.js" data-target="#og-live-tv" data-source="${source}" data-filter="${filter}"></script>`;
 
   /**
@@ -576,7 +617,7 @@ export function LivePlayerContent({
             {activeChannel?.name ?? (loading ? "Loading…" : "No channel")}
           </h1>
           <span className="glass rounded-full px-2.5 py-1 text-[11px] font-bold text-accent">
-            {source === "maxtv" ? "maxTV" : "AK TV"}
+            {sourceLabel(source)}
           </span>
           {activeChannel && (
             <span className="text-xs text-muted-foreground">
@@ -612,15 +653,15 @@ export function LivePlayerContent({
              * error.
              */}
             <p className="font-bold text-accent">
-              {source === "maxtv" && !maxTvConfigured
-                ? "maxTV is not configured."
+              {!maxTvConfigured
+                ? `${sourceLabel(source)} is not configured.`
                 : channels.length > 0
-                  ? `${source === "maxtv" ? "maxTV" : "AK TV"} could not be refreshed — showing the list you already had.`
+                  ? `${sourceLabel(source)} could not be refreshed — showing the list you already had.`
                   : channels.length === 0 && sourceBlocked
                   ? "maxTV is refusing this site's address."
                   : channels.length === 0 && (warming || retryAttempt.current > 0)
-                    ? `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels yet.`
-                    : `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels.`}
+                    ? `${sourceLabel(source)} returned no channels yet.`
+                    : `${sourceLabel(source)} returned no channels.`}
             </p>
             <p className="mt-0.5 text-muted-foreground">
               {channels.length > 0 ? (
@@ -628,7 +669,7 @@ export function LivePlayerContent({
                   Nothing was lost: the guide below is the one this browser saw last, and it is
                   replaced the moment the relay answers. {tgtvError ?? portalError ?? backupError ?? ""}
                 </>
-              ) : source === "maxtv" && !maxTvConfigured ? (
+              ) : !maxTvConfigured ? (
                 <>
                   This deployment has no portal to ask. Put the four maxTV values in{" "}
                   <code>src/lib/maxtv-account.ts</code> — portal, MAC, serial, device id — or set{" "}
@@ -647,7 +688,7 @@ export function LivePlayerContent({
                 </>
               ) : channels.length === 0 && (warming || retryAttempt.current > 0) ? (
                 `Retrying by itself — attempt ${Math.max(retryAttempt.current, 1)}. The relay is reading the ${
-                  source === "maxtv" ? "portal" : "playlist"
+                  "portal"
                 }${tgtvError ? ` (last answer: ${tgtvError})` : ""}.`
               ) : (
                 (portalError ??
@@ -819,7 +860,7 @@ export function LivePlayerContent({
               { key: "one", label: "2. This channel · sources and ClearKey (JSON)", value: channelPublicUrl },
               { key: "api", label: "3. Channel list (public JSON API)", value: publicApiUrl },
               { key: "watch", label: "4. This channel · full page", value: channelWatchUrl },
-              { key: "m3u", label: "5. AK TV M3U playlist", value: m3uUrl },
+              { key: "m3u", label: "5. M3U playlist", value: m3uUrl },
               { key: "sdk", label: "6. Player and channel grid (script tag)", value: sdkCode },
             ].map((item) => (
               <div key={item.key} className="space-y-1 rounded-xl border border-border bg-background/80 p-3">

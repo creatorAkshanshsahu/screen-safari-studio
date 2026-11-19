@@ -27,7 +27,7 @@ vi.mock("@/components/tv/LiveVideoSurface", () => ({
   },
 }));
 
-const CACHE_KEY = "streamr.catalogue.v1.tgtv";
+const CACHE_KEY = "streamr.catalogue.v1.maxtv";
 
 const catalogue = {
   ok: true,
@@ -98,7 +98,7 @@ describe("a browser that has been here before", () => {
     // Nothing was lost: the channels are still on screen, and the reason is beside them.
     expect(screen.getAllByRole("button", { name: /Sports18 1 HD/ }).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/the playlist host timed out/).length).toBeGreaterThan(0);
-    expect(screen.queryByText(/AK TV returned no channels\./)).toBeNull();
+    expect(screen.queryByText(/maxTV returned no channels\./)).toBeNull();
 
     vi.unstubAllGlobals();
   });
@@ -128,7 +128,7 @@ describe("a browser that has been here before", () => {
 
     renderLive();
     await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(2));
-    fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
+    fireEvent.click(screen.getByRole("tab", { name: "fusion4k" }));
 
     // AK TV's channels are not maxTV's channels, and the tab is a different question.
     await waitFor(() => expect(screen.queryAllByRole("button", { name: /Sports18 1 HD/ }).length).toBe(0));

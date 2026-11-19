@@ -5,7 +5,7 @@
  * (zero `node:*` imports) so `vite build` with Lovable's Nitro Cloudflare target succeeds cleanly.
  */
 
-import { MAXTV_ACCOUNT, MAXTV_ENV_VARS } from "./maxtv-account";
+import { MAXTV_ACCOUNT, MAXTV_ACCOUNTS, MAXTV_ENV_VARS, findMaxTvAccount } from "./maxtv-account";
 
 export interface LiveChannelItem {
   /**
@@ -19,6 +19,8 @@ export interface LiveChannelItem {
   id: string;
   rawId: string;
   source: "maxtv" | "starshare" | "jio" | "tgtv";
+  /** For maxTV: which subscription listed it, when the deployment has more than one. */
+  account?: string;
   name: string;
   category: string;
   logo: string;
@@ -126,6 +128,17 @@ const PREVIEW_SEED_CHANNELS: LiveChannelItem[] = [
 ];
 
 type GatewayConfig = {
+  /**
+   * Which subscription this request is about.
+   *
+   * Two panels are paid for and neither has expired, so the guide has a tab for each. The name
+   * travels in the URL (`?account=fusion4k`) and lands here; everything below -- the handshake, the
+   * catalogue, the play link -- is already written in terms of `cfg`, so the identity is the only
+   * thing that has to change.
+   */
+  maxtvAccountId: string;
+  /** What the tab calls it. */
+  maxtvAccountLabel: string;
   maxtvPortal: string;
   maxtvMac: string;
   /** True when the value came from configuration rather than from our defaults. */
@@ -176,13 +189,76 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
   const explicit = (key: string): boolean =>
     resolveEnvSources(env, request).some((src) => typeof src[key] === "string" && (src[key] as string).trim() !== "");
 
+  /*
+   * `?account=<id>` asks for one of the subscriptions in `maxtv-account.ts`.
+   *
+   * An unknown name is the default rather than an error: a stale link to `?account=whatever` should
+   * still open the guide. The environment variables keep winning for the *default* account, because
+   * they are how a deployment of somebody else's panel is configured; a named account is a value
+   * that shipped with the code and nobody is overriding it.
+   */
+  const named = findMaxTvAccount(request ? new URL(request.url).searchParams.get("account") : null);
+  if (named) {
+    /*
+     * `MAXTV_PORTAL_FUSION4K` and friends point *one* subscription somewhere else, which is how a
+     * test or a staging panel is asked without touching the account the code ships. The plain
+     * names stay for the default subscription, so nothing that worked before changes meaning.
+     */
+    const suffix = named.id.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+    /*
+     * Naming the default subscription is not a different subscription: `?account=maxtv` must honour
+     * plain `MAXTV_PORTAL`, because that is how a deployment's own panel is configured and the page
+     * always names the tab it is on.
+     */
+    const fallback = (plain: string, specific: string, shipped: string): string =>
+      readEnv(env, specific, readEnv(env, plain, shipped, request), request);
+    const isDefault = named.id === MAXTV_ACCOUNT.id;
+    const value = (plain: string, shipped: string): string =>
+      isDefault
+        ? fallback(plain, `MAXTV_${plain.replace("MAXTV_", "")}_${suffix}`, shipped)
+        : readEnv(env, `MAXTV_${plain.replace("MAXTV_", "")}_${suffix}`, shipped, request);
+    return {
+      maxtvAccountId: named.id,
+      maxtvAccountLabel: named.label,
+      maxtvPortal: value("MAXTV_PORTAL", named.portal),
+      maxtvMac: value("MAXTV_MAC", named.mac),
+      maxtvMacExplicit: true,
+      maxtvPortalExplicit: true,
+      maxtvSerial: value("MAXTV_SERIAL", named.serial),
+      maxtvDeviceId: value("MAXTV_DEVICE_ID", named.deviceId),
+      ...commonConfig(env, request),
+    };
+  }
+
   return {
+    maxtvAccountId: MAXTV_ACCOUNT.id,
+    maxtvAccountLabel: MAXTV_ACCOUNT.label,
     maxtvPortal: readEnv(env, "MAXTV_PORTAL", STALKER_DEFAULT_PORTAL, request),
     maxtvMac: readEnv(env, "MAXTV_MAC", STALKER_DEFAULT_MAC, request),
     maxtvMacExplicit: explicit("MAXTV_MAC"),
     maxtvPortalExplicit: explicit("MAXTV_PORTAL"),
     maxtvSerial: readEnv(env, "MAXTV_SERIAL", STALKER_DEFAULT_SERIAL, request),
     maxtvDeviceId: readEnv(env, "MAXTV_DEVICE_ID", STALKER_DEFAULT_DEVICE, request),
+    ...commonConfig(env, request),
+  };
+}
+
+/**
+ * The settings that do not depend on which subscription is being asked.
+ *
+ * Split out because the account branch above returns early, and a second copy of these defaults is
+ * a second place for them to drift.
+ */
+function commonConfig(
+  env: unknown,
+  request?: Request,
+): Omit<
+  GatewayConfig,
+  "maxtvAccountId" | "maxtvAccountLabel" | "maxtvPortal" | "maxtvMac" | "maxtvMacExplicit" | "maxtvPortalExplicit" | "maxtvSerial" | "maxtvDeviceId"
+> {
+  const explicit = (key: string): boolean =>
+    resolveEnvSources(env, request).some((src) => typeof src[key] === "string" && (src[key] as string).trim() !== "");
+  return {
     starshareServer: readEnv(env, "STARSHARE_SERVER", "http://livebox.pro:8080", request),
     starshareFallback: readEnv(env, "STARSHARE_FALLBACK", "http://starshare.fans:8080", request),
     starshareUser: readEnv(env, "STARSHARE_USER", "", request),
@@ -321,18 +397,13 @@ const STALKER_DEFAULT_SERIAL = MAXTV_ACCOUNT.serial;
 const STALKER_DEFAULT_DEVICE = MAXTV_ACCOUNT.deviceId;
 
 /**
- * The account this app shipped before this one — a second identity, on a different portal.
+ * The oldest identity this app ever shipped, kept only so a stored one can be upgraded.
  *
- * It is tried only after the configured account has been refused outright, and it is a whole
- * device: a MAC belongs to a serial and a device id, and lending it another account's pair is how
- * a panel sees a device it has never billed. The values here are the previously published ones,
- * so a deployment that still carries them in its environment keeps talking to the panel that
- * issued them.
+ * It is not an account any more: `migrateStalkerAccount` replaces it with the current default when
+ * it arrives from configuration, because it is a value this code once wrote itself.
  */
-const STALKER_LEGACY_PORTAL = "http://new.maxtv.be/stalker_portal/c/";
-const STALKER_LEGACY_MAC = "00:1A:79:EE:03:9F";
-const STALKER_LEGACY_SERIAL = "92180365D21FE";
-const STALKER_LEGACY_DEVICE = "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070";
+const STALKER_LEGACY_PORTAL = "http://new.maxtv.be/c/";
+const STALKER_LEGACY_MAC = "00:1A:79:BA:DF:D7";
 
 /** `server/load.php` — the API every panel action is posted to. */
 const STALKER_API = "server/load.php";
@@ -671,7 +742,7 @@ const SOURCE_BACKOFF_MS = 30_000;
 const BLOCKED_STATUSES = new Set([403, 429, 451]);
 const BLOCKED_BACKOFF_MS = 10 * 60_000;
 
-const stalkerSession: {
+type StalkerSession = {
   endpoint: string | null;
   token: string | null;
   profiled: boolean;
@@ -685,13 +756,37 @@ const stalkerSession: {
    * How many tokens this session has had.
    *
    * A panel keeps one token per device: a handshake anywhere replaces it, and every request still
-   * holding the old one is answered "Authorization failed." Two things in this app handshake --
-   * the catalogue and the link resolver -- and they run at the same time on a page load. Counting
-   * the tokens is what lets a call that lost the race tell "my token was replaced" apart from
-   * "this account is refused", because those need opposite responses.
+   * holding the old one is answered "Authorization failed." Two things in this app handshake -- the
+   * catalogue and the link resolver -- and they run together on a page load. Counting the tokens is
+   * what lets a call that lost the race tell "my token was replaced" apart from "this account is
+   * refused", because those need opposite responses.
    */
   generation: number;
-} = { endpoint: null, token: null, profiled: false, profileAttempts: 0, profileError: null, account: null, generation: 0 };
+};
+
+function blankStalkerSession(): StalkerSession {
+  return { endpoint: null, token: null, profiled: false, profileAttempts: 0, profileError: null, account: null, generation: 0 };
+}
+
+/**
+ * One session per subscription.
+ *
+ * This was a single object, which was right while there was one panel. There are two now, and a
+ * shared object means the tab nobody is looking at can replace the token the tab being watched is
+ * using -- the "Authorization failed." storm arriving through another door. The session is keyed by
+ * the account, and every function that touches it takes the config, so there is no version of this
+ * where the wrong panel's token is in scope.
+ */
+const stalkerSessions = new Map<string, StalkerSession>();
+
+function stalkerSessionFor(cfg: GatewayConfig): StalkerSession {
+  const key = cfg.maxtvAccountId;
+  const existing = stalkerSessions.get(key);
+  if (existing) return existing;
+  const fresh = blankStalkerSession();
+  stalkerSessions.set(key, fresh);
+  return fresh;
+}
 
 /**
  * The identity the app would use for this configuration.
@@ -733,22 +828,27 @@ function stalkerAccountCandidates(cfg: GatewayConfig): StalkerAccount[] {
   // The configured identity is always tried first. The other published identity is tried
   // second, whichever one that is: a portal that still honours the old account is rescued,
   // and one that has moved on is not asked twice.
-  // Each identity keeps its own serial and device id: they are the device the panel billed, and a
-  // MAC paired with another account's serial is a device the panel has never seen.
-  const alternate: StalkerAccount =
-    primary.mac.trim().toUpperCase() === STALKER_DEFAULT_MAC.toUpperCase()
-      ? {
-          portal: STALKER_LEGACY_PORTAL,
-          mac: STALKER_LEGACY_MAC,
-          serial: STALKER_LEGACY_SERIAL,
-          deviceId: STALKER_LEGACY_DEVICE,
-        }
-      : {
-          portal: STALKER_DEFAULT_PORTAL,
-          mac: STALKER_DEFAULT_MAC,
-          serial: STALKER_DEFAULT_SERIAL,
-          deviceId: STALKER_DEFAULT_DEVICE,
-        };
+  /*
+   * The other subscription, whichever one that is.
+   *
+   * Both are paid for, so a panel that refuses one is not the end of the guide. It is a whole
+   * device: a MAC belongs to a serial and a device id, and lending it another account's pair is how
+   * a panel sees a device it has never billed.
+   */
+  const others = MAXTV_ACCOUNTS.filter(
+    (a) =>
+      a.mac.trim().toUpperCase() !== primary.mac.trim().toUpperCase() ||
+      a.portal.trim().replace(/\/+$/, "") !== primary.portal.trim().replace(/\/+$/, ""),
+  );
+  const spare = others[0];
+  const alternate: StalkerAccount = spare
+    ? { portal: spare.portal, mac: spare.mac, serial: spare.serial, deviceId: spare.deviceId }
+    : {
+        portal: STALKER_DEFAULT_PORTAL,
+        mac: STALKER_DEFAULT_MAC,
+        serial: STALKER_DEFAULT_SERIAL,
+        deviceId: STALKER_DEFAULT_DEVICE,
+      };
   return stalkerSameAccount(primary, alternate) ? [primary] : [primary, alternate];
 }
 
@@ -759,12 +859,19 @@ function stalkerSameAccount(a: StalkerAccount, b: StalkerAccount): boolean {
   );
 }
 
-/** The account in force: whichever identity last proved it works, else the migrated one. */
+/**
+ * The account in force: whichever identity last proved it works *for this subscription*.
+ *
+ * The session is shared by the worker and two subscriptions use it in turn, so "the identity last
+ * proved" is only an answer for the panel it belongs to. Returning it for the other panel is how a
+ * guide shows one panel's channels under the other panel's tab.
+ */
 function stalkerAccount(cfg: GatewayConfig): StalkerAccount {
-  return stalkerSession.account ?? migrateStalkerAccount(cfg);
+  return stalkerSessionFor(cfg).account ?? migrateStalkerAccount(cfg);
 }
 
-function stalkerHeaders(_cfg: GatewayConfig, account: StalkerAccount, auth: boolean): Record<string, string> {
+function stalkerHeaders(cfg: GatewayConfig, account: StalkerAccount, auth: boolean): Record<string, string> {
+  const stalkerSession = stalkerSessionFor(cfg);
   const h: Record<string, string> = {
     // `Asia/Kolkata` is what `StalkerPortal.kt` sends. We had `Europe/London` here, a divergence
     // left over from the first port; a portal is entitled to refuse a device whose stated zone
@@ -803,6 +910,7 @@ async function stalkerRaw(
   params: Record<string, string>,
   auth: boolean,
 ): Promise<string> {
+  const stalkerSession = stalkerSessionFor(cfg);
   // 8 candidates x 20s was up to ~160s of blank page when the host is a black hole.
   // A reachable portal answers a handshake well inside this.
   // A panel that reads the token as a query parameter gets it there, so that every call -- not
@@ -870,6 +978,7 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
 }
 
 async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
+  const stalkerSession = stalkerSessionFor(cfg);
   const account = stalkerAccount(cfg);
   if (stalkerSession.endpoint) {
     const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, "stb", "handshake", { token: "", prehash: "0" }, false);
@@ -969,6 +1078,7 @@ async function stalkerRequest(
   params: Record<string, string>,
   retried = false,
 ): Promise<string> {
+  const stalkerSession = stalkerSessionFor(cfg);
   const account = stalkerAccount(cfg);
   if (!stalkerSession.token || !stalkerSession.endpoint) await stalkerHandshake(cfg);
 
@@ -1084,6 +1194,7 @@ async function fetchMaxtvCatalogueForIdentity(
   cfg: GatewayConfig,
   identity?: StalkerAccount,
 ): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
+  const stalkerSession = stalkerSessionFor(cfg);
   if (identity && (!stalkerSession.account || !stalkerSameAccount(stalkerSession.account, identity))) {
     stalkerSession.endpoint = null;
     stalkerSession.token = null;
@@ -1125,6 +1236,7 @@ function channelListAnswer(body: string): string {
 }
 
 async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
+  const stalkerSession = stalkerSessionFor(cfg);
   let channelsBody = await stalkerRequest(cfg, "itv", "get_all_channels", {});
   const account = stalkerAccount(cfg);
   let listed = stalkerChannels(channelsBody);
@@ -1202,6 +1314,9 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
       id: `st:${c.id}`,
       rawId: c.id,
       source: "maxtv" as const,
+      // Which of the two subscriptions this row came from. The id is the panel's own channel id
+      // and both panels use the same numbering, so the account is what tells them apart.
+      account: cfg.maxtvAccountId,
       name: c.name,
       category: genre && genre.trim() && genre !== "*" && genre.toLowerCase() !== "all" ? genre : "maxTV",
       logo: c.logo.startsWith("/") ? `${origin}${c.logo}` : c.logo,
@@ -1220,6 +1335,7 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
 }
 
 async function fetchMaxtvCatalogue(cfg: GatewayConfig): Promise<{ channels: LiveChannelItem[]; endpoint: string | null }> {
+  const stalkerSession = stalkerSessionFor(cfg);
   const candidates = stalkerAccountCandidates(cfg);
   let lastErr: unknown = null;
   /**
@@ -1333,6 +1449,7 @@ async function createLinkInShape(
  * same one.
  */
 async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string> {
+  const stalkerSession = stalkerSessionFor(cfg);
   const attempts: Array<{ label: string; words: string; said: string | null }> = [];
 
   const run = async (label: string, ask: () => Promise<LinkAnswer | null>): Promise<string | null> => {
@@ -2189,23 +2306,52 @@ async function fetchStarshareCatalogue(cfg: GatewayConfig): Promise<LiveChannelI
 
 // ---------- In-Memory Catalogue Cache ----------
 
+type MaxtvCacheSlot = {
+  items: LiveChannelItem[];
+  fetchedAt: number;
+  usingSeed: boolean;
+  error: string | null;
+  endpoint: string | null;
+};
+
 const memCache: {
-  maxtv: { items: LiveChannelItem[]; fetchedAt: number; usingSeed: boolean; error: string | null; endpoint: string | null };
+  /** One slot per subscription: two panels list two different catalogues. */
+  maxtv: Map<string, MaxtvCacheSlot>;
   starshare: { items: LiveChannelItem[]; fetchedAt: number; error: string | null };
 } = {
-  maxtv: { items: [], fetchedAt: 0, usingSeed: false, error: null, endpoint: null },
+  maxtv: new Map(),
   starshare: { items: [], fetchedAt: 0, error: null },
 };
 
+/**
+ * The cache slot for the subscription this configuration asks.
+ *
+ * Keyed by the account *and* its device, so a deployment that points itself at another panel never
+ * shows one portal's channels under another portal's name.
+ */
+function slotKey(cfg: GatewayConfig): string {
+  return `${cfg.maxtvAccountId}|${cfg.maxtvPortal.replace(/\/+$/, "")}|${cfg.maxtvMac.toUpperCase()}`;
+}
+
+function maxtvSlot(cfg: GatewayConfig): MaxtvCacheSlot {
+  const key = slotKey(cfg);
+  const existing = memCache.maxtv.get(key);
+  if (existing) return existing;
+  const fresh: MaxtvCacheSlot = { items: [], fetchedAt: 0, usingSeed: false, error: null, endpoint: null };
+  memCache.maxtv.set(key, fresh);
+  return fresh;
+}
+
 async function loadMaxtvCached(cfg: GatewayConfig, force = false): Promise<LiveChannelItem[]> {
-  if (!force && memCache.maxtv.items.length > 0 && !memCache.maxtv.usingSeed && Date.now() - memCache.maxtv.fetchedAt < CATALOGUE_TTL_MS) {
-    return memCache.maxtv.items;
+  const slot = maxtvSlot(cfg);
+  if (!force && slot.items.length > 0 && !slot.usingSeed && Date.now() - slot.fetchedAt < CATALOGUE_TTL_MS) {
+    return slot.items;
   }
   try {
     const { channels: live, endpoint } = await fetchMaxtvCatalogue(cfg);
     // Remember the address that answered so later calls skip discovery.
-    if (endpoint) memCache.maxtv.endpoint = endpoint;
-    memCache.maxtv = { items: live, fetchedAt: Date.now(), usingSeed: false, error: null, endpoint: endpoint ?? memCache.maxtv.endpoint };
+    if (endpoint) slot.endpoint = endpoint;
+    memCache.maxtv.set(slotKey(cfg), { items: live, fetchedAt: Date.now(), usingSeed: false, error: null, endpoint: endpoint ?? slot.endpoint });
     return live;
   } catch (e) {
     /*
@@ -2219,14 +2365,14 @@ async function loadMaxtvCached(cfg: GatewayConfig, force = false): Promise<LiveC
      *
      * The last real catalogue is worth keeping; a fictional one is not.
      */
-    const lastGood = memCache.maxtv.items;
-    memCache.maxtv = {
+    const lastGood = slot.items;
+    memCache.maxtv.set(slotKey(cfg), {
       items: lastGood,
-      fetchedAt: memCache.maxtv.fetchedAt,
+      fetchedAt: slot.fetchedAt,
       usingSeed: lastGood.length === 0,
       error: e instanceof Error ? e.message : String(e),
-      endpoint: memCache.maxtv.endpoint,
-    };
+      endpoint: slot.endpoint,
+    });
     return lastGood;
   }
 }
@@ -3763,7 +3909,7 @@ async function getChannelsBySource(cfg: GatewayConfig, source: string, force = f
     // public listing handlers, which map "all" to AK TV before this is ever called and filter the
     // result as well. Retiring a source from the product and pretending it does not exist inside
     // the code are different jobs, and confusing them breaks the diagnostics.
-    const live = memCache.maxtv.usingSeed ? [] : m;
+    const live = maxtvSlot(cfg).usingSeed ? [] : m;
     const combined = [...live, ...j, ...t];
     return combined.length > 0 ? combined : m;
   }
@@ -5071,7 +5217,12 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
    * from it lands on whichever the catalogue happened to sort first.
    */
   const shareId = ch.number !== undefined ? String(ch.number) : enc;
-  const embedUrl = `${publicOrigin}/embed/${shareId}`;
+  /*
+   * Both links carry the subscription, for the same reason the stream does: `st:901` is channel
+   * 901 on *either* panel, and the two panels do not carry the same 901.
+   */
+  const accountQuery = ch.account ? `?account=${encodeURIComponent(ch.account)}` : "";
+  const embedUrl = `${publicOrigin}/embed/${shareId}${accountQuery}`;
   const isDirectHttpsHls =
     ch.source === "tgtv" &&
     ch.mediaType === "hls" &&
@@ -5092,7 +5243,7 @@ function toDto(ch: LiveChannelItem, publicOrigin: string): LiveChannelDto {
     embedUrl,
     iframeCode: `<iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>`,
     // The extension follows the container so the player probes the right engine.
-    streamUrl: `${publicOrigin}/api/live/stream/${enc}.${ch.mediaType === "dash" ? "mpd" : ch.mediaType === "hls" ? "m3u8" : "ts"}`,
+    streamUrl: `${publicOrigin}/api/live/stream/${enc}.${ch.mediaType === "dash" ? "mpd" : ch.mediaType === "hls" ? "m3u8" : "ts"}${accountQuery}`,
     ...(isDirectHttpsHls ? { directUrl: ch.cmd } : {}),
     ...(ch.drm && ch.drm.keys.length ? { drm: { type: "clearkey" as const, keys: ch.drm.keys } } : {}),
     ...(ch.mediaType ? { container: ch.mediaType } : {}),
@@ -5509,7 +5660,7 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
     // catalogue, and when the backup playlist is carrying the list that is stated plainly.
     const usingSeed =
       filtered.length === 0
-        ? memCache.maxtv.usingSeed
+        ? maxtvSlot(cfg).usingSeed
         : filtered.every((c) => String(c.cmd || "").startsWith("seed://"));
     const hasJio = filtered.some((c) => c.source === "jio");
     const hasMaxtv = filtered.some((c) => c.source === "maxtv");
@@ -5533,7 +5684,7 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
                     ? "tgtv"
                     : "maxtv";
 
-    const portalError = usingSeed ? memCache.maxtv.error : null;
+    const portalError = usingSeed ? maxtvSlot(cfg).error : null;
 
     return jsonResponse(200, {
       ok: true,
@@ -5543,7 +5694,7 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
       totalMatching: filtered.length,
       usingPreviewSeed: usingSeed,
       portalError,
-      portalEndpoint: memCache.maxtv.endpoint,
+      portalEndpoint: maxtvSlot(cfg).endpoint,
       backupError: jioCache.error,
       /*
        * Why the guide is empty, when it is. `tgtvCache.error` has been recorded on every failed
@@ -5559,8 +5710,8 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
        * "why is the AK TV list empty"; this answers the same question for maxTV, and a maxTV tab
        * that is empty because nothing is configured needs to say that rather than retry forever.
        */
-      sourceError: source === "maxtv" ? memCache.maxtv.error : tgtvCache.error,
-      sourceEndpoint: source === "maxtv" ? memCache.maxtv.endpoint : null,
+      sourceError: source === "maxtv" ? maxtvSlot(cfg).error : tgtvCache.error,
+      sourceEndpoint: source === "maxtv" ? maxtvSlot(cfg).endpoint : null,
       /** True when this is a cached list being served after its refresh failed. */
       stale: Boolean(tgtvCache.error) && listed.length > 0 && source !== "maxtv",
       listAgeSeconds: tgtvCache.fetchedAt ? Math.round((Date.now() - tgtvCache.fetchedAt) / 1000) : null,
@@ -5844,6 +5995,7 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
        * token per session, and a replay gets an empty answer. The replay was not only misleading,
        * it was traffic the panel counts.
        */
+      const stalkerSession = stalkerSessionFor(cfg);
       const heldToken = stalkerSession.token;
       try {
         const token = heldToken ?? (await stalkerHandshake(cfg));
