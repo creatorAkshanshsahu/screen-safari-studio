@@ -34,6 +34,46 @@ const SOURCES: Array<{ id: LiveSource; label: string }> = [
   { id: "maxtv", label: "maxTV" },
 ];
 
+/**
+ * The last catalogue this browser saw, kept so a reload does not start from nothing.
+ *
+ * The relay answers a cold read in one to three seconds -- a handshake, a profile call, the list --
+ * and the page used to spend that time showing "Loading Live TV…" over an empty guide and then,
+ * on a bad day, "maxTV returned no channels" for a channel list the viewer was watching a minute
+ * ago. The list is the same list; it is only the *asking* that is slow. So the last one is kept
+ * here, shown immediately, and replaced the moment the relay answers.
+ *
+ * Browser-local, not shared: it is this viewer's copy of a list they were already given.
+ */
+const CATALOGUE_CACHE_PREFIX = "streamr.catalogue.v1.";
+
+type CachedCatalogue = { savedAt: number; channels: LiveChannelDto[]; categories: string[] };
+
+function readCachedCatalogue(source: LiveSource): CachedCatalogue | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(CATALOGUE_CACHE_PREFIX + source);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CachedCatalogue;
+    if (!parsed || !Array.isArray(parsed.channels) || parsed.channels.length === 0) return null;
+    if (!parsed.channels.every((c) => c && typeof c.id === "string")) return null;
+    return parsed;
+  } catch {
+    // A corrupt or refused store is not a reason to fail the page: the relay is still there.
+    return null;
+  }
+}
+
+function writeCachedCatalogue(source: LiveSource, channels: LiveChannelDto[], categories: string[]): void {
+  if (typeof window === "undefined" || channels.length === 0) return;
+  try {
+    const entry: CachedCatalogue = { savedAt: Date.now(), channels, categories };
+    window.localStorage.setItem(CATALOGUE_CACHE_PREFIX + source, JSON.stringify(entry));
+  } catch {
+    // Quota is finite; a list that does not fit is not a failure.
+  }
+}
+
 /** "3 minutes", "2 hours" — an age a person can act on, never a raw number of seconds. */
 function formatAge(seconds: number): string {
   if (seconds < 90) return `${Math.max(Math.round(seconds), 1)} seconds`;
@@ -174,6 +214,18 @@ export function LivePlayerContent({
 
   useEffect(() => cancelRetry, [cancelRetry]);
 
+  /*
+   * Declared before the loader, so React runs it first: the guide is on screen before the relay is
+   * asked, and the ask only ever replaces it.
+   */
+  useEffect(() => {
+    const cached = readCachedCatalogue(source);
+    if (!cached) return;
+    setChannels((prev) => (prev.length > 0 ? prev : cached.channels));
+    setCategories((prev) => (prev.length > 0 ? prev : cached.categories));
+    setLoading(false);
+  }, [source]);
+
   const loadCatalogue = useCallback(
     async (force = false) => {
       setLoading(true);
@@ -198,7 +250,19 @@ export function LivePlayerContent({
           listAgeSeconds?: number | null;
         };
         const list = data.channels ?? [];
-        setChannels(list);
+        /*
+         * An empty answer is not always a smaller list.
+         *
+         * When the relay says the source failed -- the panel refused, the playlist host timed out,
+         * the read is stale -- the honest guide is the one the viewer already had, with the reason
+         * printed beside it. Replacing it with nothing turns a temporary refusal into "maxTV
+         * returned no channels" about a list that was working a minute earlier. A genuinely empty
+         * answer (a filter that matches nothing) still clears it.
+         */
+        const sourceFailed = Boolean(
+          data.sourceError || data.portalError || data.backupError || data.tgtvError || data.stale,
+        );
+        setChannels((prev) => (list.length > 0 ? list : sourceFailed ? prev : list));
         setCategories(data.categories ?? []);
         setPortalError(data.portalError ?? null);
         setBackupError(data.backupError ?? null);
@@ -215,6 +279,7 @@ export function LivePlayerContent({
          * wheel, so it resets the budget rather than counting against it.
          */
         if (list.length > 0) {
+          writeCachedCatalogue(source, list, data.categories ?? []);
           retryAttempt.current = 0;
           cancelRetry();
           if (!data.stale) staleRefresh.current = false;
@@ -549,14 +614,21 @@ export function LivePlayerContent({
             <p className="font-bold text-accent">
               {source === "maxtv" && !maxTvConfigured
                 ? "maxTV is not configured."
-                : channels.length === 0 && sourceBlocked
+                : channels.length > 0
+                  ? `${source === "maxtv" ? "maxTV" : "AK TV"} could not be refreshed — showing the list you already had.`
+                  : channels.length === 0 && sourceBlocked
                   ? "maxTV is refusing this site's address."
                   : channels.length === 0 && (warming || retryAttempt.current > 0)
                     ? `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels yet.`
                     : `${source === "maxtv" ? "maxTV" : "AK TV"} returned no channels.`}
             </p>
             <p className="mt-0.5 text-muted-foreground">
-              {source === "maxtv" && !maxTvConfigured ? (
+              {channels.length > 0 ? (
+                <>
+                  Nothing was lost: the guide below is the one this browser saw last, and it is
+                  replaced the moment the relay answers. {tgtvError ?? portalError ?? backupError ?? ""}
+                </>
+              ) : source === "maxtv" && !maxTvConfigured ? (
                 <>
                   This deployment has no portal to ask. Put the four maxTV values in{" "}
                   <code>src/lib/maxtv-account.ts</code> — portal, MAC, serial, device id — or set{" "}
@@ -630,7 +702,7 @@ export function LivePlayerContent({
         <section className="space-y-2.5">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">
-              {loading ? "Loading…" : `${visibleChannels.length} Channels`}
+              {loading && visibleChannels.length === 0 ? "Loading…" : `${visibleChannels.length} Channels`}
             </p>
             <button
               type="button"

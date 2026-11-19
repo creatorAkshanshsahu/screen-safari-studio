@@ -681,7 +681,17 @@ const stalkerSession: {
   profileError: string | null;
   /** The identity that last answered; pinned so later calls keep the same MAC and portal. */
   account: StalkerAccount | null;
-} = { endpoint: null, token: null, profiled: false, profileAttempts: 0, profileError: null, account: null };
+  /**
+   * How many tokens this session has had.
+   *
+   * A panel keeps one token per device: a handshake anywhere replaces it, and every request still
+   * holding the old one is answered "Authorization failed." Two things in this app handshake --
+   * the catalogue and the link resolver -- and they run at the same time on a page load. Counting
+   * the tokens is what lets a call that lost the race tell "my token was replaced" apart from
+   * "this account is refused", because those need opposite responses.
+   */
+  generation: number;
+} = { endpoint: null, token: null, profiled: false, profileAttempts: 0, profileError: null, account: null, generation: 0 };
 
 /**
  * The identity the app would use for this configuration.
@@ -835,7 +845,31 @@ function portalAddress(base: string): string {
  * A portal that refuses in its own words (expired MAC, too many connections) is reported in those
  * words instead of as a list of HTTP codes.
  */
+/**
+ * One handshake at a time, per device.
+ *
+ * A refresh asks for the guide and for a stream at the same moment. Both used to handshake, and
+ * the panel -- which mints one token per device -- answered the loser with "Authorization failed."
+ * for every call that followed. Sharing the handshake that is already in flight is the whole fix:
+ * the second caller waits for the same token instead of replacing it.
+ */
+let stalkerHandshakeInFlight: { key: string; promise: Promise<string> } | null = null;
+
+function stalkerSessionKey(account: StalkerAccount): string {
+  return `${account.portal.replace(/\/+$/, "")}|${account.mac.trim().toUpperCase()}`;
+}
+
 async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
+  const key = stalkerSessionKey(stalkerAccount(cfg));
+  if (stalkerHandshakeInFlight?.key === key) return stalkerHandshakeInFlight.promise;
+  const promise = stalkerHandshakeNow(cfg).finally(() => {
+    if (stalkerHandshakeInFlight?.promise === promise) stalkerHandshakeInFlight = null;
+  });
+  stalkerHandshakeInFlight = { key, promise };
+  return promise;
+}
+
+async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
   const account = stalkerAccount(cfg);
   if (stalkerSession.endpoint) {
     const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, "stb", "handshake", { token: "", prehash: "0" }, false);
@@ -843,6 +877,7 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
     if (!issued) throw new StalkerError(null, stalkerError(body) ?? "the portal issued no token");
     stalkerSession.token = issued;
     stalkerSession.profiled = false;
+    stalkerSession.generation += 1;
     return issued;
   }
 
@@ -872,6 +907,7 @@ async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
         stalkerSession.account = identity;
         stalkerSession.token = issued;
         stalkerSession.profiled = false;
+        stalkerSession.generation += 1;
         sourceBackoff.maxtvUntil = 0;
         sourceBackoff.maxtvReason = null;
         sourceBackoff.maxtvBlocked = false;
@@ -981,12 +1017,26 @@ async function stalkerRequest(
   }
 
   if (!stalkerSession.endpoint) throw new StalkerError(null, "no portal address was reached");
+  const generation = stalkerSession.generation;
   const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, type, action, params, true);
 
-  // An expired token is normal on a portal that sat idle; handshake once and repeat the call.
+  /*
+   * An expired token is normal on a portal that sat idle; handshake once and repeat the call.
+   *
+   * Two different things reach this branch and they are not the same problem:
+   *
+   *   - the token was replaced while this call was in flight (another handshake happened, which is
+   *     ordinary on a page load) -- the new token is already in hand, so the call is simply
+   *     repeated, and no handshake is minted on top of it;
+   *   - the panel dropped the session (idle, or a restart) -- one handshake, at the address that
+   *     already answered. It used to clear the endpoint too, which turned one token into a sweep of
+   *     eight addresses against a host that had done nothing wrong.
+   */
   if (!retried && isStalkerExpired(body)) {
+    if (stalkerSession.generation !== generation && stalkerSession.token) {
+      return stalkerRequest(cfg, type, action, params, true);
+    }
     stalkerSession.token = null;
-    stalkerSession.endpoint = null;
     await stalkerHandshake(cfg);
     return stalkerRequest(cfg, type, action, params, true);
   }
@@ -1081,14 +1131,20 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
   /** What each shape answered when the list came back empty. */
   const answers: string[] = [];
 
-  if (listed.length === 0) {
+  /*
+   * A panel that *spoke* has answered a different question.
+   *
+   * `{"js":"Authorization failed."}` is about the token or the account, and neither moves because
+   * the token was put in a cookie instead. Sweeping four shapes against it is four more calls at a
+   * host that is already refusing us -- which is how a short refusal becomes a block. The sweep is
+   * for the quiet case only: `{"js":{"data":[],"total_items":0}}`, which is indistinguishable from
+   * a portal with no channels.
+   */
+  // The panel's own words, however it wrapped them: `{"js":{"error":"…"}}` and the bare
+  // `{"js":"Authorization failed."}` mean the same thing and both count as an answer.
+  const spokenNow = () => stalkerError(channelsBody) ?? stalkerPlainWords(channelsBody);
+  if (listed.length === 0 && !spokenNow()) {
     answers.push(`as a MAG — ${channelListAnswer(channelsBody)}`);
-    /*
-     * An empty list is the quietest refusal a panel makes, and it is not obviously a refusal at
-     * all: `{"js":{"data":[],"total_items":0}}` is exactly what a portal with no channels sends,
-     * and exactly what a panel that will not accept the bearer header sends too. So the shape is
-     * the thing to vary first -- before the paged fallback, which will be refused the same way.
-     */
     for (const shape of AUTH_MODES) {
       if (shape.mode === stalkerAuth.mode) continue;
       const body = await withAuthMode(shape.mode, () =>
@@ -1107,8 +1163,12 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
   }
 
   if (listed.length === 0) {
-    const spoken = stalkerError(channelsBody);
-    const paged = await stalkerPagedChannels(cfg).catch(() => []);
+    /*
+     * The paged call is a second way to ask the same question, so it is worth asking only when the
+     * answer was silence. A refusal is an answer; repeating it twelve pages deep is traffic.
+     */
+    const spoken = spokenNow();
+    const paged = spoken ? [] : await stalkerPagedChannels(cfg).catch(() => []);
     if (paged.length > 0) listed = paged;
     else if (spoken) throw new StalkerError(null, spoken);
   }
@@ -1123,7 +1183,7 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
       : "";
     throw new StalkerError(
       null,
-      `${stalkerError(channelsBody) ?? "The portal lists no channels."}${detail}`,
+      `${spokenNow() ?? "The portal lists no channels."}${detail}`,
     );
   }
 
@@ -1307,11 +1367,14 @@ async function resolveMaxtvLink(cfg: GatewayConfig, cmd: string): Promise<string
     profiled: stalkerSession.profiled,
     profileAttempts: stalkerSession.profileAttempts,
   };
+  /*
+   * The endpoint is *kept*. It answered a moment ago; clearing it turns one re-sign-in into a
+   * sweep of eight addresses, and every one of those handshakes replaces the token the catalogue
+   * is still using. A fresh token is the remedy here; a fresh portal is not.
+   */
   stalkerSession.token = null;
-  stalkerSession.endpoint = null;
   stalkerSession.profiled = false;
   stalkerSession.profileAttempts = 0;
-  stalkerSession.account = null;
   try {
     await stalkerHandshake(cfg);
   } catch {
