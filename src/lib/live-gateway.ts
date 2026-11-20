@@ -1014,6 +1014,127 @@ function stalkerSessionKey(account: StalkerAccount): string {
   return `${account.portal.replace(/\/+$/, "")}|${account.mac.trim().toUpperCase()}`;
 }
 
+/**
+ * What a `handshake` answer actually was.
+ *
+ * "no token" was the whole of this answer once, and it covered four different facts: a panel that
+ * asked to be challenged before it would mint one, a host serving a web page instead of the API, a
+ * JSON envelope with no token in it, and a genuinely empty body. The address list in the guide read
+ * `… server/load.php no token, … server/load.php HTTP 404` -- one of those is a moved endpoint and
+ * the other is a *question*, and the message could not tell them apart.
+ */
+type HandshakeAnswer = {
+  token: string | null;
+  /** A panel asking to be challenged first; `prehash` handed back for the second call. */
+  challenge: string | null;
+  /** The panel's own refusal, when it spoke. */
+  said: string | null;
+  /** What it was, in words that can go in front of a reader. */
+  shape: string;
+};
+
+function handshakeAnswer(body: string): HandshakeAnswer {
+  const token = stalkerToken(body);
+  if (token) return { token, challenge: null, said: null, shape: "a token" };
+
+  const js = stalkerJs(body);
+  const challenge = js?.["prehash"];
+  if (typeof challenge === "string" && challenge.trim()) {
+    return { token: null, challenge: challenge.trim(), said: null, shape: "a prehash challenge" };
+  }
+
+  const said = stalkerError(body);
+  const trimmed = body.trim();
+  if (/^<(!doctype|html)/i.test(trimmed)) {
+    return {
+      token: null,
+      challenge: null,
+      said,
+      shape: "a web page, not the API (a host redirecting, or a firewall challenge)",
+    };
+  }
+  if (!trimmed) return { token: null, challenge: null, said, shape: "an empty body" };
+
+  const keys = js ? Object.keys(js).slice(0, 5).join(", ") : "";
+  return {
+    token: null,
+    challenge: null,
+    said,
+    shape: keys ? `JSON without a token (${keys})` : `text, not the API (${trimmed.slice(0, 40)})`,
+  };
+}
+
+/**
+ * One handshake, with the challenge answered when the panel asks for one.
+ *
+ * A panel that wants the challenge first answers `{"js":{"prehash":"…"}}` and mints the token only
+ * once the challenge comes back — a plain `prehash=0` call is answered with no token at all, which
+ * reads as "this portal is not here". Both address sweeps use this, so the answer is the same
+ * wherever the panel keeps its API.
+ */
+async function stalkerHandshakeAt(
+  cfg: GatewayConfig,
+  identity: StalkerAccount,
+  endpoint: string,
+): Promise<HandshakeAnswer> {
+  const plain = handshakeAnswer(
+    await stalkerRaw(cfg, identity, endpoint, "stb", "handshake", { token: "", prehash: "0" }, false),
+  );
+  if (plain.token) return plain;
+
+  /*
+   * No token and no challenge yet. `prehash=1` is the request that *asks* to be challenged, and a
+   * panel that wants one may answer nothing at all until it is asked -- so the ask is part of the
+   * handshake, not a fallback for a different problem.
+   */
+  let challenge = plain.challenge;
+  let asked = plain;
+  if (!challenge) {
+    try {
+      asked = handshakeAnswer(
+        await stalkerRaw(cfg, identity, endpoint, "stb", "handshake", { prehash: "1", token: "" }, false),
+      );
+      if (asked.token) return asked;
+      challenge = asked.challenge;
+    } catch {
+      // The panel's refusal to the ask is reported by the untouched `plain` answer below.
+    }
+  }
+  if (!challenge) return { ...plain, said: plain.said ?? asked.said };
+
+  /*
+   * The challenge, answered the way the panels ask for it: (1) ask to be challenged, (2) hand the
+   * challenge back with the token field. A panel that wanted no challenge answers the first call
+   * with a token, so nothing is lost by asking.
+   */
+  try {
+    const challenged = handshakeAnswer(
+      await stalkerRaw(
+        cfg,
+        identity,
+        endpoint,
+        "stb",
+        "handshake",
+        { prehash: "1", token: challenge },
+        false,
+      ),
+    );
+    if (challenged.token) return challenged;
+    return {
+      ...challenged,
+      challenge,
+      shape: challenged.shape === "a token" ? "a challenge that was not answered" : challenged.shape,
+    };
+  } catch (e) {
+    return {
+      token: null,
+      challenge,
+      said: e instanceof StalkerError ? e.detail : null,
+      shape: "a prehash challenge the host would not take back",
+    };
+  }
+}
+
 async function stalkerHandshake(cfg: GatewayConfig): Promise<string> {
   const key = stalkerSessionKey(stalkerAccount(cfg));
   if (stalkerHandshakeInFlight?.key === key) return stalkerHandshakeInFlight.promise;
@@ -1028,9 +1149,18 @@ async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
   const stalkerSession = stalkerSessionFor(cfg);
   const account = stalkerAccount(cfg);
   if (stalkerSession.endpoint) {
-    const body = await stalkerRaw(cfg, account, stalkerSession.endpoint, "stb", "handshake", { token: "", prehash: "0" }, false);
-    const issued = stalkerToken(body);
-    if (!issued) throw new StalkerError(null, stalkerError(body) ?? "the portal issued no token");
+    const answer = await stalkerHandshakeAt(cfg, account, stalkerSession.endpoint);
+    const issued = answer.token;
+    if (!issued) {
+      throw new StalkerError(
+        null,
+        answer.said ??
+          `The panel answered ${answer.shape} instead of a token.`.replace(
+            "answered a web page, not the API (a host redirecting, or a firewall challenge)",
+            "answered a web page instead of the API — a host redirect, or a firewall challenge",
+          ),
+      );
+    }
     stalkerSession.token = issued;
     stalkerSession.profiled = false;
     /*
@@ -1052,18 +1182,30 @@ async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
   const failures: string[] = [];
   let spoken: string | null = null;
   let lastErr: unknown = null;
+  /** How many addresses answered a web page where the API should be. */
+  let pages = 0;
   /** Set when an address says we are not welcome at all: the other seven will say the same. */
   let blocked: StalkerError | null = null;
 
   identities: for (const identity of stalkerAccountCandidates(cfg)) {
     for (const candidate of stalkerCandidates(identity.portal)) {
       try {
-        const body = await stalkerRaw(cfg, identity, candidate, "stb", "handshake", { token: "", prehash: "0" }, false);
-        const issued = stalkerToken(body);
+        const answer = await stalkerHandshakeAt(cfg, identity, candidate);
+        const issued = answer.token;
         if (!issued) {
-          const detail = stalkerError(body);
-          if (detail && !spoken) spoken = detail;
-          failures.push(`${candidate} no token`);
+          if (answer.said && !spoken) spoken = answer.said;
+          if (answer.shape.startsWith("a web page")) {
+            pages += 1;
+            /*
+             * Two addresses on the same host serving the same page is not eight chances: it is one
+             * firewall and sixteen requests. The rest of the ladder is the same host, so it is left
+             * for the next attempt rather than asked now.
+             */
+            if (pages >= 2) break identities;
+          }
+          // What the address answered, not that it answered nothing: "a web page" and "404" are
+          // different problems with different next steps.
+          failures.push(`${candidate} ${answer.shape}`);
           continue;
         }
         stalkerSession.endpoint = candidate;
@@ -1125,7 +1267,22 @@ async function stalkerHandshakeNow(cfg: GatewayConfig): Promise<string> {
   stalkerSession.endpoint = null;
   stalkerSession.token = null;
   const tried = failures.slice(0, 4).join(", ") + (failures.length > 4 ? " …" : "");
-  const detail = spoken ?? (failures.length ? `no portal at this address (tried ${tried})` : "no portal at this address");
+  /*
+   * A host serving a page where the API lives is not a portal that is absent. Saying "no portal at
+   * this address" about it sends the reader to check a portal address that is correct -- and this
+   * exact sentence, printed over a page of Cloudflare HTML, is what made the last report read like
+   * a dead subscription.
+   */
+  const pageOnly = pages > 0 && failures.every((f) => f.includes("a web page"));
+  const detail =
+    spoken ??
+    (pageOnly
+      ? "The portal's address answered a web page instead of the portal API, which is a redirect or a " +
+        "firewall challenge in front of the panel — not a dead portal and not your account. " +
+        `(tried ${tried})`
+      : failures.length
+        ? `no portal at this address (tried ${tried})`
+        : "no portal at this address");
   sourceBackoff.maxtvUntil = Date.now() + SOURCE_BACKOFF_MS;
   sourceBackoff.maxtvReason = detail;
   if (lastErr instanceof StalkerError) throw new StalkerError(lastErr.status, lastErr.detail || detail);
@@ -4711,8 +4868,16 @@ function recordPortal(attempt: PortalAttempt): void {
 function portalSaid(body: string): string {
   const spoken = stalkerError(body);
   if (spoken) return spoken.slice(0, 200);
-  const head = body.trim().replace(/\s+/g, " ").slice(0, 160);
-  return head || "(empty body)";
+  const trimmed = body.trim();
+  if (!trimmed) return "(empty body)";
+  if (/^<(!doctype|html)/i.test(trimmed)) {
+    // A page of HTML where an API answer belongs is a redirect or a firewall challenge. Its doctype
+    // is not the fact; the fact is that the host answered with a web page.
+    const title = /<title[^>]*>([^<]{0,80})<\/title>/i.exec(body)?.[1]?.trim();
+    return `a web page${title ? ` titled ${JSON.stringify(title)}` : ""} (${body.length} bytes)`;
+  }
+  const head = trimmed.replace(/\s+/g, " ").slice(0, 160);
+  return `${head} (${body.length} bytes)`;
 }
 const __hdnea_re = /__hdnea__=[^&"'\s]*/g;
 const SEGMENT_LOG_LIMIT = 24;
