@@ -127,7 +127,7 @@ describe("a browser that has been here before", () => {
     vi.stubGlobal("fetch", vi.fn(async () => json({ ...catalogue, channels: [], servedBy: "maxtv", maxTvConfigured: true })));
 
     renderLive();
-    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(4));
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(5));
     fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
 
     // AK TV's channels are not maxTV's channels, and the tab is a different question.

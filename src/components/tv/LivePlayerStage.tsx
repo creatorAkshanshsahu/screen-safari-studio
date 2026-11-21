@@ -31,6 +31,15 @@ export interface StageChannel {
   directUrl?: string | undefined;
   /** Play `directUrl` first: the channel came from a playlist this browser read itself. */
   directFirst?: boolean | undefined;
+  /**
+   * Play this address in a frame instead of the engine.
+   *
+   * For a channel whose only address is somebody else's player page: the page builds its stream at
+   * run time from a key it does not give out, so the picture it can produce is only available by
+   * letting it run. Our frame, our chrome, their script -- and the UI says so, because a framed
+   * channel behaves differently from one this player owns.
+   */
+  frameUrl?: string | undefined;
   drm?: { type: "clearkey"; keys: Array<{ kid: string; k: string }> } | null | undefined;
   container?: string | undefined;
 }
@@ -219,7 +228,17 @@ export function LivePlayerStage({
 
   return (
     <div ref={stageRef} className={`${frame} ${className}`}>
-      {channel && (
+      {channel?.frameUrl ? (
+        <iframe
+          data-testid="framed-channel"
+          src={channel.frameUrl}
+          title={channel.name}
+          className="absolute inset-0 h-full w-full border-0"
+          allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+          allowFullScreen
+          referrerPolicy="no-referrer"
+        />
+      ) : channel && (
         <LiveVideoSurface
           channelId={channel.id}
           channelName={channel.name}

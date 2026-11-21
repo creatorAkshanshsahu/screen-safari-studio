@@ -5,6 +5,14 @@ import { ArrowLeft, Code2, Copy, Check, Search } from "lucide-react";
 import { LivePlayerStage, type StageChannel } from "@/components/tv/LivePlayerStage";
 import { accentInk, parseAccent, type LiveChannelDto } from "@/lib/live-gateway";
 import {
+  DIRECTORIES,
+  findDirectory,
+  looksLikeDirectory,
+  parseDirectory,
+  type ChannelDirectory,
+  type DirectoryChannel,
+} from "@/lib/directories";
+import {
   PLAYLISTS,
   PLAYLIST_PROXIES,
   findPlaylist,
@@ -37,7 +45,7 @@ export const Route = createFileRoute("/live")({
  * several is how the guide once filled with channels from two sources and no sign of which were
  * supposed to work. A tab each, and the tab says why it is empty when it is.
  */
-type LiveSource = "tg" | "tatatv" | "fusion4k" | "maxtv";
+type LiveSource = "tg" | "tatatv" | "sony" | "fusion4k" | "maxtv";
 
 /**
  * A tab per subscription.
@@ -50,6 +58,7 @@ type LiveSource = "tg" | "tatatv" | "fusion4k" | "maxtv";
 const SOURCES: Array<{ id: LiveSource; label: string; query: string }> = [
   { id: "tg", label: "tg", query: "source=tgtv&playlist=tg" },
   { id: "tatatv", label: "tatatv", query: "source=tgtv&playlist=tatatv" },
+  { id: "sony", label: "sony", query: "source=tgtv&playlist=tg" },
   { id: "fusion4k", label: "fusion4k", query: "source=maxtv&account=fusion4k" },
   { id: "maxtv", label: "maxTV", query: "source=maxtv&account=maxtv" },
 ];
@@ -120,6 +129,37 @@ function writeStoredPlaylist(id: string, text: string): void {
   } catch {
     // A refused store is not a reason to refuse the list the viewer just read.
   }
+}
+
+/**
+ * Directory rows as guide rows.
+ *
+ * Two kinds, and the guide shows both because the directory shows both: a link that is a media
+ * address plays in this player, and a link that is the seller's player page plays in a frame inside
+ * this player. The frame is named in the UI, so nobody has to wonder why one channel looks
+ * different from the next.
+ */
+function directoryChannels(directory: ChannelDirectory, rows: DirectoryChannel[]): LiveChannelDto[] {
+  return rows.map((row, index) => {
+    const id = `dir:${directory.id}:${index}`;
+    return {
+      id,
+      key: id,
+      number: index + 1,
+      source: "tgtv" as const,
+      name: row.name,
+      category: row.play.kind === "frame" ? `${directory.label} · framed` : directory.label,
+      rawCategory: directory.label,
+      logo: row.logo,
+      embedUrl: "",
+      iframeCode: "",
+      streamUrl: row.play.url,
+      directUrl: row.play.url,
+      ...(row.play.kind === "media" && /\.m3u8(\?|$)/i.test(row.play.url) ? { container: "hls" as const } : {}),
+      // Remembered so the player can frame it instead of trying an address that is not a stream.
+      ...(row.play.kind === "frame" ? { framed: true } : {}),
+    } satisfies LiveChannelDto & { framed?: boolean };
+  });
 }
 
 /** Playlist entries as guide rows: an id, a name, and the address itself. */
@@ -317,6 +357,9 @@ export function LivePlayerContent({
    * the token position that worked, and what each address answered -- so the panel asks it and
    * shows it in place.
    */
+  /** The directory this tab is, once read. Kept in this browser like the playlists. */
+  const [directoryNote, setDirectoryNote] = useState<string | null>(null);
+  const [directoryRevision, setDirectoryRevision] = useState(0);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [diagnosing, setDiagnosing] = useState(false);
   const [blockedForSeconds, setBlockedForSeconds] = useState<number | null>(null);
@@ -552,6 +595,88 @@ export function LivePlayerContent({
     };
   }, [source, playlistRevision]);
 
+  /**
+   * Read a channel directory in the browser.
+   *
+   * The page lists channels as links. Some links are media addresses and some are the seller's own
+   * player; the parser keeps the difference, and the player acts on it. Like the playlists, the read
+   * happens here because this is the client the host serves -- with the same proxy fallback for the
+   * public page, and the same paste escape if even that is refused.
+   */
+  useEffect(() => {
+    const directory = findDirectory(source);
+    if (!directory) return;
+    let cancelled = false;
+    const storeKey = "streamr.directory.v1." + directory.id;
+
+    try {
+      const stored = window.localStorage.getItem(storeKey);
+      if (stored) {
+        const held = directoryChannels(directory, parseDirectory(stored, directory.url));
+        if (held.length > 0) {
+          setChannels(held);
+          setCategories([...new Set(held.map((c) => c.category))]);
+          setActiveId((prev) => prev || held[0]!.id);
+          setLoading(false);
+        }
+      }
+    } catch {
+      // A refused store is not a reason to refuse the page.
+    }
+
+    void (async () => {
+      const attempts: Array<() => Promise<Response>> = [
+        () => fetch(directory.url, { cache: "no-store" }),
+        ...(isPublicPlaylistUrl(directory.url)
+          ? PLAYLIST_PROXIES.map((build) => () => fetch(build(directory.url), { cache: "no-store" }))
+          : []),
+      ];
+      const tried: string[] = [];
+      for (const attempt of attempts) {
+        if (cancelled) return;
+        try {
+          const res = await attempt();
+          const html = await res.text();
+          if (cancelled) return;
+          if (!looksLikeDirectory(html)) {
+            tried.push(`HTTP ${res.status}, not a directory`);
+            continue;
+          }
+          const rows = parseDirectory(html, directory.url);
+          if (rows.length === 0) {
+            tried.push("readable but listed nothing");
+            continue;
+          }
+          try {
+            window.localStorage.setItem(storeKey, html);
+          } catch {
+            // Quota is finite; the list is still usable this time.
+          }
+          const channelsNow = directoryChannels(directory, rows);
+          setChannels(channelsNow);
+          setCategories([...new Set(channelsNow.map((c) => c.category))]);
+          setActiveId((prev) => prev || channelsNow[0]!.id);
+          setDirectoryNote(
+            `${rows.length} channels from ${directory.note}. ${rows.filter((r) => r.play.kind === "frame").length} of them play in the seller's own player, framed here.`,
+          );
+          setLoading(false);
+          return;
+        } catch {
+          tried.push("refused here");
+        }
+      }
+      if (cancelled) return;
+      setDirectoryNote(
+        `Could not read ${directory.url} from this browser (${tried.join("; ")}). Open it in a tab — if it lists channels there, this tab will too once the host answers.`,
+      );
+      setLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [source, directoryRevision]);
+
   const loadCatalogue = useCallback(
     async (force = false) => {
       setLoading(true);
@@ -666,7 +791,7 @@ export function LivePlayerContent({
      * already know -- the host refuses this site's server -- and the answer would overwrite the list
      * this browser read for itself, which is the only list that can play.
      */
-    if (findPlaylist(source)) return;
+    if (findPlaylist(source) || findDirectory(source)) return;
     void loadCatalogue(false);
   }, [loadCatalogue, source]);
 
@@ -798,7 +923,9 @@ export function LivePlayerContent({
     source: c.source,
     directUrl: c.directUrl,
     // A row this browser read out of a playlist plays from its own address, not through the relay.
-    directFirst: c.id.startsWith("pl:"),
+    directFirst: c.id.startsWith("pl:") || c.id.startsWith("dir:"),
+    // A directory row may be somebody else's player page rather than a stream: frame it.
+    frameUrl: (c as LiveChannelDto & { framed?: boolean }).framed ? c.directUrl : undefined,
     drm: c.drm ?? null,
     container: c.container,
   });
@@ -822,6 +949,9 @@ export function LivePlayerContent({
 
   /** The playlist this tab is, when the tab is one. */
   const playlist = findPlaylist(source);
+
+  /** The channel directory this tab is, when the tab is one. */
+  const directory = findDirectory(source);
 
   /** Ask the relay why this tab is empty, and show the answer in place. */
   const explain = async () => {
@@ -947,6 +1077,53 @@ export function LivePlayerContent({
             );
           })}
         </div>
+
+        {directory && (
+          <div
+            data-testid="directory-panel"
+            className="mb-3 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs"
+          >
+            <p className="font-bold text-accent">
+              {directory.label} · a channel directory
+            </p>
+            <p className="mt-0.5 text-muted-foreground">
+              {channels.length > 0
+                ? `${channels.length} channels, mapped from the page in this browser.${
+                    directoryNote ? ` ${directoryNote}` : ""
+                  }`
+                : (directoryNote ?? `Reading ${directory.url} in this browser…`)}
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <a
+                href={directory.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="rounded-full bg-accent px-3 py-1 text-[11px] font-bold text-accent-foreground no-underline"
+              >
+                Open the directory
+              </a>
+              <button
+                type="button"
+                onClick={() => {
+                  setChannels([]);
+                  setActiveId("");
+                  setDirectoryNote(null);
+                  setDirectoryRevision((n) => n + 1);
+                }}
+                className="glass rounded-full px-3 py-1 text-[11px] font-bold"
+              >
+                Read it again
+              </button>
+              <button
+                type="button"
+                onClick={() => void explain()}
+                className="glass rounded-full px-3 py-1 text-[11px] font-bold"
+              >
+                {diagnosing ? "Asking…" : "Why is this empty?"}
+              </button>
+            </div>
+          </div>
+        )}
 
         {playlist && (
           <div
@@ -1105,7 +1282,7 @@ export function LivePlayerContent({
         </section>
 
         {/* One source, so there is nothing to fall back from: say the list is short or dead. */}
-        {!playlist && (portalError || backupError || tgtvError || (!loading && visibleChannels.length === 0)) && (
+        {!playlist && !directory && (portalError || backupError || tgtvError || (!loading && visibleChannels.length === 0)) && (
           <div className="mb-3 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs">
             {/*
              * "Still coming" and "came back empty" look identical on screen and are not the same

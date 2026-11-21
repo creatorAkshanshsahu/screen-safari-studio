@@ -161,7 +161,7 @@ describe("the maxTV tab", () => {
     );
 
     renderLive();
-    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(4));
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(5));
     fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
 
     await waitFor(() => expect(screen.getByText(/is not configured/)).toBeTruthy());
@@ -203,7 +203,7 @@ describe("a maxTV portal that is refusing the site", () => {
     );
 
     renderLive();
-    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(4));
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(5));
     fireEvent.click(screen.getByRole("tab", { name: "maxTV" }));
 
     await waitFor(() => expect(screen.getByText(/maxTV is refusing this site's address/)).toBeTruthy());

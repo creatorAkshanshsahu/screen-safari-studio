@@ -55,7 +55,7 @@ describe("Live route", () => {
      * filled this guide with two sources' channels and no way to tell which were meant to work --
      * so there is no such tab. AK TV is gone from the bar: it is not what this page is for.
      */
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["tg", "tatatv", "fusion4k", "maxTV"]);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["tg", "tatatv", "sony", "fusion4k", "maxTV"]);
     expect(screen.queryAllByText("Both")).toHaveLength(0);
   });
 
@@ -67,7 +67,7 @@ describe("Live route", () => {
      */
     const fetchMock = vi.mocked(fetch);
     renderLive();
-    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(4));
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(5));
     fetchMock.mockClear();
 
     fireEvent.click(screen.getByRole("tab", { name: "tatatv" }));
