@@ -739,14 +739,23 @@ async function refusalWords(res: Response): Promise<string> {
  * `get_all_channels` first, and an empty list is indistinguishable from "The portal lists no
  * channels" unless the app goes looking. Once a shape is known to work, it is used for every call.
  */
-type StalkerAuthMode = "bearer" | "cookie" | "query" | "none";
-const stalkerAuth: { mode: StalkerAuthMode; override: StalkerAuthMode | null } = {
+type StalkerAuthMode = "bearer" | "raw" | "cookie" | "query" | "none";
+const stalkerAuth: {
+  mode: StalkerAuthMode;
+  override: StalkerAuthMode | null;
+  /** Positions already tried and found wanting in this worker; a shape is learned, not re-guessed. */
+  exhausted: Set<StalkerAuthMode>;
+} = {
   mode: "bearer",
   override: null,
+  exhausted: new Set(),
 };
 
 /** The shapes to try, in order, when the standard one does not work. */
 const AUTH_MODES: Array<{ mode: StalkerAuthMode; label: string }> = [
+  // The token with no scheme on it. A MAG sends `Bearer`, but middlewares that grew up around
+  // `Authorization: <token>` answer "Authorization failed." to the prefix and work without it.
+  { mode: "raw", label: "the bare token in Authorization" },
   { mode: "cookie", label: "token in a cookie" },
   { mode: "none", label: "no Authorization header" },
   { mode: "query", label: "token in the query" },
@@ -756,7 +765,9 @@ const authMode = (): StalkerAuthMode => stalkerAuth.override ?? stalkerAuth.mode
 
 /** How the token is being presented, in the words the page and the diagnose report use. */
 function authModeLabel(mode: StalkerAuthMode = authMode()): string {
-  return mode === "bearer" ? "a bearer Authorization header" : (AUTH_MODES.find((m) => m.mode === mode)?.label ?? mode);
+  return mode === "bearer"
+    ? "a bearer Authorization header"
+    : (AUTH_MODES.find((m) => m.mode === mode)?.label ?? mode);
 }
 
 /** Run one portal call as if this were the panel's preferred shape, and put the shape back. */
@@ -983,6 +994,7 @@ function stalkerHeaders(cfg: GatewayConfig, account: StalkerAccount, auth: boole
   if (auth && stalkerSession.token) {
     const mode = authMode();
     if (mode === "bearer") h["Authorization"] = `Bearer ${stalkerSession.token}`;
+    else if (mode === "raw") h["Authorization"] = stalkerSession.token;
     else if (mode === "cookie") h["Cookie"] = `${h["Cookie"]}; token=${stalkerSession.token}`;
     // "query" is added to the URL by `stalkerRaw`; "none" sends the identity and nothing else.
   }
@@ -1535,6 +1547,19 @@ async function stalkerRequest(
  * portal is telling us it has nothing more, and guessing a page count would mean asking a
  * portal for pages it does not have.
  */
+/** One page of `get_ordered_list`, for a panel whose bulk list is refused. */
+async function stalkerPagedChannelsOnce(cfg: GatewayConfig): Promise<StalkerChannel[]> {
+  const body = await stalkerRequest(cfg, "itv", "get_ordered_list", {
+    genre: "*",
+    force_ch_link_check: "0",
+    fav: "0",
+    sortby: "number",
+    hd: "0",
+    p: "1",
+  });
+  return stalkerChannels(body);
+}
+
 async function stalkerPagedChannels(cfg: GatewayConfig): Promise<StalkerChannel[]> {
   const out: StalkerChannel[] = [];
   const seen = new Set<string>();
@@ -1628,21 +1653,26 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
   const answers: string[] = [];
 
   /*
-   * A panel that *spoke* has answered a different question.
+   * Where the panel wants the token is a fact about the panel, and it survived a wrong guess.
    *
-   * `{"js":"Authorization failed."}` is about the token or the account, and neither moves because
-   * the token was put in a cookie instead. Sweeping four shapes against it is four more calls at a
-   * host that is already refusing us -- which is how a short refusal becomes a block. The sweep is
-   * for the quiet case only: `{"js":{"data":[],"total_items":0}}`, which is indistinguishable from
-   * a portal with no channels.
+   * `Authorization failed.` was read here as "the panel has answered a different question, and the
+   * position cannot matter" -- which is true of an account that has lapsed and false of a middleware
+   * that has never seen the shape this app sends. The reported evidence was four positions saying
+   * the same 21-byte sentence, and the conclusion drawn from it was that the subscription was dead.
+   * So the sweep runs on a refusal too.
+   *
+   * What keeps it from being a flood is that a shape is learned: once a position has been tried and
+   * answered nothing for this worker, it is not tried again, and a position that works becomes the
+   * one used for every call after it. The cost is paid once, at a panel that is refusing anyway.
    */
   // The panel's own words, however it wrapped them: `{"js":{"error":"…"}}` and the bare
   // `{"js":"Authorization failed."}` mean the same thing and both count as an answer.
   const spokenNow = () => stalkerError(channelsBody) ?? stalkerPlainWords(channelsBody);
-  if (listed.length === 0 && !spokenNow()) {
+  if (listed.length === 0) {
     answers.push(`as a MAG — ${channelListAnswer(channelsBody)}`);
     for (const shape of AUTH_MODES) {
       if (shape.mode === stalkerAuth.mode) continue;
+      if (stalkerAuth.exhausted.has(shape.mode)) continue;
       const body = await withAuthMode(shape.mode, () =>
         stalkerRequest(cfg, "itv", "get_all_channels", {}),
       ).catch(() => null);
@@ -1650,23 +1680,31 @@ async function fetchMaxtvCatalogueOnce(cfg: GatewayConfig): Promise<{ channels: 
       if (got.length > 0) {
         // This panel reads the token somewhere else. It is the panel's habit, not this call's.
         stalkerAuth.mode = shape.mode;
+        stalkerAuth.exhausted.clear();
         channelsBody = body!;
         listed = got;
         break;
       }
+      stalkerAuth.exhausted.add(shape.mode);
       answers.push(`${shape.label} — ${body ? channelListAnswer(body) : "no answer"}`);
     }
   }
 
   if (listed.length === 0) {
-    /*
-     * The paged call is a second way to ask the same question, so it is worth asking only when the
-     * answer was silence. A refusal is an answer; repeating it twelve pages deep is traffic.
-     */
     const spoken = spokenNow();
-    const paged = spoken ? [] : await stalkerPagedChannels(cfg).catch(() => []);
+    /*
+     * The paged call is a second way to ask the same question.
+     *
+     * Silence gets the full walk. A *refusal* gets one page: some panels disable the bulk
+     * `get_all_channels` for a device and serve `get_ordered_list` quite happily, and their refusal
+     * names no reason at all -- so the only way to tell those two apart is to ask once. One page,
+     * not twelve: thirteen requests at a host that is refusing is how a short block gets longer.
+     */
+    const paged = spoken
+      ? await stalkerPagedChannelsOnce(cfg).catch(() => [])
+      : await stalkerPagedChannels(cfg).catch(() => []);
     if (paged.length > 0) listed = paged;
-    else if (spoken) throw new StalkerError(null, spoken);
+    else if (spoken) throw new StalkerError(null, `${spoken} (the paged list was refused too)`);
   }
   if (listed.length === 0) {
     /*

@@ -17,23 +17,54 @@ export type PlaylistId = "tg" | "tatatv";
 export interface PlaylistSource {
   id: PlaylistId;
   label: string;
-  /** The address the seller publishes. */
+  /** The address the seller publishes. The first of {@link urls}; kept for links and reports. */
   url: string;
+  /**
+   * Every address this tab will try, in order.
+   *
+   * The seller publishes a main link and a list of backups, and says the important thing plainly:
+   * "if one playlist doesn't work, try another". That is a rule the page can follow without being
+   * told which one is down today — and doing it here is the difference between a tab that works
+   * and a tab that says "could not be read" about the one address it happened to pick.
+   */
+  urls: string[];
   /** What this list is, in one line, for the tab that shows it. */
   note: string;
 }
+
+/**
+ * The seller's own links, from the announcement that accompanies them.
+ *
+ * `still-haze-50d5.lindahicks827.workers.dev` and `tghub.lindahicks827.workers.dev` are the
+ * published backups; `hjh-545.pages.dev` is the one this app shipped as its default for months, so
+ * it is known to have served a list. The order is deliberate: the address that serves a file at a
+ * path ending in `.m3u` first, because a bare host is as often a web page as a playlist.
+ */
+const TG_LINKS = [
+  "https://hjh-545.pages.dev/",
+  "https://tghub.lindahicks827.workers.dev/",
+  "https://still-haze-50d5.lindahicks827.workers.dev/playlist.m3u",
+  "https://still-haze-50d5.lindahicks827.workers.dev/",
+];
+
+const TATATV_LINKS = [
+  "https://allinonereborn2.online/playlist/ttv6t.m3u",
+  ...TG_LINKS,
+];
 
 export const PLAYLISTS: PlaylistSource[] = [
   {
     id: "tg",
     label: "tg",
-    url: "https://hjh-545.pages.dev/",
+    url: TG_LINKS[0]!,
+    urls: TG_LINKS,
     note: "the tg playlist",
   },
   {
     id: "tatatv",
     label: "tatatv",
-    url: "https://allinonereborn2.online/playlist/ttv6t.m3u",
+    url: TATATV_LINKS[0]!,
+    urls: TATATV_LINKS,
     note: "the tatatv playlist",
   },
 ];
