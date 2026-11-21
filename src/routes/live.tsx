@@ -418,39 +418,57 @@ export function LivePlayerContent({
       }
     }
 
-    const address = readPlaylistUrl(playlist.id) ?? playlist.url;
+    /*
+     * Every address this tab knows, in order, until one of them is a playlist.
+     *
+     * The seller's advice is the algorithm: "if one playlist doesn't work, try another". Doing it
+     * here costs a second per dead address and saves the viewer from being told the whole product
+     * is broken because the page picked the wrong link.
+     */
+    const mine = readPlaylistUrl(playlist.id);
+    const addresses = mine ? [mine, ...playlist.urls.filter((u) => u !== mine)] : playlist.urls;
     void (async () => {
-      try {
-        const res = await fetch(address, { cache: "no-store" });
-        const text = await res.text();
+      const tried: string[] = [];
+      for (const address of addresses) {
         if (cancelled) return;
-        if (!looksLikePlaylist(text)) {
-          setPlaylistNote(
-            `${playlist.label} answered this browser with ${res.ok ? "a page, not a playlist" : `HTTP ${res.status}`}. Open the address in a tab and copy what it shows, or use the button below.`,
-          );
+        try {
+          const res = await fetch(address, { cache: "no-store" });
+          const text = await res.text();
+          if (cancelled) return;
+          if (!looksLikePlaylist(text)) {
+            tried.push(`${new URL(address).host} (${res.ok ? "a page, not a playlist" : `HTTP ${res.status}`})`);
+            continue;
+          }
+          const read = playlistChannels(playlist, parsePlaylist(text));
+          if (read.length === 0) {
+            tried.push(`${new URL(address).host} (listed nothing)`);
+            continue;
+          }
+          writeStoredPlaylist(playlist.id, text);
+          setChannels(read);
+          setCategories([...new Set(read.map((c) => c.category))]);
+          setActiveId((prev) => prev || read[0]!.id);
+          setPlaylistNote(null);
           setLoading(false);
           return;
+        } catch {
+          // A refused `fetch` is the expected case: a cross-origin file with no CORS header for us.
+          tried.push(`${(() => {
+            try {
+              return new URL(address).host;
+            } catch {
+              return address;
+            }
+          })()} (refused by this browser)`);
         }
-        const read = playlistChannels(playlist, parsePlaylist(text));
-        if (read.length === 0) {
-          setPlaylistNote(`${playlist.label} was readable but listed nothing.`);
-          setLoading(false);
-          return;
-        }
-        writeStoredPlaylist(playlist.id, text);
-        setChannels(read);
-        setCategories([...new Set(read.map((c) => c.category))]);
-        setActiveId((prev) => prev || read[0]!.id);
-        setPlaylistNote(null);
-        setLoading(false);
-      } catch {
-        if (cancelled) return;
-        // A refused `fetch` is expected: this is a cross-origin file with no CORS header for us.
-        setPlaylistNote(
-          `${playlist.label} could not be read by this page directly. Open the address in a tab and copy what it shows, or use the button below.`,
-        );
-        setLoading(false);
       }
+      if (cancelled) return;
+      setPlaylistNote(
+        tried.length
+          ? `None of the ${tried.length} addresses this tab knows could be read here: ${tried.join("; ")}. Open one in a tab and copy what it shows, or use the button below.`
+          : `${playlist.label} has no address to read.`,
+      );
+      setLoading(false);
     })();
 
     return () => {

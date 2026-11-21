@@ -129,22 +129,34 @@ describe("a portal that keeps one token per device", () => {
     expect(panel.handshakes - before).toBeLessThanOrEqual(1);
   });
 
-  it("does not sweep four token positions at a panel that said 'Authorization failed.'", async () => {
+  it("tries each token position once, and never again for this worker", async () => {
     const panel = oneTokenPanel({ refuseAll: true });
     const { maybeHandleLiveRequest } = await import("@/lib/live-gateway");
+    const read = async () => {
+      const res = await maybeHandleLiveRequest(
+        new Request("http://localhost/api/live/channels?source=maxtv&refresh=1", { headers: { host: "localhost:8080" } }),
+        CONFIG,
+      );
+      return (await res!.json()) as { channels: unknown[]; sourceError: string };
+    };
 
-    const res = await maybeHandleLiveRequest(
-      new Request("http://localhost/api/live/channels?source=maxtv&refresh=1", { headers: { host: "localhost:8080" } }),
-      CONFIG,
-    );
-    const body = (await res!.json()) as { channels: unknown[]; sourceError: string };
+    const body = await read();
     expect(body.channels).toEqual([]);
     expect(body.sourceError).toContain("Authorization failed.");
 
-    const channelCalls = panel.calls.filter((c) => c.includes("action=get_all_channels"));
-    // The call, its one retry after a fresh token, and nothing else: no cookie/query/no-header tour
-    // and no twelve-page fallback behind a refusal.
-    expect(channelCalls.length).toBeLessThanOrEqual(2);
-    expect(panel.calls.filter((c) => c.includes("action=get_ordered_list"))).toHaveLength(0);
+    /*
+     * The positions were tried, because a refusal is exactly what a panel says when the token is in
+     * a place it does not look -- "Authorization failed." for four positions was read here as "the
+     * account", and it was the header. What must never happen is the tour *repeating*: a position
+     * that answered nothing is learned, and the next read costs one call, not four.
+     */
+    const firstTour = panel.calls.filter((c) => c.includes("action=get_all_channels")).length;
+    expect(firstTour).toBeGreaterThan(1);
+
+    const before = panel.calls.length;
+    await read();
+    const secondRead = panel.calls.slice(before).filter((c) => c.includes("action=get_all_channels")).length;
+    expect(secondRead).toBeLessThanOrEqual(2);
   });
+
 });

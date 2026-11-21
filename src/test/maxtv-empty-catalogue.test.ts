@@ -115,8 +115,12 @@ describe("a catalogue that comes back empty", () => {
     const panel = stubPanel((headers) => !headers["Authorization"]);
     await channels();
     const learned = panel.calls.filter((u) => u.includes("action=get_all_channels")).length;
-    // The first read had to find out: a bearer attempt, then the shape the panel accepts.
-    expect(learned).toBe(2);
+    /*
+     * The first read had to find out, and there are three shapes between the standard one and the
+     * one this panel accepts: a bearer header, the bare token in the same header, then the cookie
+     * it wants. That is the cost of learning the panel's habit, and it is paid once.
+     */
+    expect(learned).toBe(3);
 
     const before = panel.calls.length;
     await channels();

@@ -147,6 +147,34 @@ describe("a playlist tab", () => {
     expect(vi.mocked(fetch).mock.calls.map((c) => String(c[0])).some((u) => u.includes("mirror.example"))).toBe(true);
   });
 
+  it("walks to the seller's backups when the first address is not a playlist", async () => {
+    /*
+     * The seller publishes a main link and a list of backups, with one instruction: "if one
+     * playlist doesn't work, try another". That is an algorithm, and this tab follows it -- the
+     * alternative is telling the viewer the whole product is broken because the page picked the
+     * one address that is down today.
+     */
+    const hosts: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (target: string) => {
+        const url = String(target);
+        hosts.push(new URL(url).host);
+        // The first address serves a page; the second serves the file.
+        if (url.includes("hjh-545")) return new Response("<!DOCTYPE html><html>Just a moment…</html>", { status: 200 });
+        if (url.includes("tghub")) return new Response(PLAYLIST, { status: 200 });
+        return new Response("nope", { status: 404 });
+      }),
+    );
+
+    renderLive();
+    fireEvent.click(await screen.findByRole("tab", { name: "tg" }));
+
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /Colors HD/ }).length).toBeGreaterThan(0));
+    expect(hosts).toContain("hjh-545.pages.dev");
+    expect(hosts).toContain("tghub.lindahicks827.workers.dev");
+  });
+
   it("refuses something that is not a playlist, and says why", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 500 })));
 
