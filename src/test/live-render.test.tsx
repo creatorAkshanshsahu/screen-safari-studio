@@ -55,31 +55,32 @@ describe("Live route", () => {
      * filled this guide with two sources' channels and no way to tell which were meant to work --
      * so there is no such tab. AK TV is gone from the bar: it is not what this page is for.
      */
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["fusion4k", "maxTV", "tatatv"]);
-    expect(screen.queryAllByText("AK TV")).toHaveLength(0);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["tg", "tatatv", "fusion4k", "maxTV"]);
     expect(screen.queryAllByText("Both")).toHaveLength(0);
   });
 
-  it("asks for the playlist when the playlist tab is chosen", async () => {
+  it("reads a playlist tab in this browser, and never asks the relay about it", async () => {
     /*
-     * `tatatv` is a plain M3U, not a portal: no device, no token, nothing to be refused. It is a
-     * tab of its own because it keeps playing when a panel decides it does not like this
-     * deployment -- and because its channels are not the panels' channels.
+     * A playlist is a file, not a panel: the host serves browsers and refuses servers, so the relay
+     * is not asked at all. Its answer would only be the refusal, and it would overwrite the list
+     * this browser read for itself -- the only list that can play.
      */
     const fetchMock = vi.mocked(fetch);
     renderLive();
-    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(3));
+    await waitFor(() => expect(screen.getAllByRole("tab").length).toBe(4));
     fetchMock.mockClear();
 
     fireEvent.click(screen.getByRole("tab", { name: "tatatv" }));
 
     await waitFor(() => {
       const urls = fetchMock.mock.calls.map((c) => String(c[0]));
-      expect(urls.some((u) => u.includes("/api/live/channels?source=tgtv"))).toBe(true);
-      // Not a portal call: no account is involved.
-      expect(urls.some((u) => u.includes("account="))).toBe(false);
+      expect(urls.some((u) => u.includes("allinonereborn2.online"))).toBe(true);
     });
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.includes("/api/live/channels"))).toBe(false);
+    expect(urls.some((u) => u.includes("account="))).toBe(false);
   });
+
 
   it("asks for the one subscription the tab names", async () => {
     const fetchMock = vi.mocked(fetch);

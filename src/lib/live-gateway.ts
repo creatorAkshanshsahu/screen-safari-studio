@@ -6,6 +6,7 @@
  */
 
 import { MAXTV_ACCOUNT, MAXTV_ACCOUNTS, MAXTV_ENV_VARS, TATATV_PLAYLIST_URL, findMaxTvAccount } from "./maxtv-account";
+import { findPlaylist } from "./playlists";
 
 export interface LiveChannelItem {
   /**
@@ -282,7 +283,19 @@ function commonConfig(
      * configuration change, not a code change. `/api/live/diagnose?playlist=1` reports which
      * address is in use and what it answered.
      */
-    tgtvPlaylistUrl: readEnv(env, "TGTV_PLAYLIST_URL", TATATV_PLAYLIST_URL, request),
+    /*
+     * Which playlist: the tab's `?playlist=`, then the environment, then the shipped default.
+     *
+     * The page reads playlists itself now, because the hosts serve browsers. This stays for the
+     * hosts that do answer a server, and for `/api/live/playlist.m3u` links that were shared before.
+     */
+    tgtvPlaylistUrl: readEnv(
+      env,
+      "TGTV_PLAYLIST_URL",
+      findPlaylist(request ? new URL(request.url).searchParams.get("playlist") : null)?.url ??
+        TATATV_PLAYLIST_URL,
+      request,
+    ),
     // Whether that address came from configuration or from our default. It decides which one to
     // change when the playlist will not load, and the diagnostic is where that is asked.
     tgtvPlaylistFromEnv: explicit("TGTV_PLAYLIST_URL"),

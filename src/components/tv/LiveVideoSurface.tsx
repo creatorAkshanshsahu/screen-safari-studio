@@ -48,6 +48,15 @@ interface LiveVideoSurfaceProps {
   channelName: string;
   /** Optional direct HTTPS HLS stream URL for browser-side fallback when proxy ASN is geo-blocked. */
   directUrl?: string | undefined;
+  /**
+   * Play `directUrl` as the *first* source, without asking the relay at all.
+   *
+   * A channel the viewer's own browser read out of a playlist has no relay to ask: the host serves
+   * that file to a browser and refuses the site's server, so the relay's only answer would be its
+   * own refusal. Asking anyway spends a round trip and a probe to learn nothing, and the viewer
+   * sees "Connecting" for the duration of it.
+   */
+  directFirst?: boolean | undefined;
   /** ClearKey material for DRM channels, handed over by the catalogue. */
   drm?: ChannelDrm | null | undefined;
   /** Stated by the catalogue: "dash" | "hls". */
@@ -242,6 +251,7 @@ export function LiveVideoSurface({
   channelId,
   channelName,
   directUrl,
+  directFirst,
   drm,
   container,
   activeSource,
@@ -478,6 +488,7 @@ export function LiveVideoSurface({
   const latest = useRef({
     channelName,
     directUrl,
+    directFirst,
     drm,
     container,
     activeSource,
@@ -490,6 +501,7 @@ export function LiveVideoSurface({
   latest.current = {
     channelName,
     directUrl,
+    directFirst,
     drm,
     container,
     activeSource,
@@ -1240,6 +1252,21 @@ export function LiveVideoSurface({
        * app has hung.
        */
       if (!cancelled) setStatusMsg(`Connecting to ${latest.current.channelName}…`);
+
+      /*
+       * A browser-native channel plays from where it came from.
+       *
+       * The playlist is read in this browser, so its addresses are the browser's to use -- the
+       * server cannot reach them, and asking it to would only produce a refusal that looks like a
+       * dead channel. The extension picks the engine; the fallback inside each one covers a host
+       * that serves the other kind.
+       */
+      if (latest.current.directFirst && latest.current.directUrl) {
+        const nativeUrl = latest.current.directUrl;
+        if (/\.m3u8(\?|$)/i.test(nativeUrl)) startHls(nativeUrl, true);
+        else startMpegTs(nativeUrl, true);
+        return;
+      }
 
       const probeCtrl = new AbortController();
       const timer = setTimeout(() => probeCtrl.abort(), 8000);
