@@ -149,6 +149,10 @@ type GatewayConfig = {
   maxtvPortalExplicit: boolean;
   maxtvSerial: string;
   maxtvDeviceId: string;
+  /** The second device id the card prints, when it prints one. */
+  maxtvDeviceId2: string;
+  /** The box the panel believes it is talking to. */
+  maxtvStbType: string;
   starshareServer: string;
   starshareFallback: string;
   starshareUser: string;
@@ -230,6 +234,8 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
       maxtvPortalExplicit: true,
       maxtvSerial: value("MAXTV_SERIAL", named.serial),
       maxtvDeviceId: value("MAXTV_DEVICE_ID", named.deviceId),
+      maxtvDeviceId2: value("MAXTV_DEVICE_ID2", named.deviceId2 ?? named.deviceId),
+      maxtvStbType: value("MAXTV_STB_TYPE", named.stbType ?? "MAG254"),
       ...commonConfig(env, request),
     };
   }
@@ -244,6 +250,8 @@ function getConfig(env: unknown, request?: Request): GatewayConfig {
     maxtvPortalExplicit: explicit("MAXTV_PORTAL"),
     maxtvSerial: readEnv(env, "MAXTV_SERIAL", STALKER_DEFAULT_SERIAL, request),
     maxtvDeviceId: readEnv(env, "MAXTV_DEVICE_ID", STALKER_DEFAULT_DEVICE, request),
+    maxtvDeviceId2: readEnv(env, "MAXTV_DEVICE_ID2", STALKER_DEFAULT_DEVICE2, request),
+    maxtvStbType: readEnv(env, "MAXTV_STB_TYPE", STALKER_DEFAULT_STB, request),
     ...commonConfig(env, request),
   };
 }
@@ -259,7 +267,7 @@ function commonConfig(
   request?: Request,
 ): Omit<
   GatewayConfig,
-  "maxtvAccountId" | "maxtvAccountNamed" | "maxtvAccountLabel" | "maxtvPortal" | "maxtvMac" | "maxtvMacExplicit" | "maxtvPortalExplicit" | "maxtvSerial" | "maxtvDeviceId"
+  "maxtvAccountId" | "maxtvAccountNamed" | "maxtvAccountLabel" | "maxtvPortal" | "maxtvMac" | "maxtvMacExplicit" | "maxtvPortalExplicit" | "maxtvSerial" | "maxtvDeviceId" | "maxtvDeviceId2" | "maxtvStbType"
 > {
   const explicit = (key: string): boolean =>
     resolveEnvSources(env, request).some((src) => typeof src[key] === "string" && (src[key] as string).trim() !== "");
@@ -400,6 +408,16 @@ interface StalkerAccount {
   mac: string;
   serial: string;
   deviceId: string;
+  /**
+   * The rest of the device the seller's card describes.
+   *
+   * A panel bills a *device*, not a MAC: the cookie says which MAC, and `sn`, `device_id` and
+   * `device_id2` say which box that MAC belongs to. Presenting one without the others is a device
+   * the panel has never seen, and its answer to that is "Authorization failed." -- the same
+   * sentence it uses for a lapsed subscription, which is why it reads like one.
+   */
+  deviceId2?: string;
+  stbType?: string;
 }
 
 /*
@@ -412,6 +430,8 @@ const STALKER_DEFAULT_MAC = MAXTV_ACCOUNT.mac;
 
 const STALKER_DEFAULT_SERIAL = MAXTV_ACCOUNT.serial;
 const STALKER_DEFAULT_DEVICE = MAXTV_ACCOUNT.deviceId;
+const STALKER_DEFAULT_DEVICE2 = MAXTV_ACCOUNT.deviceId2 ?? MAXTV_ACCOUNT.deviceId;
+const STALKER_DEFAULT_STB = MAXTV_ACCOUNT.stbType ?? "MAG254";
 
 /**
  * The oldest identity this app ever shipped, kept only so a stored one can be upgraded.
@@ -830,7 +850,22 @@ function stalkerSessionFor(cfg: GatewayConfig): StalkerSession {
    * as the worker lived, with nothing to distinguish it from a dead subscription.
    */
   const identity = migrateStalkerAccount(cfg);
-  const key = `${cfg.maxtvAccountId}|${identity.portal.replace(/\/+$/, "")}|${identity.mac.trim().toUpperCase()}`;
+  /*
+   * The whole device is in the key, not just the address.
+   *
+   * A token and a settled profile are facts about one panel and one *box*. Correcting a serial or
+   * a device id is correcting which box this is -- and reusing the old session against it is the
+   * same mistake as reusing it against a different panel: a token the panel never issued to this
+   * device, refused with "Authorization failed." until the worker restarts.
+   */
+  const key = [
+    cfg.maxtvAccountId,
+    identity.portal.replace(/\/+$/, ""),
+    identity.mac.trim().toUpperCase(),
+    identity.serial.trim().toUpperCase(),
+    identity.deviceId.trim().toUpperCase(),
+    (identity.deviceId2 ?? identity.deviceId).trim().toUpperCase(),
+  ].join("|");
   const existing = stalkerSessions.get(key);
   if (existing) return existing;
   const fresh = blankStalkerSession();
@@ -865,6 +900,8 @@ function migrateStalkerAccount(cfg: GatewayConfig): StalkerAccount {
     // panel looking at a device that was never registered.
     serial: migrateMac ? STALKER_DEFAULT_SERIAL : cfg.maxtvSerial,
     deviceId: migrateMac ? STALKER_DEFAULT_DEVICE : cfg.maxtvDeviceId,
+    deviceId2: migrateMac ? STALKER_DEFAULT_DEVICE2 : cfg.maxtvDeviceId2,
+    stbType: cfg.maxtvStbType || STALKER_DEFAULT_STB,
   };
 }
 
@@ -975,10 +1012,25 @@ async function stalkerRaw(
   // A reachable portal answers a handshake well inside this.
   // A panel that reads the token as a query parameter gets it there, so that every call -- not
   // only `create_link` -- is answered the same way it answers a MAG.
-  const shaped =
-    auth && stalkerSession.token && authMode() === "query"
-      ? { ...params, token: stalkerSession.token }
-      : params;
+  /*
+   * The device travels with every call, handshake included.
+   *
+   * A panel bills a box, not a MAC: the cookie names the MAC, and `sn` / `device_id` / `device_id2`
+   * name the box it belongs to. A client that sends only the cookie is a stranger holding somebody's
+   * address -- and the panel says so with "Authorization failed.", the same sentence it uses for a
+   * lapsed subscription. The card the seller hands out prints all of them, so all of them are sent.
+   */
+  const identity: Record<string, string> = {
+    sn: account.serial,
+    device_id: account.deviceId,
+    device_id2: account.deviceId2 ?? account.deviceId,
+    stb_type: account.stbType ?? STALKER_DEFAULT_STB,
+  };
+  const shaped = {
+    ...identity,
+    ...params,
+    ...(auth && stalkerSession.token && authMode() === "query" ? { token: stalkerSession.token } : {}),
+  };
   const target = buildStalkerUrl(base, type, action, shaped);
   try {
     const body = await fetchTextTimeout(target, stalkerHeaders(cfg, account, auth), 7000);
@@ -1321,8 +1373,9 @@ function stalkerProfileShapes(account: StalkerAccount): Array<{ label: string; p
   const identity = {
     sn: account.serial,
     device_id: account.deviceId,
-    device_id2: account.deviceId,
+    device_id2: account.deviceId2 ?? account.deviceId,
   };
+  const stbType = account.stbType ?? STALKER_DEFAULT_STB;
   return [
     {
       label: "a plain profile",
@@ -1332,7 +1385,7 @@ function stalkerProfileShapes(account: StalkerAccount): Array<{ label: string; p
         auth_second_step: "0",
         prehash: "0",
         num_banks: "2",
-        stb_type: "MAG254",
+        stb_type: stbType,
         signature: "",
         client_type: "STB",
         image_version: "218",
@@ -1349,7 +1402,7 @@ function stalkerProfileShapes(account: StalkerAccount): Array<{ label: string; p
         auth_second_step: "1",
         prehash: "0",
         num_banks: "2",
-        stb_type: "MAG254",
+        stb_type: stbType,
         signature: "",
         client_type: "STB",
         image_version: "218",
@@ -1535,6 +1588,8 @@ async function fetchMaxtvCatalogueForIdentity(
       maxtvMac: identity.mac,
       maxtvSerial: identity.serial,
       maxtvDeviceId: identity.deviceId,
+      maxtvDeviceId2: identity.deviceId2 ?? identity.deviceId,
+      maxtvStbType: identity.stbType ?? STALKER_DEFAULT_STB,
       maxtvPortalExplicit: true,
       maxtvMacExplicit: true,
     };
@@ -6350,6 +6405,18 @@ async function handleLiveRequest(request: Request, env: unknown): Promise<Respon
         configured: {
           portal: cfg.maxtvPortal,
           mac: cfg.maxtvMac,
+          /*
+           * The whole device, not just its address.
+           *
+           * A panel bills a box: the MAC says which line, and the serial with the two device ids
+           * say which box that line belongs to. A report that named only the MAC could not show
+           * whether the rest was being sent at all -- and "is it using the numbers I gave you?" is
+           * the first question anyone asks of a failing panel.
+           */
+          sn: cfg.maxtvSerial,
+          deviceId: cfg.maxtvDeviceId,
+          deviceId2: cfg.maxtvDeviceId2,
+          stbType: cfg.maxtvStbType,
           // Whether these came from configuration or from our defaults. It decides whether
           // an identity may be migrated, and it explains a mismatch that otherwise looks
           // like the portal disagreeing with what was set.

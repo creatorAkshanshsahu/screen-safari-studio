@@ -54,7 +54,15 @@ describe("the maxTV account", () => {
 
   it("lets an environment variable override any one of the four values", async () => {
     const { MAXTV_ACCOUNT, MAXTV_ENV_VARS } = await import("@/lib/maxtv-account");
-    expect(MAXTV_ENV_VARS).toEqual(["MAXTV_PORTAL", "MAXTV_MAC", "MAXTV_SERIAL", "MAXTV_DEVICE_ID"]);
+    // The four the card always prints, then the two that matter when a panel checks them.
+    expect(MAXTV_ENV_VARS).toEqual([
+      "MAXTV_PORTAL",
+      "MAXTV_MAC",
+      "MAXTV_SERIAL",
+      "MAXTV_DEVICE_ID",
+      "MAXTV_DEVICE_ID2",
+      "MAXTV_STB_TYPE",
+    ]);
 
     const { configured: diagnosed } = (
       await get<Diagnosed>("/api/live/diagnose?source=maxtv", { MAXTV_PORTAL: "http://other.example/c/" })
