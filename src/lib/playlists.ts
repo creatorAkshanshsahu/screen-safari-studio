@@ -136,3 +136,33 @@ export function looksLikePlaylist(text: string): boolean {
   const head = text.trimStart();
   return head.startsWith("#EXTM3U") || head.startsWith("#EXTINF") || /\n#EXTINF/i.test(head.slice(0, 4000));
 }
+
+/**
+ * Reading a public playlist through a proxy, when the host will not answer this page.
+ *
+ * A seller's playlist URL is a public file — no token, no account, nothing secret in it — so routing
+ * the read through somebody else's server gives away nothing that is not already on a poster. What
+ * it buys is the one thing the page cannot do for itself: a different address on the internet, and
+ * with it a chance the host does not refuse this particular client.
+ *
+ * It is a fallback and it says so: the tab reports which link answered, so a proxy that works is
+ * visible rather than silent. Nothing with credentials ever goes through here — the panels are not
+ * public files and are never proxied.
+ */
+export const PLAYLIST_PROXIES: Array<(url: string) => string> = [
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+];
+
+/** Whether an address is safe to hand a third party: public, no credentials, no query token. */
+export function isPublicPlaylistUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return false;
+    // A query string is where sellers put the buyer's key (`?token=…`, `/playlist/abc.m3u`).
+    // A path segment is fine; a secret in the query is not.
+    return !parsed.search || !/(token|key|pass|auth|user|mac|login)/i.test(parsed.search);
+  } catch {
+    return false;
+  }
+}

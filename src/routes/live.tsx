@@ -4,7 +4,16 @@ import { Button } from "@/components/ui/button";
 import { ArrowLeft, Code2, Copy, Check, Search } from "lucide-react";
 import { LivePlayerStage, type StageChannel } from "@/components/tv/LivePlayerStage";
 import { accentInk, parseAccent, type LiveChannelDto } from "@/lib/live-gateway";
-import { PLAYLISTS, findPlaylist, looksLikePlaylist, parsePlaylist, type PlaylistEntry, type PlaylistSource } from "@/lib/playlists";
+import {
+  PLAYLISTS,
+  PLAYLIST_PROXIES,
+  findPlaylist,
+  isPublicPlaylistUrl,
+  looksLikePlaylist,
+  parsePlaylist,
+  type PlaylistEntry,
+  type PlaylistSource,
+} from "@/lib/playlists";
 
 export const Route = createFileRoute("/live")({
   head: () => ({
@@ -177,6 +186,29 @@ const CATALOGUE_CACHE_PREFIX = "streamr.catalogue.v1.";
 
 type CachedCatalogue = { savedAt: number; channels: LiveChannelDto[]; categories: string[] };
 
+/** The parts of `/api/live/diagnose` the page shows. Fields are optional: the relay says what it knows. */
+type Diagnosis = {
+  ok?: boolean;
+  error?: string;
+  kind?: string;
+  hint?: string;
+  tokenPosition?: string;
+  configuredUrl?: string;
+  configured?: {
+    portal?: string;
+    mac?: string;
+    sn?: string;
+    deviceId?: string;
+    deviceId2?: string;
+    stbType?: string;
+    fromEnv?: { portal?: boolean; mac?: boolean };
+  };
+  handshake?: { ok?: boolean; endpoint?: string | null; reused?: boolean; error?: string };
+  catalogue?: { channels?: number; note?: string };
+  probe?: { status?: number | null; contentType?: string | null; channels?: number | null; error?: string | null };
+  trace?: Array<{ secondsAgo?: number; action?: string; address?: string; status?: number; said?: string }>;
+};
+
 function readCachedCatalogue(source: LiveSource): CachedCatalogue | null {
   if (typeof window === "undefined") return null;
   try {
@@ -277,6 +309,16 @@ export function LivePlayerContent({
   const [pasteDraft, setPasteDraft] = useState("");
   const [playlistNote, setPlaylistNote] = useState<string | null>(null);
   const [playlistRevision, setPlaylistRevision] = useState(0);
+  /**
+   * The relay's own report about this tab, fetched on demand.
+   *
+   * The person looking at an empty guide should not have to be handed a URL to paste somewhere. The
+   * question "why is this empty" has an answer the relay already knows -- the device it presented,
+   * the token position that worked, and what each address answered -- so the panel asks it and
+   * shows it in place.
+   */
+  const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
+  const [diagnosing, setDiagnosing] = useState(false);
   const [blockedForSeconds, setBlockedForSeconds] = useState<number | null>(null);
 
   useEffect(() => {
@@ -452,14 +494,48 @@ export function LivePlayerContent({
           setLoading(false);
           return;
         } catch {
-          // A refused `fetch` is the expected case: a cross-origin file with no CORS header for us.
-          tried.push(`${(() => {
+          /*
+           * A refused `fetch` is the expected case: a cross-origin file with no CORS header for us.
+           *
+           * A public playlist has nothing secret in it, so the read is retried through a proxy --
+           * a different address on the internet, and a chance the host does not refuse this client.
+           * The tab says which link answered, so a proxy that worked is visible rather than silent.
+           */
+          const host = (() => {
             try {
               return new URL(address).host;
             } catch {
               return address;
             }
-          })()} (refused by this browser)`);
+          })();
+          if (!isPublicPlaylistUrl(address)) {
+            tried.push(`${host} (refused by this browser)`);
+            continue;
+          }
+          let viaProxy = false;
+          for (const build of PLAYLIST_PROXIES) {
+            if (cancelled) return;
+            try {
+              const res = await fetch(build(address), { cache: "no-store" });
+              const text = await res.text();
+              if (!looksLikePlaylist(text)) continue;
+              const read = playlistChannels(playlist, parsePlaylist(text));
+              if (read.length === 0) continue;
+              viaProxy = true;
+              writeStoredPlaylist(playlist.id, text);
+              setChannels(read);
+              setCategories([...new Set(read.map((c) => c.category))]);
+              setActiveId((prev) => prev || read[0]!.id);
+              setPlaylistNote(
+                `${read.length} channels from ${host}, read through a proxy because the host refused this page directly.`,
+              );
+              setLoading(false);
+              return;
+            } catch {
+              // The next proxy, then the next address.
+            }
+          }
+          if (!viaProxy) tried.push(`${host} (refused here and through a proxy)`);
         }
       }
       if (cancelled) return;
@@ -747,6 +823,22 @@ export function LivePlayerContent({
   /** The playlist this tab is, when the tab is one. */
   const playlist = findPlaylist(source);
 
+  /** Ask the relay why this tab is empty, and show the answer in place. */
+  const explain = async () => {
+    setDiagnosing(true);
+    try {
+      const res = await fetch(
+        `/api/live/diagnose?${catalogueQuery(source)}${source === "maxtv" || source === "fusion4k" ? "" : "&playlist=1"}`,
+      );
+      const data = (await res.json()) as Diagnosis;
+      setDiagnosis(data);
+    } catch {
+      setDiagnosis({ ok: false, error: "The relay did not answer the diagnostic request either." });
+    } finally {
+      setDiagnosing(false);
+    }
+  };
+
   /** Hand the pasted (or dropped) playlist over: it becomes the guide this browser keeps. */
   const usePastedPlaylist = () => {
     if (!playlist) return;
@@ -866,7 +958,9 @@ export function LivePlayerContent({
             </p>
             <p className="mt-0.5 text-muted-foreground">
               {channels.length > 0
-                ? `${channels.length} channels, read in this browser and played from their own addresses.`
+                ? `${channels.length} channels, read in this browser and played from their own addresses.${
+                    playlistNote ? ` ${playlistNote}` : ""
+                  }`
                 : (playlistNote ??
                   "Reading the playlist in this browser — the host serves browsers, and this page is one.")}
             </p>
@@ -897,6 +991,13 @@ export function LivePlayerContent({
                 className="glass rounded-full px-3 py-1 text-[11px] font-bold"
               >
                 Read it again
+              </button>
+              <button
+                type="button"
+                onClick={() => void explain()}
+                className="glass rounded-full px-3 py-1 text-[11px] font-bold"
+              >
+                {diagnosing ? "Asking…" : "Why is this empty?"}
               </button>
             </div>
             {pasteOpen && (
@@ -1057,17 +1158,76 @@ export function LivePlayerContent({
                   "The source answered but listed nothing. Press Refresh to try again.")
               )}
             </p>
-            <button
-              type="button"
-              onClick={() => {
-                retryAttempt.current = 0;
-                cancelRetry();
-                void loadCatalogue(true);
-              }}
-              className="mt-2 rounded-full bg-accent px-3 py-1 text-[11px] font-bold text-accent-foreground"
-            >
-              Refresh now
-            </button>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  retryAttempt.current = 0;
+                  cancelRetry();
+                  void loadCatalogue(true);
+                }}
+                className="rounded-full bg-accent px-3 py-1 text-[11px] font-bold text-accent-foreground"
+              >
+                Refresh now
+              </button>
+              <button
+                type="button"
+                onClick={() => void explain()}
+                className="glass rounded-full px-3 py-1 text-[11px] font-bold"
+              >
+                {diagnosing ? "Asking…" : "Why is this empty?"}
+              </button>
+            </div>
+
+            {/*
+              The relay's own report, in place.
+              
+              Everything here is a fact the relay already had: the device it presented, the token
+              position that worked, and what each address answered. Being asked to open a URL and
+              paste JSON is a fine thing to ask an engineer and a poor thing to ask a viewer.
+            */}
+            {diagnosis && (
+              <div data-testid="diagnosis" className="mt-2 space-y-1 rounded-lg border border-border/60 bg-background/60 p-2 font-mono text-[11px] leading-relaxed">
+                {diagnosis.configured && (
+                  <p>
+                    device: {diagnosis.configured.mac ?? "—"} · sn {diagnosis.configured.sn ?? "—"} · id{" "}
+                    {(diagnosis.configured.deviceId ?? "—").slice(0, 12)}… · id2{" "}
+                    {(diagnosis.configured.deviceId2 ?? "—").slice(0, 12)}… · {diagnosis.configured.stbType ?? "—"}
+                  </p>
+                )}
+                {diagnosis.tokenPosition && <p>token position that worked: {diagnosis.tokenPosition}</p>}
+                {diagnosis.handshake && (
+                  <p>
+                    handshake: {diagnosis.handshake.ok ? "ok" : "failed"}
+                    {diagnosis.handshake.endpoint ? ` via ${diagnosis.handshake.endpoint}` : ""}
+                    {diagnosis.handshake.error ? ` — ${diagnosis.handshake.error}` : ""}
+                  </p>
+                )}
+                {diagnosis.configuredUrl && <p>playlist address: {diagnosis.configuredUrl}</p>}
+                {diagnosis.probe && (
+                  <p>
+                    playlist read: {diagnosis.probe.status ?? "—"} {diagnosis.probe.contentType ?? ""} ·{" "}
+                    {diagnosis.probe.channels ?? 0} channels
+                    {diagnosis.probe.error ? ` — ${diagnosis.probe.error}` : ""}
+                  </p>
+                )}
+                {diagnosis.catalogue?.note && <p>{diagnosis.catalogue.note}</p>}
+                {diagnosis.hint && <p className="text-muted-foreground">{diagnosis.hint}</p>}
+                {diagnosis.error && <p className="text-accent">{diagnosis.error}</p>}
+                {diagnosis.trace && diagnosis.trace.length > 0 && (
+                  <details>
+                    <summary className="cursor-pointer">what each address answered</summary>
+                    <ul className="mt-1 space-y-0.5">
+                      {diagnosis.trace.slice(0, 8).map((t, i) => (
+                        <li key={i}>
+                          {t.action || "probe"} → {t.status || "—"} {t.address} {t.said ? `— ${t.said}` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </div>
+            )}
           </div>
         )}
 
