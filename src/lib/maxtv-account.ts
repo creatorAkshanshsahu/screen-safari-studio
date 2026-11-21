@@ -10,7 +10,8 @@
  *   mac       the address the panel bills. `00:1A:79:…` is the usual first three bytes. Two
  *             accounts on one portal differ by this value alone, which is why it decides identity.
  *   serial    the box serial, in the panel's own format.
- *   deviceId  the long hex device id that goes with the serial.
+ *   deviceId  the long hex device id that goes with the serial (and `deviceId2` when the card
+ *             prints a second one).
  *
  * ## Which wins: an environment variable or this file?
  *
@@ -61,6 +62,22 @@ export type MaxTvAccount = {
   mac: string;
   serial: string;
   deviceId: string;
+  /**
+   * The second device id, when the seller's card gives one.
+   *
+   * A card that prints two values is telling you the panel checks both. They are usually the same
+   * string, and when they are not, sending the first twice is a device the panel has never billed
+   * -- which it answers with "Authorization failed." and no explanation.
+   */
+  deviceId2?: string;
+  /** The box the panel thinks it is talking to. `MAG254` unless the card says otherwise. */
+  stbType?: string;
+  /** The firmware fields a MAG reports; left alone unless a card names them. */
+  hwVersion?: string;
+  imageVersion?: string;
+  apiSignature?: string;
+  /** The zone the device was registered in. A zone that contradicts it is a refusal with no words. */
+  timezone?: string;
 };
 
 export const MAXTV_ACCOUNTS: readonly MaxTvAccount[] = [
@@ -71,6 +88,7 @@ export const MAXTV_ACCOUNTS: readonly MaxTvAccount[] = [
     mac: "00:1A:79:EE:03:9F",
     serial: "92180365D21FE",
     deviceId: "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070",
+    deviceId2: "3610DEAFB556781F84CBC8A6AF876A8F20637668862B28DEECFACE00D67A6070",
   },
   {
     id: "fusion4k",
@@ -79,6 +97,7 @@ export const MAXTV_ACCOUNTS: readonly MaxTvAccount[] = [
     mac: "00:1A:79:F5:8F:95",
     serial: "99EB2A8128098",
     deviceId: "01F71B517FE629CE5FB7158273354EDF361793DC5BB6C481C4957C3356040ABA",
+    deviceId2: "01F71B517FE629CE5FB7158273354EDF361793DC5BB6C481C4957C3356040ABA",
   },
 ] as const;
 
@@ -102,4 +121,11 @@ export function findMaxTvAccount(id: string | null | undefined): MaxTvAccount | 
 }
 
 /** The environment variables that override {@link MAXTV_ACCOUNT}, in the order they matter. */
-export const MAXTV_ENV_VARS = ["MAXTV_PORTAL", "MAXTV_MAC", "MAXTV_SERIAL", "MAXTV_DEVICE_ID"] as const;
+export const MAXTV_ENV_VARS = [
+  "MAXTV_PORTAL",
+  "MAXTV_MAC",
+  "MAXTV_SERIAL",
+  "MAXTV_DEVICE_ID",
+  "MAXTV_DEVICE_ID2",
+  "MAXTV_STB_TYPE",
+] as const;
