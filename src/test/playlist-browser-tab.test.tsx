@@ -175,6 +175,30 @@ describe("a playlist tab", () => {
     expect(hosts).toContain("tghub.lindahicks827.workers.dev");
   });
 
+  it("reads a public playlist through a proxy when the host refuses this page", async () => {
+    /*
+     * A seller's playlist URL is a public file: no token, no account, nothing in it that is not
+     * already on a poster. So a refused direct read is retried through a proxy -- a different
+     * address on the internet, and a chance the host does not refuse this client. The tab says so,
+     * because a proxy that worked should be visible rather than silent.
+     */
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (target: string) => {
+        const url = String(target);
+        if (url.includes("allorigins") || url.includes("corsproxy")) return new Response(PLAYLIST, { status: 200 });
+        if (url.includes("allinonereborn2.online")) throw new TypeError("Failed to fetch");
+        return new Response("<!DOCTYPE html><html>nope</html>", { status: 200 });
+      }),
+    );
+
+    renderLive();
+    fireEvent.click(await screen.findByRole("tab", { name: "tatatv" }));
+
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /Colors HD/ }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByText(/read through a proxy/)).toBeTruthy());
+  });
+
   it("refuses something that is not a playlist, and says why", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 500 })));
 
