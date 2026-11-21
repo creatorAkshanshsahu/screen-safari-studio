@@ -29,6 +29,8 @@ export interface StageChannel {
   number?: number | undefined;
   source?: string | undefined;
   directUrl?: string | undefined;
+  /** Play `directUrl` first: the channel came from a playlist this browser read itself. */
+  directFirst?: boolean | undefined;
   drm?: { type: "clearkey"; keys: Array<{ kid: string; k: string }> } | null | undefined;
   container?: string | undefined;
 }
@@ -222,6 +224,7 @@ export function LivePlayerStage({
           channelId={channel.id}
           channelName={channel.name}
           directUrl={channel.directUrl}
+          directFirst={channel.directFirst}
           drm={channel.drm ?? null}
           container={channel.container}
           activeSource={channel.source}

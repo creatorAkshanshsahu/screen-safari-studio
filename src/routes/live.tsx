@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ArrowLeft, Code2, Copy, Check, Search } from "lucide-react";
 import { LivePlayerStage, type StageChannel } from "@/components/tv/LivePlayerStage";
 import { accentInk, parseAccent, type LiveChannelDto } from "@/lib/live-gateway";
+import { PLAYLISTS, findPlaylist, looksLikePlaylist, parsePlaylist, type PlaylistEntry, type PlaylistSource } from "@/lib/playlists";
 
 export const Route = createFileRoute("/live")({
   head: () => ({
@@ -27,7 +28,7 @@ export const Route = createFileRoute("/live")({
  * several is how the guide once filled with channels from two sources and no sign of which were
  * supposed to work. A tab each, and the tab says why it is empty when it is.
  */
-type LiveSource = "fusion4k" | "maxtv" | "tatatv";
+type LiveSource = "tg" | "tatatv" | "fusion4k" | "maxtv";
 
 /**
  * A tab per subscription.
@@ -38,16 +39,110 @@ type LiveSource = "fusion4k" | "maxtv" | "tatatv";
  * is a tab of its own rather than a fallback behind the others.
  */
 const SOURCES: Array<{ id: LiveSource; label: string; query: string }> = [
+  { id: "tg", label: "tg", query: "source=tgtv&playlist=tg" },
+  { id: "tatatv", label: "tatatv", query: "source=tgtv&playlist=tatatv" },
   { id: "fusion4k", label: "fusion4k", query: "source=maxtv&account=fusion4k" },
   { id: "maxtv", label: "maxTV", query: "source=maxtv&account=maxtv" },
-  { id: "tatatv", label: "tatatv", query: "source=tgtv" },
 ];
 
-const sourceLabel = (id: LiveSource): string => SOURCES.find((s) => s.id === id)?.label ?? "fusion4k";
+/**
+ * The two tabs this browser reads for itself.
+ *
+ * A portal tabs talks to a panel that has to accept the site's server. A playlist tab is a file: it
+ * can be read by whoever is looking at the page, and the addresses inside it can be played by the
+ * same client. That is why these two are the tabs that work when a panel does not -- and why the
+ * relay is not asked for them at all.
+ */
+const PLAYLIST_STORE_PREFIX = "streamr.playlist.v1.";
+/**
+ * An address the viewer supplied for a playlist tab: `/live?account=tg&playlistUrl=…`.
+ *
+ * The sellers move their files, and a mirror is worth nothing if it needs a deployment. This is
+ * also how a playlist that the shipped address refuses can be reached without waiting for a build.
+ */
+const PLAYLIST_URL_PREFIX = "streamr.playlistUrl.v1.";
+
+function readPlaylistUrl(id: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const url = window.localStorage.getItem(PLAYLIST_URL_PREFIX + id);
+    return url && /^https?:\/\//i.test(url) ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePlaylistUrl(id: string, url: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PLAYLIST_URL_PREFIX + id, url);
+  } catch {
+    // A refused store is not a reason to refuse the address.
+  }
+}
+
+/** Whether this browser already holds a playlist of its own. */
+function hasStoredPlaylist(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    for (const playlist of PLAYLISTS) {
+      if (window.localStorage.getItem(PLAYLIST_STORE_PREFIX + playlist.id)) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function readStoredPlaylist(id: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const text = window.localStorage.getItem(PLAYLIST_STORE_PREFIX + id);
+    return text && text.trim() ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredPlaylist(id: string, text: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PLAYLIST_STORE_PREFIX + id, text);
+  } catch {
+    // A refused store is not a reason to refuse the list the viewer just read.
+  }
+}
+
+/** Playlist entries as guide rows: an id, a name, and the address itself. */
+function playlistChannels(playlist: PlaylistSource, entries: PlaylistEntry[]): LiveChannelDto[] {
+  return entries.map((entry, index) => {
+    const id = `pl:${playlist.id}:${index}`;
+    return {
+      id,
+      key: id,
+      number: index + 1,
+      source: "tgtv" as const,
+      name: entry.name,
+      category: entry.group || playlist.label,
+      rawCategory: entry.group || playlist.label,
+      logo: entry.logo,
+      embedUrl: "",
+      iframeCode: "",
+      // Not a relay address: this channel plays from the address the playlist gave, in this browser.
+      streamUrl: entry.url,
+      directUrl: entry.url,
+      // Only HLS is declared: everything else is the browser's own MPEG-TS path, and the player
+      // decides by extension when `directFirst` is set.
+      ...(/\.m3u8(\?|$)/i.test(entry.url) ? { container: "hls" as const } : {}),
+    } satisfies LiveChannelDto;
+  });
+}
+
+const sourceLabel = (id: LiveSource): string => SOURCES.find((s) => s.id === id)?.label ?? "tg";
 
 /** The question this tab asks the relay. The account is the subscription, the source is its kind. */
 const catalogueQuery = (id: LiveSource): string =>
-  SOURCES.find((s) => s.id === id)?.query ?? "source=maxtv&account=fusion4k";
+  SOURCES.find((s) => s.id === id)?.query ?? "source=tgtv&playlist=tg";
 
 /**
  * The tab the viewer was last on, so a reload does not silently move them somewhere else.
@@ -123,7 +218,7 @@ export function LivePlayerContent({
   const [source, setSource] = useState<LiveSource>(() =>
     SOURCES.some((s) => s.id === initialSource)
       ? (initialSource as LiveSource)
-      : (readStoredTab() ?? "fusion4k"),
+      : (readStoredTab() ?? (hasStoredPlaylist() ? "tg" : "fusion4k")),
   );
   const [filter, setFilter] = useState<"hindi" | "en_hi" | "all">("all");
   const [selectedCategory, setSelectedCategory] = useState<string>("");
@@ -170,6 +265,18 @@ export function LivePlayerContent({
    * feeding it.
    */
   const [sourceBlocked, setSourceBlocked] = useState(false);
+  /**
+   * The playlist this browser holds, and what it last said when it tried to read one itself.
+   *
+   * `pasting` is the escape hatch that no host policy can close: if the seller's address answers
+   * this browser with a challenge page, or CORS refuses the read, the viewer can open the address
+   * in a tab, copy it, and hand it over here. The list is then theirs, stored locally, and plays
+   * from their own connection.
+   */
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteDraft, setPasteDraft] = useState("");
+  const [playlistNote, setPlaylistNote] = useState<string | null>(null);
+  const [playlistRevision, setPlaylistRevision] = useState(0);
   const [blockedForSeconds, setBlockedForSeconds] = useState<number | null>(null);
 
   useEffect(() => {
@@ -182,6 +289,13 @@ export function LivePlayerContent({
       setActiveId(requested);
     }
     // `?account=fusion4k` (and the older `?source=`) is a link someone can share, like `?ch=`.
+    // `?playlistUrl=` points a playlist tab at an address of the viewer's choosing, for this tab.
+    const address = params.get("playlistUrl");
+    const target = findPlaylist(params.get("account") ?? params.get("source") ?? initialSource ?? null);
+    if (address && /^https?:\/\//i.test(address) && target) {
+      writePlaylistUrl(target.id, address);
+      setPlaylistRevision((n) => n + 1);
+    }
     const wanted = params.get("account") ?? params.get("source");
     if (!initialSource && wanted && SOURCES.some((s) => s.id === wanted)) setSource(wanted as LiveSource);
   }, [initialChannelId, initialSource]);
@@ -279,6 +393,70 @@ export function LivePlayerContent({
     setCategories((prev) => (prev.length > 0 ? prev : cached.categories));
     setLoading(false);
   }, [source]);
+
+  /**
+   * Read a playlist in the browser that is asking.
+   *
+   * This is the whole point of these two tabs. The host serves browsers and refuses servers, so the
+   * relay's answer is a challenge page -- while the page in front of the viewer can read the file
+   * and play what is in it. When even that read is refused (no CORS header, a challenge for
+   * `fetch` too), the last resort is the viewer handing the text over.
+   */
+  useEffect(() => {
+    const playlist = findPlaylist(source);
+    if (!playlist) return;
+    let cancelled = false;
+
+    const stored = readStoredPlaylist(playlist.id);
+    if (stored) {
+      const held = playlistChannels(playlist, parsePlaylist(stored));
+      if (held.length > 0) {
+        setChannels(held);
+        setCategories([...new Set(held.map((c) => c.category))]);
+        setLoading(false);
+        setActiveId((prev) => prev || held[0]!.id);
+      }
+    }
+
+    const address = readPlaylistUrl(playlist.id) ?? playlist.url;
+    void (async () => {
+      try {
+        const res = await fetch(address, { cache: "no-store" });
+        const text = await res.text();
+        if (cancelled) return;
+        if (!looksLikePlaylist(text)) {
+          setPlaylistNote(
+            `${playlist.label} answered this browser with ${res.ok ? "a page, not a playlist" : `HTTP ${res.status}`}. Open the address in a tab and copy what it shows, or use the button below.`,
+          );
+          setLoading(false);
+          return;
+        }
+        const read = playlistChannels(playlist, parsePlaylist(text));
+        if (read.length === 0) {
+          setPlaylistNote(`${playlist.label} was readable but listed nothing.`);
+          setLoading(false);
+          return;
+        }
+        writeStoredPlaylist(playlist.id, text);
+        setChannels(read);
+        setCategories([...new Set(read.map((c) => c.category))]);
+        setActiveId((prev) => prev || read[0]!.id);
+        setPlaylistNote(null);
+        setLoading(false);
+      } catch {
+        if (cancelled) return;
+        // A refused `fetch` is expected: this is a cross-origin file with no CORS header for us.
+        setPlaylistNote(
+          `${playlist.label} could not be read by this page directly. Open the address in a tab and copy what it shows, or use the button below.`,
+        );
+        setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [source, playlistRevision]);
 
   const loadCatalogue = useCallback(
     async (force = false) => {
@@ -389,8 +567,14 @@ export function LivePlayerContent({
     loadRef.current = loadCatalogue;
     // A different source or filter is a different question: its retry budget starts over.
     retryAttempt.current = 0;
+    /*
+     * A playlist tab is not the relay's question. Asking anyway spends a request to be told what we
+     * already know -- the host refuses this site's server -- and the answer would overwrite the list
+     * this browser read for itself, which is the only list that can play.
+     */
+    if (findPlaylist(source)) return;
     void loadCatalogue(false);
-  }, [loadCatalogue]);
+  }, [loadCatalogue, source]);
 
   /*
    * A quiet refresh every five minutes, so a page left open does not drift.
@@ -519,6 +703,8 @@ export function LivePlayerContent({
     number: c.number,
     source: c.source,
     directUrl: c.directUrl,
+    // A row this browser read out of a playlist plays from its own address, not through the relay.
+    directFirst: c.id.startsWith("pl:"),
     drm: c.drm ?? null,
     container: c.container,
   });
@@ -539,6 +725,52 @@ export function LivePlayerContent({
     activeChannel && (!requestedId || matchesRequest(requestedId, activeChannel)) ? describe(activeChannel) : null;
 
   const activeNumber = activeChannel ? String(activeChannel.number ?? activeChannel.id) : "";
+
+  /** The playlist this tab is, when the tab is one. */
+  const playlist = findPlaylist(source);
+
+  /** Hand the pasted (or dropped) playlist over: it becomes the guide this browser keeps. */
+  const usePastedPlaylist = () => {
+    if (!playlist) return;
+    const text = pasteDraft.trim();
+    const read = playlistChannels(playlist, parsePlaylist(text));
+    if (!looksLikePlaylist(text) || read.length === 0) {
+      setPlaylistNote(
+        "That does not look like a playlist. Open the address, copy everything it shows (it starts with #EXTM3U), and paste it here.",
+      );
+      return;
+    }
+    writeStoredPlaylist(playlist.id, text);
+    setChannels(read);
+    setCategories([...new Set(read.map((c) => c.category))]);
+    setActiveId(read[0]!.id);
+    setPlaylistNote(null);
+    setPasteOpen(false);
+    setPasteDraft("");
+    setPlaylistRevision((n) => n + 1);
+  };
+
+  const readPlaylistFile = (file: File | null) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = typeof reader.result === "string" ? reader.result : "";
+      setPasteDraft(text);
+      if (playlist) {
+        const read = playlistChannels(playlist, parsePlaylist(text));
+        if (read.length > 0) {
+          writeStoredPlaylist(playlist.id, text);
+          setChannels(read);
+          setCategories([...new Set(read.map((c) => c.category))]);
+          setActiveId(read[0]!.id);
+          setPlaylistNote(null);
+          setPasteOpen(false);
+          setPlaylistRevision((n) => n + 1);
+        }
+      }
+    };
+    reader.readAsText(file);
+  };
 
   return (
     /*
@@ -605,6 +837,87 @@ export function LivePlayerContent({
             );
           })}
         </div>
+
+        {playlist && (
+          <div
+            data-testid="playlist-panel"
+            className="mb-3 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs"
+          >
+            <p className="font-bold text-accent">
+              {playlist.label} · {playlist.note}
+            </p>
+            <p className="mt-0.5 text-muted-foreground">
+              {channels.length > 0
+                ? `${channels.length} channels, read in this browser and played from their own addresses.`
+                : (playlistNote ??
+                  "Reading the playlist in this browser — the host serves browsers, and this page is one.")}
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <a
+                href={readPlaylistUrl(playlist.id) ?? playlist.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="rounded-full bg-accent px-3 py-1 text-[11px] font-bold text-accent-foreground no-underline"
+              >
+                Open the playlist
+              </a>
+              <button
+                type="button"
+                onClick={() => setPasteOpen((v) => !v)}
+                className="glass rounded-full px-3 py-1 text-[11px] font-bold"
+              >
+                {pasteOpen ? "Close" : "Paste it instead"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setChannels([]);
+                  setActiveId("");
+                  setPlaylistNote(null);
+                  setPlaylistRevision((n) => n + 1);
+                }}
+                className="glass rounded-full px-3 py-1 text-[11px] font-bold"
+              >
+                Read it again
+              </button>
+            </div>
+            {pasteOpen && (
+              <div className="mt-2 space-y-2">
+                <p className="text-muted-foreground">
+                  Open the address above in a new tab, select everything it shows, and paste it here
+                  — the file starts with <code>#EXTM3U</code>. A <code>.m3u</code> file you saved works
+                  too.
+                </p>
+                <textarea
+                  aria-label="Paste the playlist"
+                  value={pasteDraft}
+                  onChange={(e) => setPasteDraft(e.target.value)}
+                  rows={4}
+                  placeholder={"#EXTM3U\n#EXTINF:-1 group-title=\"Hindi\",Colors HD\nhttp://…/colors.m3u8"}
+                  className="w-full rounded-lg border border-border bg-background/60 p-2 font-mono text-[11px]"
+                />
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={usePastedPlaylist}
+                    className="rounded-full bg-accent px-3 py-1 text-[11px] font-bold text-accent-foreground"
+                  >
+                    Use this playlist
+                  </button>
+                  <label className="glass cursor-pointer rounded-full px-3 py-1 text-[11px] font-bold">
+                    Choose a file
+                    <input
+                      type="file"
+                      accept=".m3u,.m3u8,text/plain"
+                      className="hidden"
+                      onChange={(e) => readPlaylistFile(e.target.files?.[0] ?? null)}
+                    />
+                  </label>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         <LivePlayerStage
           channel={stageChannel}
@@ -673,7 +986,7 @@ export function LivePlayerContent({
         </section>
 
         {/* One source, so there is nothing to fall back from: say the list is short or dead. */}
-        {(portalError || backupError || tgtvError || (!loading && visibleChannels.length === 0)) && (
+        {!playlist && (portalError || backupError || tgtvError || (!loading && visibleChannels.length === 0)) && (
           <div className="mb-3 rounded-xl border border-accent/40 bg-background/85 px-4 py-2.5 text-xs">
             {/*
              * "Still coming" and "came back empty" look identical on screen and are not the same
